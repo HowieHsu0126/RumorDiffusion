@@ -12,7 +12,8 @@ source /share/home/hwxu/miniconda3/bin/activate hw
 cd /share/home/hwxu/Researches/D2Plus
 
 EXP_CFG="Libs/configs/exp.yaml"
-MODEL_CFGS="Libs/configs/baselines/rumordiffusion.yaml,Libs/configs/baselines/rumordiffusion_hparam_depth.yaml,Libs/configs/baselines/rumordiffusion_hparam_guidance.yaml"
+MODEL_CFGS_DEFAULT="Libs/configs/baselines/rumordiffusion.yaml,Libs/configs/baselines/rumordiffusion_hparam_depth.yaml,Libs/configs/baselines/rumordiffusion_hparam_guidance.yaml"
+MODEL_CFGS="${MODEL_CFGS_OVERRIDE:-$MODEL_CFGS_DEFAULT}"
 SEEDS="${SEEDS_OVERRIDE:-42,43,44}"
 DATASET_OVERRIDE="${DATASET_OVERRIDE:-}"
 

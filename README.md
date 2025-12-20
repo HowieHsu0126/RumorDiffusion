@@ -1,14 +1,14 @@
 # RumorDiffusion: Prefix-Conditioned Diffusion for Early Rumor Detection Under Sparse and Incomplete Social Cascades
 
 <!-- Highlights
-----------
+--
 - All knobs live in YAML (`Libs/configs/exp*.yaml`, `Libs/configs/baselines/*.yaml`); no hardcoded params.
 - Supports multi-dataset (Twitter15/16 4-class, Weibo/PHEME 2-class) via `Libs/configs/dataset.yaml`.
 - One entrypoint runner (`python -m Libs.exp.run`) for RumorDiffusion and baselines; optional SLURM helper scripts.
 - Robustness/early-observation sweeps, calibration, and interpretability utilities included. -->
 
 ## Repository Layout
------------------
+-
 - `Input/raw/` — raw datasets (Twitter-style: `tree/*.txt`, `label.txt`, `source_tweets.txt`; JSON-style: `.json` with `source` + `comment`).
 - `Input/processed/<dataset>/` — processed PyG data (`pyg/data.pt`, `pyg/slices.pt`, `splits.json`, optional `text_embs.pt`).
 - `Input/sentence_transformers_all_MiniLM_L6v2/` — local text encoder checkpoint used by preprocessing (adjust path in YAML if different).
@@ -21,7 +21,7 @@
 
 ## Installation
 
-------------
+----
 1) Install PyTorch and PyG matching your CUDA/CPU setup (follow official install guides).  
 2) Install Python deps:
 ```
@@ -32,17 +32,16 @@ pip install pyyaml tqdm transformers sentence-transformers wandb
 ## Data
 
 ----
-- Processed data expected at `Input/processed/<dataset>/` with:
-  - `pyg/data.pt`, `pyg/slices.pt`, `splits.json`
-  - optional `text_embs.pt` (graph-level text embeddings)
-- Raw data expectations:
-  - Twitter15/16: `Input/raw/twitter15/{tree/*.txt,label.txt,source_tweets.txt}` (same for twitter16)
-  - Weibo/PHEME (JSON): `Input/raw/<dataset>/*.json` containing `source` + `comment` fields
-- Text encoder: by default uses `Input/sentence_transformers_all_MiniLM_L6v2/`; adjust `dataset.text.encoder_path` in `Libs/configs/dataset.yaml` if stored elsewhere.
+Download all data (raw data, processed data, and sentence transformer weights) from [Google Drive](https://drive.google.com/file/d/1rSFOLfTwe-TWrCEIPfYK7j4X_kosaX28/view?usp=sharing) and extract to `Input/` directory.
+
+The extracted structure should include:
+- `Input/raw/` — raw datasets (Twitter-style: `tree/*.txt`, `label.txt`, `source_tweets.txt`; JSON-style: `.json` with `source` + `comment`).
+- `Input/processed/<dataset>/` — processed PyG data (`pyg/data.pt`, `pyg/slices.pt`, `splits.json`, optional `text_embs.pt`).
+- `Input/sentence_transformers_all_MiniLM_L6v2/` — text encoder checkpoint used by preprocessing (adjust path in YAML if different).
 
 ## Preprocessing
 
-------------------------
+
 Generate processed PyG data from raw:
 ```
 python -m Libs.data.processor \
@@ -59,7 +58,7 @@ python -m Libs.data.processor \
 Adjust `--dataset` to one of `twitter15`, `twitter16`, `weibo`, `pheme`. Update paths in YAML if your `Input/` location differs.
 
 Quickstart (smoke test)
------------------------
+-------
 Runs 1 epoch, 1 batch, 1 sample (per `exp_smoke.yaml`), RumorDiffusion model:
 ```
 python -m Libs.exp.run \
@@ -70,7 +69,7 @@ Edit the YAML paths (`dataset.root`, `outputs.*`) if your data/output directorie
 
 ## Training & Evaluation
 
----------------------
+-----
 Single model, multi-seed (defaults from `exp.yaml`):
 ```
 python -m Libs.exp.run \
@@ -106,7 +105,7 @@ Outputs:
 
 ## Benchmark scripts (SLURM, optional)
 
-------------------------------------
+----
 Helper scripts read `Libs/configs/exp.yaml` and submit jobs. Example (Twitter15):
 ```
 sbatch Libs/scripts/run_bench_twitter15.sh
@@ -114,7 +113,7 @@ sbatch Libs/scripts/run_bench_twitter15.sh
 You can override env vars (e.g., `SEEDS_OVERRIDE`, `MODELS_OVERRIDE`, `DATASETS_OVERRIDE`) when submitting. Use these only in SLURM environments; otherwise call `python -m Libs.exp.run` directly.
 
 Interpretability export (optional)
-----------------------------------
+--
 Generate per-sample logits/probs and token stats for a trained RumorDiffusion checkpoint:
 ```
 python -m Libs.exp.rumordiffusion_explain \
@@ -134,5 +133,5 @@ python -m Libs.exp.explain_summary \
 
 ## Citation
 
---------
+
 This work is under review (ACM T-IST). Citation details will be added when available.

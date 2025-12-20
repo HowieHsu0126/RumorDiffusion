@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 import warnings
@@ -48,6 +49,30 @@ def read_yaml_like(path: str) -> Dict[str, Any]:
         import yaml  # local import to avoid global dependency if unused
 
         return yaml.safe_load(f)
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Recursively merge two mappings with override taking precedence.
+
+    - Only merges when both sides are dict; other types are replaced by override.
+    - Leaves input objects unmodified by constructing a new dict.
+    """
+    if not isinstance(base, dict):
+        base = {}
+    if not isinstance(override, dict):
+        return dict(base)
+
+    merged: Dict[str, Any] = {}
+    # Keys from both dicts
+    for k in set(base.keys()) | set(override.keys()):
+        if k in override and isinstance(override[k], dict) and isinstance(base.get(k), dict):
+            merged[k] = _deep_merge(base[k], override[k])
+        elif k in override:
+            merged[k] = override[k]
+        else:
+            merged[k] = base[k]
+    return merged
 
 
 def collect_logits(model: torch.nn.Module, loader: DataLoader, device: str, amp: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
@@ -141,6 +166,60 @@ def aggregate_numeric(values: List[float]) -> tuple[float, float]:
     if len(values) == 1:
         return float(values[0]), 0.0
     return float(mean(values)), float(pstdev(values))
+
+
+def run_transfer_eval(exp_cfg: Dict[str, Any], args: argparse.Namespace) -> None:
+    """Orchestrates transfer evaluation by spawning eval-only runs per pair/model/seed."""
+    transfer_cfg = exp_cfg.get("transfer", {})
+    if not isinstance(transfer_cfg, dict) or len(transfer_cfg.get("pairs", [])) == 0:
+        raise ValueError("Transfer config is missing pairs.")
+
+    outputs_cfg = exp_cfg.get("outputs", {})
+    base_ckpt_dir = outputs_cfg.get("ckpt_dir", os.path.join("Output", "ckpts"))
+    ckpt_name = str(transfer_cfg.get("ckpt_name", "best.pt"))
+    lp_policy = str(transfer_cfg.get("lp_edges_policy", args.lp_edges_policy))
+    seeds = parse_seeds(args.seeds, exp_cfg)
+
+    transfer_models = transfer_cfg.get("models")
+    if not transfer_models:
+        transfer_models = [p.strip() for p in args.model.split(",") if p.strip()]
+    model_cfgs = [read_yaml_like(p) for p in transfer_models]
+
+    for pair in transfer_cfg.get("pairs", []):
+        source = str(pair["source"])
+        target = str(pair["target"])
+        for model_path, model_cfg in zip(transfer_models, model_cfgs):
+            model_name = str(model_cfg["name"]).lower()
+            for seed in seeds:
+                ckpt_path = os.path.join(
+                    base_ckpt_dir,
+                    source,
+                    model_name,
+                    f"seed{seed}",
+                    ckpt_name,
+                )
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "Libs.exp.run",
+                    "--exp",
+                    args.exp,
+                    "--model",
+                    model_path,
+                    "--seeds",
+                    str(seed),
+                    "--eval_only",
+                    "--ckpt",
+                    ckpt_path,
+                    "--dataset_override",
+                    target,
+                    "--source_dataset_override",
+                    source,
+                    "--lp_edges_policy",
+                    lp_policy,
+                ]
+                print(f"[transfer] {source}->{target} model={model_name} seed={seed} ckpt={ckpt_path}")
+                subprocess.run(cmd, check=True)
 
 
 def build_model(name: str, cfg: Dict[str, Any], num_features: int, num_classes: int):
@@ -329,6 +408,13 @@ def main() -> None:
                         help="Checkpoint path override for eval_only or transfer runs")
     parser.add_argument("--dataset_override", type=str, default="",
                         help="Override dataset name from exp.yaml for transfer evaluation")
+    parser.add_argument("--source_dataset_override", type=str, default="",
+                        help="Override dataset.name for transfer source dataset")
+    parser.add_argument("--transfer_eval", action="store_true",
+                        help="Run transfer evaluation across dataset pairs defined in exp transfer config")
+    parser.add_argument("--lp_edges_policy", type=str, default="auto",
+                        choices=["auto", "require_existing"],
+                        help="LP edges handling: auto-generate when missing, or require existing edges")
     args = parser.parse_args()
 
     exp_cfg = read_yaml_like(args.exp)
@@ -337,11 +423,18 @@ def main() -> None:
     seeds = parse_seeds(args.seeds, exp_cfg)
     train_max_samples = int(exp_cfg.get("training", {}).get("max_samples", 0))
 
+    if args.transfer_eval:
+        run_transfer_eval(exp_cfg, args)
+        return
+
     dataset_cfg = exp_cfg["dataset"]
+    if args.source_dataset_override:
+        dataset_cfg = {**dataset_cfg, "name": args.source_dataset_override}
     source_dataset_name = dataset_cfg["name"]
     dataset_name = args.dataset_override if args.dataset_override else source_dataset_name
     dataset_root = os.path.join(dataset_cfg["root"], dataset_name)
     use_lp_edges = bool(dataset_cfg.get("use_lp_edges", False))
+    lp_edges_policy = str(args.lp_edges_policy)
     prefix_cfg = dataset_cfg.get("prefix", {})
     observability_cfg = dataset_cfg.get("observability", {})
     observability_sweep_cfg = dataset_cfg.get("observability_sweep", {})
@@ -353,7 +446,8 @@ def main() -> None:
     base_results_dir = outputs_cfg.get(
         "results_dir", os.path.join("Output", "results"))
     sweeps_csv = os.path.join(base_results_dir, "rd_sweeps.csv")
-    transfer_csv = os.path.join(base_results_dir, "transfer.csv")
+    transfer_csv_default = os.path.join(base_results_dir, "transfer.csv")
+    transfer_csv = exp_cfg.get("transfer", {}).get("results_path", transfer_csv_default)
 
     # Device configuration
     device_cfg = exp_cfg.get("device", {})
@@ -421,6 +515,7 @@ def main() -> None:
         "calibration_temp",
     ]
     run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ckpt_filename = str(exp_cfg.get("transfer", {}).get("ckpt_name", "best.pt"))
 
     for model_cfg, model_path in zip(model_cfgs, model_paths):
         name = model_cfg["name"].lower()
@@ -461,12 +556,15 @@ def main() -> None:
         logging.info(
             f"Dataset: {dataset_name}; Model: {name}; LP: {use_lp}; Seed: {seed}")
 
+        lp_require_existing = (lp_edges_policy == "require_existing" and name == "lp_gcn")
         # Optional pre-step: if LP is required but lp_edges are missing, train LP and generate edges
         if use_lp:
             lp_dir = os.path.join(dataset_root, "lp_edges")
             need_generate = not os.path.isdir(lp_dir) or len(
                 [p for p in os.listdir(lp_dir) if p.endswith('.pt')]) == 0
-            if need_generate:
+            if lp_require_existing and need_generate:
+                raise ValueError(f"LP edges required for LP-GCN transfer, but missing in {lp_dir}")
+            if not lp_require_existing and need_generate:
                 logging.info(
                     "LP edges missing; training link predictor and generating edges...")
                 # Build TGN from model_cfg if provided; else from lp_cfg_dict
@@ -581,8 +679,10 @@ def main() -> None:
             logging.info("Running RumorDiffusion two-stage training...")
 
             # 1) Scan max_nodes from train split
-            rd_cfg = exp_cfg.get("rumordiffusion", {})
-            ctdm_cfg = rd_cfg.get("ctdm", model_cfg.get("ctdm", {}))
+            rd_cfg_exp = exp_cfg.get("rumordiffusion", {})
+            rd_cfg_model = model_cfg.get("model", {})
+            rd_cfg = _deep_merge(rd_cfg_exp, rd_cfg_model)
+            ctdm_cfg = rd_cfg.get("ctdm", {})
             max_nodes_scan = 0
             for split_idx in range(len(ds_train)):
                 sample = ds_train.get(split_idx)
@@ -622,8 +722,7 @@ def main() -> None:
                     f"Degree histogram computed: max_deg={int(deg_histogram.argmax().item())}")
 
             # Optional text fusion from exp config
-            text_cfg = rd_cfg.get("text", model_cfg.get(
-                "text", model_cfg.get("forecast", {}).get("text", {})))
+            text_cfg = rd_cfg.get("text", {})
             text_enabled = bool(text_cfg.get("enabled", False)) if isinstance(
                 text_cfg, dict) else False
             text_dim = int(text_cfg.get("text_dim", 0)) if text_enabled else 0
@@ -670,6 +769,10 @@ def main() -> None:
             # Defaults per plan: guidance_p=0.2, guidance_scale=2.0
             ctdm.guidance_p = float(ctdm_cfg.get("guidance_p", 0.2))
             ctdm.guidance_scale = float(ctdm_cfg.get("guidance_scale", 2.0))
+            logging.info(
+                f"RD-CTDM cfg -> T={ctdm.T}, stride={getattr(ctdm, 't_stride', 1)}, "
+                f"guidance_scale={ctdm.guidance_scale}, guidance_p={ctdm.guidance_p}"
+            )
             if "use_attn_readout" in ctdm_cfg:
                 ctdm.use_attn_readout = bool(ctdm_cfg["use_attn_readout"])
             # Multi-window training block
@@ -734,7 +837,7 @@ def main() -> None:
             # RumorDiffusion arbiter and loss config overrides
             rd_loss_cfg = rd_cfg.get("loss", {})
             # Build RumorDiffusion arbiter
-            arb_cfg = rd_cfg.get("arbiter", model_cfg.get("arbiter", {}))
+            arb_cfg = rd_cfg.get("arbiter", {})
             # Get actual potential vector dimension from loaded data
             sample_data = ds_train.get(0)
             if hasattr(sample_data, 'h0') and hasattr(sample_data, 'h1'):
@@ -833,6 +936,10 @@ def main() -> None:
             m.la_smooth = float(rd_loss_cfg.get("la_smooth", 0.05))
             m.lambda_brier = float(rd_loss_cfg.get("w_brier", 0.01))
             m.lambda_consistency = float(rd_loss_cfg.get("w_cons", 0.05))
+            logging.info(
+                f"RD-Loss cfg -> lambda_diffusion={m.lambda_diffusion}, "
+                f"la_tau={m.la_tau}, la_gamma={m.la_gamma}"
+            )
             # Multi-pair margin loss configuration for handling multiple confusable class pairs
             mp_enabled = bool(rd_loss_cfg.get("enable_multi_pair_margin", rd_loss_cfg.get(
                 "multi_pair_margin_enabled", False)))
@@ -1023,9 +1130,10 @@ def main() -> None:
         test_loader = make_loader(ds_test_eval, shuffle=False)
 
         ckpt_dir = os.path.join(
-            base_ckpt_dir, dataset_name, name, f"seed{seed}")
+            base_ckpt_dir, source_dataset_name, name, f"seed{seed}")
         os.makedirs(ckpt_dir, exist_ok=True)
-        ckpt_path = os.path.join(ckpt_dir, "best.pt")
+        ckpt_path = os.path.join(ckpt_dir, ckpt_filename)
+        actual_ckpt_path = args.ckpt if args.ckpt else ckpt_path
 
         logging.info("Training started")
         wb_cfg = exp_cfg.get("training", {}).get("wandb", {})
@@ -1059,8 +1167,7 @@ def main() -> None:
                 wandb.log({"best_val_macro_f1": float(fit_out.get(
                     'best_val_macro_f1', fit_out.get('best_val_metric', 0.0)))})
         else:
-            load_path = args.ckpt if args.ckpt else ckpt_path
-            state = torch.load(load_path, map_location=device)
+            state = torch.load(actual_ckpt_path, map_location=device)
             trainer.model.load_state_dict(state)
         eval_cfg = exp_cfg.get("evaluation", {})
         class_names = eval_cfg.get(
@@ -1324,7 +1431,7 @@ def main() -> None:
                 name,
                 model_path,
                 args.exp,
-                ckpt_path,
+                actual_ckpt_path,
                 log_path,
                 str(seed),
                 f"{fit_out.get('best_val_macro_f1', fit_out.get('best_val_metric', 0.0)):.6f}",
@@ -1365,7 +1472,7 @@ def main() -> None:
                     dataset_name,
                     name,
                     str(seed),
-                    ckpt_path,
+                    actual_ckpt_path,
                     f"{test_metrics.get('acc', 0.0):.6f}",
                     f"{test_metrics.get('macro_f1', 0.0):.6f}",
                     f"{test_metrics.get('nll', 0.0):.6f}",

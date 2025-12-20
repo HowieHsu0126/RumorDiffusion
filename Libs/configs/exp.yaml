@@ -61,6 +61,23 @@ sbatch:
   cuda_devices: [0, 1, 2, 3]
 bench_models:
   default: ["bigcn", "cgvae_gcn", "gat", "gcn", "lp_gcn", "resgcn", "rumordiffusion", "tgat"]
+transfer:
+  pairs:
+    - source: twitter15
+      target: twitter16
+    - source: twitter16
+      target: twitter15
+    - source: weibo
+      target: pheme
+    - source: pheme
+      target: weibo
+  models:
+    - Libs/configs/baselines/rumordiffusion.yaml
+    - Libs/configs/baselines/dga_fake.yaml
+    - Libs/configs/baselines/lp_gcn.yaml
+  ckpt_name: best.pt
+  lp_edges_policy: require_existing
+  results_path: Output/results/transfer.csv
 rumordiffusion:
   arbiter:
     dropout: 0.3
