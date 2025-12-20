@@ -1,16 +1,13 @@
-RumorDiffusion
-==============
+# RumorDiffusion: Prefix-Conditioned Diffusion for Early Rumor Detection Under Sparse and Incomplete Social Cascades
 
-Prefix-conditioned diffusion for early rumor detection across Twitter15/16, Weibo, and PHEME, bundled with baselines and a YAML-first experiment runner.
-
-Highlights
+<!-- Highlights
 ----------
 - All knobs live in YAML (`Libs/configs/exp*.yaml`, `Libs/configs/baselines/*.yaml`); no hardcoded params.
 - Supports multi-dataset (Twitter15/16 4-class, Weibo/PHEME 2-class) via `Libs/configs/dataset.yaml`.
 - One entrypoint runner (`python -m Libs.exp.run`) for RumorDiffusion and baselines; optional SLURM helper scripts.
-- Robustness/early-observation sweeps, calibration, and interpretability utilities included.
+- Robustness/early-observation sweeps, calibration, and interpretability utilities included. -->
 
-Repository Layout
+## Repository Layout
 -----------------
 - `Input/raw/` — raw datasets (Twitter-style: `tree/*.txt`, `label.txt`, `source_tweets.txt`; JSON-style: `.json` with `source` + `comment`).
 - `Input/processed/<dataset>/` — processed PyG data (`pyg/data.pt`, `pyg/slices.pt`, `splits.json`, optional `text_embs.pt`).
@@ -22,7 +19,8 @@ Repository Layout
 - `Libs/scripts/` — SLURM helpers for benchmarks/ablation.
 - `Output/` — checkpoints (`ckpts/`), logs (`logs/`), and results (`results/*.csv`, explain outputs).
 
-Installation
+## Installation
+
 ------------
 1) Install PyTorch and PyG matching your CUDA/CPU setup (follow official install guides).  
 2) Install Python deps:
@@ -31,7 +29,8 @@ pip install pyyaml tqdm transformers sentence-transformers wandb
 ```
 3) If you use SLURM helpers, ensure `sbatch` is available.
 
-Data
+## Data
+
 ----
 - Processed data expected at `Input/processed/<dataset>/` with:
   - `pyg/data.pt`, `pyg/slices.pt`, `splits.json`
@@ -41,7 +40,8 @@ Data
   - Weibo/PHEME (JSON): `Input/raw/<dataset>/*.json` containing `source` + `comment` fields
 - Text encoder: by default uses `Input/sentence_transformers_all_MiniLM_L6v2/`; adjust `dataset.text.encoder_path` in `Libs/configs/dataset.yaml` if stored elsewhere.
 
-Preprocessing (optional)
+## Preprocessing
+
 ------------------------
 Generate processed PyG data from raw:
 ```
@@ -68,7 +68,8 @@ python -m Libs.exp.run \
 ```
 Edit the YAML paths (`dataset.root`, `outputs.*`) if your data/output directories differ.
 
-Training & Evaluation
+## Training & Evaluation
+
 ---------------------
 Single model, multi-seed (defaults from `exp.yaml`):
 ```
@@ -103,7 +104,8 @@ Outputs:
 - Logs: `Output/logs/`
 - Metrics: `Output/results/<dataset>.csv` (+ `rd_sweeps.csv`, `transfer.csv` when applicable)
 
-Benchmark scripts (SLURM, optional)
+## Benchmark scripts (SLURM, optional)
+
 ------------------------------------
 Helper scripts read `Libs/configs/exp.yaml` and submit jobs. Example (Twitter15):
 ```
@@ -130,17 +132,7 @@ python -m Libs.exp.explain_summary \
   --topk 20
 ```
 
-Citation
+## Citation
+
 --------
 This work is under review (ACM T-IST). Citation details will be added when available.
-
-Workflow (mermaid)
-------------------
-```
-flowchart LR
-  rawData[rawData] --> preprocess[preprocess]
-  preprocess --> processedData[processedData]
-  processedData --> runExp[runExp (Libs.exp.run)]
-  runExp --> outputs[outputs (ckpts/logs/results)]
-```
-
