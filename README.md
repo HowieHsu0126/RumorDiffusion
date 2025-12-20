@@ -1,15 +1,9 @@
 # RumorDiffusion: Prefix-Conditioned Diffusion for Early Rumor Detection Under Sparse and Incomplete Social Cascades
 
-<!-- Highlights
---
-- All knobs live in YAML (`Libs/configs/exp*.yaml`, `Libs/configs/baselines/*.yaml`); no hardcoded params.
-- Supports multi-dataset (Twitter15/16 4-class, Weibo/PHEME 2-class) via `Libs/configs/dataset.yaml`.
-- One entrypoint runner (`python -m Libs.exp.run`) for RumorDiffusion and baselines; optional SLURM helper scripts.
-- Robustness/early-observation sweeps, calibration, and interpretability utilities included. -->
+To address the difficulty of early rumor detection under sparse and incomplete social cascades, based on the sparse, noisy, and structurally incomplete nature of early diffusion traces, this study analyzes the conditional distribution of plausible future cascades given observed prefixes, and constructs **RumorDiffusion**, a prefix-conditioned diffusion model, to achieve more accurate early rumor detection with uncertainty-aware decision-making.
 
 ## Repository Layout
 
--
 - `Input/raw/` — raw datasets (Twitter-style: `tree/*.txt`, `label.txt`, `source_tweets.txt`; JSON-style: `.json` with `source` + `comment`).
 - `Input/processed/<dataset>/` — processed PyG data (`pyg/data.pt`, `pyg/slices.pt`, `splits.json`, optional `text_embs.pt`).
 - `Input/sentence_transformers_all_MiniLM_L6v2/` — local text encoder checkpoint used by preprocessing (adjust path in YAML if different).

@@ -12,7 +12,7 @@ dist/
 .eggs/
 pip-wheel-metadata/
 *.whl
-
+notebook.ipynb
 # Virtual environments and local config
 .env
 .envrc
