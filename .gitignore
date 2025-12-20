@@ -40,6 +40,7 @@ htmlcov/
 Input/
 Output/
 runs/
+Docs/
 lightning_logs/
 wandb/
 tensorboard/
