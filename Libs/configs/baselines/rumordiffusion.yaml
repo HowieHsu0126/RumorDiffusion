@@ -50,7 +50,7 @@ model:
     token_norm: layernorm
     token_dropout: 0.3
     type: transformer
-    freeze_ctdm: false
+    freeze_ctdm: true
     use_pair_token: true
     pair_token_mode: diff
     pair_ids: [1, 2]
@@ -122,10 +122,21 @@ evaluation:
   early_stop:
     enabled: true
     samples: 2
-    max_batches: 5
+    max_batches: 0
     tau_low: 0.3
     tau_high: 0.7
     gamma: 0.02
     rumor_classes: [1, 2, 3]
+  sampling_sweep:
+    enabled: true
+    samples: [1, 2, 4, 8]
+    max_batches: 0
+  threshold_sweep:
+    enabled: true
+    samples: 2
+    tau_low: [0.2, 0.3, 0.4]
+    tau_high: [0.6, 0.7, 0.8]
+    gamma: [0.01, 0.02, 0.05]
+    max_batches: 0
   robustness:
     edge_dropout: [0.0, 0.1]

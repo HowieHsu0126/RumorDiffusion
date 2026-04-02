@@ -13,9 +13,15 @@ cd /share/home/hwxu/Researches/D2Plus
 
 EXP_CFG=${EXP_CFG:-"Libs/configs/exp.yaml"}
 MODEL_CFG=${MODEL_CFG:-"Libs/configs/baselines/rumordiffusion.yaml"}
-SEEDS="${SEEDS_OVERRIDE:-42,43,44}"
+SEEDS_DEFAULT=$(python3 - "${EXP_CFG}" <<'PY'
+import yaml
+import sys
+cfg = yaml.safe_load(open(sys.argv[1]))
+print(",".join(str(s) for s in cfg.get("experiment", {}).get("seeds", [42])))
+PY
+)
+SEEDS="${SEEDS_OVERRIDE:-$SEEDS_DEFAULT}"
 
 CMD="python3 -m Libs.exp.run --exp ${EXP_CFG} --model ${MODEL_CFG} --seeds ${SEEDS} --transfer_eval --lp_edges_policy require_existing"
 echo "Running transfer_eval using config ${EXP_CFG}, seeds=${SEEDS}"
 eval ${CMD}
-

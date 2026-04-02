@@ -38,6 +38,18 @@ evaluation:
       0: non-rumor
       1: rumor
   max_samples: 1
+  export_predictions:
+    enabled: true
+  latency:
+    enabled: true
+    repeat: 1
+    warmup_batches: 0
+    max_batches: 1
+  significance:
+    enabled: false
+    baseline_models: []
+    metrics: [macro_f1, acc]
+    n_bootstrap: 100
 
 link_prediction:
   dropout: 0.3
@@ -53,10 +65,12 @@ link_prediction:
   weight_decay: 0.0
 
 outputs:
-  ckpt_dir: /share/home/hwxu/Researches/D2Plus/Output/ckpts
-  dir: /share/home/hwxu/Researches/D2Plus/Output/twitter15
+  ckpt_dir: /share/home/hwxu/Researches/D2Plus/Output/ckpts/smoke
+  dir: /share/home/hwxu/Researches/D2Plus/Output/smoke/twitter15
   log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs
-  results_dir: /share/home/hwxu/Researches/D2Plus/Output/results
+  results_dir: /share/home/hwxu/Researches/D2Plus/Output/results/smoke
+  prediction_csv: /share/home/hwxu/Researches/D2Plus/Output/results/smoke/predictions.csv
+  revision_artifacts_csv: /share/home/hwxu/Researches/D2Plus/Output/results/smoke/revision_artifacts.csv
 
 transfer:
   pairs:
@@ -68,12 +82,42 @@ transfer:
     - Libs/configs/baselines/lp_gcn.yaml
   ckpt_name: best.pt
   lp_edges_policy: require_existing
-  results_path: /share/home/hwxu/Researches/D2Plus/Output/results/transfer.csv
+  results_path: /share/home/hwxu/Researches/D2Plus/Output/results/smoke/transfer.csv
 
 rumordiffusion:
+  evaluation:
+    early_obs_minutes: [10]
+    early_stop:
+      enabled: true
+      samples: 1
+      max_batches: 1
+      tau_low: 0.3
+      tau_high: 0.7
+      gamma: 0.02
+      rumor_classes: [1, 2, 3]
+    sampling_sweep:
+      enabled: false
+      samples: []
+      max_batches: 1
+    threshold_sweep:
+      enabled: false
+      samples: 1
+      tau_low: []
+      tau_high: []
+      gamma: []
+      max_batches: 1
+    robustness:
+      edge_dropout: []
+    calibration:
+      enabled: true
+      type: temperature
+      ece_bins: 15
+      max_iter: 20
+      lr: 0.05
+      init_temp: 1.0
   arbiter:
     dropout: 0.3
-    freeze_ctdm: false
+    freeze_ctdm: true
     hidden: 256
     input_norm: true
     readout: cls
@@ -131,6 +175,16 @@ rumordiffusion:
     lambda_gan: 0.08
     lambda_r1: 10.0
     lr_d: 0.0001
+  explain:
+    enabled: true
+    samples: 1
+    tau_low: 0.3
+    tau_high: 0.7
+    gamma: 0.02
+    rumor_classes: [1, 2, 3]
+    source_ids: ""
+    case_selection:
+      enabled: true
   loss:
     la_gamma: 2.2
     la_smooth: 0.05
@@ -150,12 +204,13 @@ rumordiffusion:
     model: all-MiniLM-L6-v2
     text_dim: 384
     robust_text:
-      noise_std: [0.0]
-      dropout_p: [0.0]
+      noise_std: []
+      dropout_p: []
 
 training:
   amp: true
   batch_size: 1
+  batch_size_ctdm: 1
   early_stopping_patience: 1
   epochs: 1
   epochs_ctdm: 1
@@ -169,4 +224,3 @@ training:
   max_batches_per_epoch: 1
   min_epochs: 1
   max_samples: 1
-

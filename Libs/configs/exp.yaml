@@ -1,5 +1,5 @@
 experiment:
-  seeds: [42, 3047, 126]
+  seeds: [42, 3407, 126, 218, 91]
 dataset:
   name: twitter15
   root: Input/processed
@@ -35,6 +35,18 @@ evaluation:
       0: non-rumor
       1: rumor
   max_samples: 0
+  export_predictions:
+    enabled: true
+  latency:
+    enabled: true
+    repeat: 1
+    warmup_batches: 2
+    max_batches: 0
+  significance:
+    enabled: true
+    baseline_models: [bigcn, tgat, lp_gcn, dga_fake]
+    metrics: [macro_f1, acc]
+    n_bootstrap: 2000
 link_prediction:
   dropout: 0.3
   early_stopping_patience: 10
@@ -48,10 +60,12 @@ link_prediction:
   topk_per_node: 2
   weight_decay: 0.0
 outputs:
-  ckpt_dir: Output/ckpts
+  ckpt_dir: Output/ckpts/round1
   dir: Output/twitter15
   log_dir: Output/logs
-  results_dir: Output/results
+  results_dir: Output/results/round1
+  prediction_csv: Output/results/round1/predictions.csv
+  revision_artifacts_csv: Output/results/round1/revision_artifacts.csv
 sbatch:
   partition: gpu1
   nodelist: gpu03
@@ -60,7 +74,7 @@ sbatch:
   log_dir: Output/logs
   cuda_devices: [0, 1, 2, 3]
 bench_models:
-  default: ["bigcn", "cgvae_gcn", "gat", "gcn", "lp_gcn", "resgcn", "rumordiffusion", "tgat"]
+  default: ["bigcn", "cgvae_gcn", "dga_fake", "gat", "gcn", "lp_gcn", "resgcn", "tgat", "rumordiffusion"]
 transfer:
   pairs:
     - source: twitter15
@@ -77,11 +91,11 @@ transfer:
     - Libs/configs/baselines/lp_gcn.yaml
   ckpt_name: best.pt
   lp_edges_policy: require_existing
-  results_path: Output/results/transfer.csv
+  results_path: Output/results/round1/transfer.csv
 rumordiffusion:
   arbiter:
     dropout: 0.3
-    freeze_ctdm: false
+    freeze_ctdm: true
     hidden: 256
     input_norm: true
     readout: cls
@@ -154,6 +168,16 @@ rumordiffusion:
     lambda_gan: 0.08
     lambda_r1: 10.0
     lr_d: 0.0001
+  explain:
+    enabled: true
+    samples: 2
+    tau_low: 0.3
+    tau_high: 0.7
+    gamma: 0.02
+    rumor_classes: [1, 2, 3]
+    source_ids: ""
+    case_selection:
+      enabled: true
   loss:
     la_gamma: 2.2
     la_smooth: 0.05
@@ -186,10 +210,11 @@ rumordiffusion:
       dropout_p: [0.0, 0.1, 0.2]
 training:
   amp: true
-  batch_size: 1
-  early_stopping_patience: 5
-  epochs: 10
-  epochs_ctdm: 10
+  batch_size: 4
+  batch_size_ctdm: 1
+  early_stopping_patience: 20
+  epochs: 120
+  epochs_ctdm: 80
   grad_clip: 1.0
   lr: 0.0003
   lr_ctdm: 0.0003
@@ -197,6 +222,6 @@ training:
   use_tqdm: true
   weight_decay: 0.0001
   weight_decay_ctdm: 0.0001
-  max_batches_per_epoch: 0
-  min_epochs: 5
+  max_batches_per_epoch:
+  min_epochs: 30
   max_samples: 0

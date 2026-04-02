@@ -10,10 +10,11 @@ import time
 import warnings
 from datetime import datetime
 from statistics import mean, pstdev
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import yaml
 from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader
 
@@ -35,7 +36,9 @@ from Libs.models.baselines.RumorDiffusion import RumorDiffusion
 from Libs.models.baselines.TemporalGCN import TemporalGCN
 from Libs.models.baselines.TextOnly import TextOnlyClassifier
 from Libs.models.baselines.TGAT import TGAT
-from Libs.utils.metrics import metrics_from_logits
+from Libs.models.baselines.TGN import TGN
+from Libs.models.modules.rumor_diffusion import _extract_source_ids_from_batch
+from Libs.utils.metrics import compute_accuracy, compute_macro_f1, metrics_from_logits
 from Libs.utils.seed import set_global_seed
 
 # 屏蔽警告
@@ -46,8 +49,6 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 def read_yaml_like(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
-        import yaml  # local import to avoid global dependency if unused
-
         return yaml.safe_load(f)
 
 
@@ -112,16 +113,7 @@ def tune_temperature(logits: torch.Tensor, targets: torch.Tensor, init_temp: flo
         loss.backward()
         return loss
 
-    try:
-        optimizer.step(closure)
-    except Exception:
-        # Fallback: single Adam step to avoid failure
-        opt = torch.optim.Adam([temp], lr=lr)
-        for _ in range(10):
-            opt.zero_grad(set_to_none=True)
-            loss = criterion(logits / temp.clamp_min(1e-3), targets)
-            loss.backward()
-            opt.step()
+    optimizer.step(closure)
     return float(temp.detach().clamp_min(1e-3).item())
 
 
@@ -149,6 +141,19 @@ def append_rows_csv(csv_path: str, headers: list[str], rows: list[list[str]]) ->
         w.writerows(rows)
 
 
+def append_dict_rows_csv(csv_path: str, headers: List[str], rows: List[Dict[str, str]]) -> None:
+    """Appends multiple dict rows to a CSV, creating header if missing."""
+    if len(rows) == 0:
+        return
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    exists = os.path.isfile(csv_path)
+    with open(csv_path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
 def parse_seeds(arg_seeds: str, exp_cfg: Dict[str, Any]) -> List[int]:
     """Resolves seed list from CLI or exp config."""
     if arg_seeds:
@@ -166,6 +171,323 @@ def aggregate_numeric(values: List[float]) -> tuple[float, float]:
     if len(values) == 1:
         return float(values[0]), 0.0
     return float(mean(values)), float(pstdev(values))
+
+
+def percentile(sorted_values: Sequence[float], q: float) -> float:
+    """Returns the q-th percentile from a sorted numeric sequence."""
+    assert 0.0 <= float(q) <= 1.0
+    if len(sorted_values) == 0:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    idx = int(round(float(q) * float(len(sorted_values) - 1)))
+    idx = max(0, min(idx, len(sorted_values) - 1))
+    return float(sorted_values[idx])
+
+
+def summarize_latency_ms(latencies_ms: Sequence[float]) -> Dict[str, float]:
+    """Summarizes a latency distribution in milliseconds."""
+    if len(latencies_ms) == 0:
+        return {"mean_ms": 0.0, "p95_ms": 0.0}
+    ordered = sorted(float(v) for v in latencies_ms)
+    return {
+        "mean_ms": float(sum(ordered) / float(len(ordered))),
+        "p95_ms": percentile(ordered, 0.95),
+    }
+
+
+def profile_cuda_boundary(device: str) -> None:
+    """Synchronizes CUDA when profiling GPU latency."""
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def collect_eval_outputs(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: str,
+    criterion: nn.Module,
+    amp: bool = False,
+    detailed: bool = True,
+    class_names: Optional[Dict[int, str]] = None,
+    compute_calibration: bool = False,
+    ece_bins: int = 15,
+    profile: bool = False,
+    profile_repeat: int = 1,
+    profile_warmup_batches: int = 0,
+    profile_max_batches: int = 0,
+) -> Dict[str, Any]:
+    """Collects logits, targets, source ids, and optional latency profile."""
+    model.eval()
+    use_amp = bool(amp) and str(device).startswith("cuda")
+    logits_list: List[torch.Tensor] = []
+    target_list: List[torch.Tensor] = []
+    source_ids: List[str] = []
+    per_sample_latency_ms: List[float] = []
+    total_loss = 0.0
+    total = 0
+    profiled_batches = 0
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(loader):
+            batch = batch.to(device)
+            source_ids.extend(_extract_source_ids_from_batch(batch))
+            logits = None
+            should_profile = bool(profile) and (
+                int(profile_max_batches) <= 0 or profiled_batches < int(profile_max_batches)
+            )
+            if should_profile and batch_idx < int(profile_warmup_batches):
+                should_profile = False
+            if should_profile:
+                repeat_count = max(1, int(profile_repeat))
+                for _ in range(repeat_count):
+                    profile_cuda_boundary(device)
+                    start = time.perf_counter()
+                    if use_amp:
+                        with torch.cuda.amp.autocast():
+                            logits_profile = model(batch)
+                    else:
+                        logits_profile = model(batch)
+                    profile_cuda_boundary(device)
+                    elapsed_ms = (time.perf_counter() - start) * 1000.0
+                    batch_size = max(1, int(batch.y.view(-1).size(0)))
+                    per_sample_latency_ms.append(elapsed_ms / float(batch_size))
+                    logits = logits_profile
+                profiled_batches += 1
+            else:
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        logits = model(batch)
+                else:
+                    logits = model(batch)
+
+            assert logits is not None
+            loss = criterion(logits, batch.y.view(-1))
+            logits_list.append(logits.detach().cpu())
+            target_list.append(batch.y.view(-1).cpu())
+            bsz = int(batch.y.view(-1).size(0))
+            total_loss += float(loss.item()) * float(bsz)
+            total += bsz
+
+    if len(logits_list) == 0:
+        return {
+            "metrics": {"loss": 0.0, "acc": 0.0, "macro_f1": 0.0},
+            "logits": torch.empty((0, 0)),
+            "targets": torch.empty((0,), dtype=torch.long),
+            "source_ids": [],
+            "latency_ms": [],
+        }
+
+    logits_cat = torch.cat(logits_list, dim=0)
+    targets_cat = torch.cat(target_list, dim=0)
+    metrics = metrics_from_logits(
+        logits_cat,
+        targets_cat,
+        num_classes=int(logits_cat.size(1)),
+        detailed=bool(detailed),
+        class_names=class_names,
+        compute_calibration=bool(compute_calibration),
+        ece_bins=int(ece_bins),
+    )
+    metrics["loss"] = total_loss / max(1, total)
+    return {
+        "metrics": metrics,
+        "logits": logits_cat,
+        "targets": targets_cat,
+        "source_ids": source_ids,
+        "latency_ms": per_sample_latency_ms,
+    }
+
+
+def export_prediction_rows(
+    csv_path: str,
+    dataset_name: str,
+    model_name: str,
+    seed: int,
+    tag: str,
+    source_ids: Sequence[str],
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+) -> None:
+    """Exports per-sample predictions for later significance testing and case analysis."""
+    headers = [
+        "dataset",
+        "model",
+        "seed",
+        "tag",
+        "source_id",
+        "target",
+        "pred",
+        "confidence",
+        "probabilities",
+    ]
+    probs = torch.softmax(logits, dim=1)
+    preds = torch.argmax(logits, dim=1)
+    rows: List[Dict[str, str]] = []
+    for idx, source_id in enumerate(source_ids):
+        rows.append(
+            {
+                "dataset": dataset_name,
+                "model": model_name,
+                "seed": str(seed),
+                "tag": tag,
+                "source_id": str(source_id),
+                "target": str(int(targets[idx].item())),
+                "pred": str(int(preds[idx].item())),
+                "confidence": f"{float(probs[idx, preds[idx]].item()):.6f}",
+                "probabilities": json.dumps([float(v) for v in probs[idx].tolist()]),
+            }
+        )
+    append_dict_rows_csv(csv_path, headers, rows)
+
+
+def load_prediction_rows(
+    csv_path: str,
+    dataset_name: str,
+    model_name: str,
+    seed: int,
+    tag: str,
+) -> Dict[str, Dict[str, Any]]:
+    """Loads exported per-sample predictions keyed by source id."""
+    if not os.path.isfile(csv_path):
+        return {}
+    rows: Dict[str, Dict[str, Any]] = {}
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("dataset", "") != dataset_name:
+                continue
+            if row.get("model", "") != model_name:
+                continue
+            if row.get("seed", "") != str(seed):
+                continue
+            if row.get("tag", "") != tag:
+                continue
+            source_id = row.get("source_id", "")
+            rows[source_id] = {
+                "target": int(row["target"]),
+                "pred": int(row["pred"]),
+                "confidence": float(row["confidence"]),
+            }
+    return rows
+
+
+def bootstrap_compare_predictions(
+    current_rows: Dict[str, Dict[str, Any]],
+    baseline_rows: Dict[str, Dict[str, Any]],
+    metric_name: str,
+    n_bootstrap: int,
+    random_seed: int,
+) -> Dict[str, float]:
+    """Computes paired bootstrap significance between two aligned prediction sets."""
+    shared_ids = sorted(set(current_rows.keys()) & set(baseline_rows.keys()))
+    if len(shared_ids) == 0:
+        return {"delta": 0.0, "p_value": 1.0, "ci_low": 0.0, "ci_high": 0.0, "count": 0.0}
+    targets = torch.tensor([int(current_rows[sid]["target"]) for sid in shared_ids], dtype=torch.long)
+    preds_current = torch.tensor([int(current_rows[sid]["pred"]) for sid in shared_ids], dtype=torch.long)
+    preds_baseline = torch.tensor([int(baseline_rows[sid]["pred"]) for sid in shared_ids], dtype=torch.long)
+    metric_name = str(metric_name).lower()
+
+    def metric_value(preds: torch.Tensor) -> float:
+        if metric_name == "acc":
+            return compute_accuracy(preds, targets)
+        if metric_name == "macro_f1":
+            num_classes = int(max(int(targets.max().item()), int(preds_current.max().item()), int(preds_baseline.max().item())) + 1)
+            return compute_macro_f1(preds, targets, num_classes=num_classes)
+        raise ValueError(f"Unsupported significance metric: {metric_name}")
+
+    delta_full = float(metric_value(preds_current) - metric_value(preds_baseline))
+    generator = torch.Generator()
+    generator.manual_seed(int(random_seed))
+    sample_count = int(targets.numel())
+    deltas: List[float] = []
+    for _ in range(max(1, int(n_bootstrap))):
+        sample_idx = torch.randint(low=0, high=sample_count, size=(sample_count,), generator=generator)
+        deltas.append(float(metric_value(preds_current[sample_idx]) - metric_value(preds_baseline[sample_idx])))
+    ordered = sorted(deltas)
+    non_positive = sum(1 for delta in ordered if delta <= 0.0)
+    non_negative = sum(1 for delta in ordered if delta >= 0.0)
+    tail_count = min(non_positive, non_negative)
+    return {
+        "delta": delta_full,
+        "p_value": float(min(1.0, 2.0 * (tail_count + 1) / float(len(ordered) + 1))),
+        "ci_low": percentile(ordered, 0.025),
+        "ci_high": percentile(ordered, 0.975),
+        "count": float(sample_count),
+    }
+
+
+def build_revision_row(
+    timestamp: str,
+    dataset_name: str,
+    model_name: str,
+    seed: int,
+    artifact_type: str,
+    tag: str,
+    values: Dict[str, Any],
+) -> Dict[str, str]:
+    """Builds one normalized revision-artifact row."""
+    row = {
+        "timestamp": timestamp,
+        "dataset": dataset_name,
+        "model": model_name,
+        "seed": str(seed),
+        "artifact_type": artifact_type,
+        "tag": tag,
+        "obs_minutes": "",
+        "samples": "",
+        "tau_low": "",
+        "tau_high": "",
+        "gamma": "",
+        "coverage": "",
+        "acc_resolved": "",
+        "mean_prob": "",
+        "mean_var": "",
+        "latency_mean_ms": "",
+        "latency_p95_ms": "",
+        "compare_model": "",
+        "metric": "",
+        "delta": "",
+        "p_value": "",
+        "ci_low": "",
+        "ci_high": "",
+        "notes": "",
+    }
+    for key, value in values.items():
+        if key not in row:
+            continue
+        if isinstance(value, float):
+            row[key] = f"{value:.6f}"
+        else:
+            row[key] = str(value)
+    return row
+
+
+def run_multi_seed_jobs(args: argparse.Namespace, seeds: Sequence[int]) -> None:
+    """Runs one child process per seed to avoid mixed-state multi-seed execution."""
+    for seed in seeds:
+        cmd = [
+            sys.executable,
+            "-m",
+            "Libs.exp.run",
+            "--exp",
+            args.exp,
+            "--model",
+            args.model,
+            "--seeds",
+            str(int(seed)),
+        ]
+        if args.eval_only:
+            cmd.append("--eval_only")
+        if args.ckpt:
+            cmd.extend(["--ckpt", args.ckpt])
+        if args.dataset_override:
+            cmd.extend(["--dataset_override", args.dataset_override])
+        if args.source_dataset_override:
+            cmd.extend(["--source_dataset_override", args.source_dataset_override])
+        if args.lp_edges_policy:
+            cmd.extend(["--lp_edges_policy", args.lp_edges_policy])
+        subprocess.run(cmd, check=True)
 
 
 def run_transfer_eval(exp_cfg: Dict[str, Any], args: argparse.Namespace) -> None:
@@ -426,6 +748,9 @@ def main() -> None:
     if args.transfer_eval:
         run_transfer_eval(exp_cfg, args)
         return
+    if len(seeds) > 1:
+        run_multi_seed_jobs(args, seeds)
+        return
 
     dataset_cfg = exp_cfg["dataset"]
     if args.source_dataset_override:
@@ -448,6 +773,36 @@ def main() -> None:
     sweeps_csv = os.path.join(base_results_dir, "rd_sweeps.csv")
     transfer_csv_default = os.path.join(base_results_dir, "transfer.csv")
     transfer_csv = exp_cfg.get("transfer", {}).get("results_path", transfer_csv_default)
+    prediction_csv = outputs_cfg.get(
+        "prediction_csv", os.path.join(base_results_dir, "predictions.csv"))
+    revision_artifacts_csv = outputs_cfg.get(
+        "revision_artifacts_csv", os.path.join(base_results_dir, "revision_artifacts.csv"))
+    revision_headers = [
+        "timestamp",
+        "dataset",
+        "model",
+        "seed",
+        "artifact_type",
+        "tag",
+        "obs_minutes",
+        "samples",
+        "tau_low",
+        "tau_high",
+        "gamma",
+        "coverage",
+        "acc_resolved",
+        "mean_prob",
+        "mean_var",
+        "latency_mean_ms",
+        "latency_p95_ms",
+        "compare_model",
+        "metric",
+        "delta",
+        "p_value",
+        "ci_low",
+        "ci_high",
+        "notes",
+    ]
 
     # Device configuration
     device_cfg = exp_cfg.get("device", {})
@@ -455,8 +810,10 @@ def main() -> None:
     if force_cpu:
         device = "cpu"
     else:
-        device = device_cfg.get(
-            "type", "cuda" if torch.cuda.is_available() else "cpu")
+        requested_device = str(
+            device_cfg.get("type", "cuda" if torch.cuda.is_available() else "cpu")
+        ).lower()
+        device = "cpu" if requested_device == "cuda" and not torch.cuda.is_available() else requested_device
 
     # Set CUDA device if specified
     if device == "cuda" and torch.cuda.is_available():
@@ -577,7 +934,6 @@ def main() -> None:
                 tgn_dropout = float(lp_cfg_dict.get(
                     "dropout", model_cfg["model"].get("dropout", 0.3)))
 
-                from Libs.models.baselines.TGN import TGN
                 tgn = TGN(
                     in_channels=num_features,
                     hidden_channels=tgn_hidden,
@@ -681,7 +1037,7 @@ def main() -> None:
             # 1) Scan max_nodes from train split
             rd_cfg_exp = exp_cfg.get("rumordiffusion", {})
             rd_cfg_model = model_cfg.get("model", {})
-            rd_cfg = _deep_merge(rd_cfg_exp, rd_cfg_model)
+            rd_cfg = _deep_merge(rd_cfg_model, rd_cfg_exp)
             ctdm_cfg = rd_cfg.get("ctdm", {})
             max_nodes_scan = 0
             for split_idx in range(len(ds_train)):
@@ -701,10 +1057,8 @@ def main() -> None:
             deg_histogram = None
             if str(bb_cfg.get("name", "gcn")).lower() == "pna":
                 logging.info("Computing degree histogram for PNA...")
-                from collections import Counter
-
                 from torch_geometric.utils import degree as pyg_degree
-                deg_counter = Counter()
+                deg_counter = collections.Counter()
                 for raw_idx in range(len(ds_train)):
                     data = ds_train.get(raw_idx)
                     if hasattr(data, "edge_index") and data.edge_index is not None and int(data.edge_index.numel()) > 0:
@@ -833,6 +1187,83 @@ def main() -> None:
             struct_cfg = ctdm_cfg.get("structure_dropout", {})
             if isinstance(struct_cfg, dict):
                 ctdm.edge_drop_rate = float(struct_cfg.get("edge", 0.0))
+
+            ctdm_train_cfg = TrainerConfig(
+                epochs=int(exp_cfg["training"].get("epochs_ctdm", exp_cfg["training"]["epochs"])),
+                learning_rate=float(exp_cfg["training"].get("lr_ctdm", exp_cfg["training"].get("lr", 3e-4))),
+                weight_decay=float(exp_cfg["training"].get("weight_decay_ctdm", exp_cfg["training"].get("weight_decay", 0.0))),
+                batch_size=int(exp_cfg["training"].get("batch_size_ctdm", 1)),
+                grad_clip=float(exp_cfg["training"].get("grad_clip", 0.0)),
+                amp=bool(exp_cfg["training"].get("amp", True)),
+                early_stopping_patience=int(
+                    exp_cfg["training"].get(
+                        "early_stopping_patience_ctdm",
+                        exp_cfg["training"].get("early_stopping_patience", 20),
+                    )
+                ),
+                num_workers=int(exp_cfg["training"].get("num_workers", 4)),
+                device=device,
+                use_tqdm=bool(exp_cfg["training"].get("use_tqdm", True)),
+                class_weights=None,
+                max_batches_per_epoch=exp_cfg["training"].get(
+                    "max_batches_per_epoch_ctdm",
+                    exp_cfg["training"].get("max_batches_per_epoch"),
+                ),
+                min_epochs=int(
+                    exp_cfg["training"].get(
+                        "min_epochs_ctdm",
+                        exp_cfg["training"].get("min_epochs", 30),
+                    )
+                ),
+            )
+            ctdm_eval_cfg = exp_cfg.get("evaluation", {})
+            ctdm_max_eval_samples = int(
+                ctdm_eval_cfg.get("max_samples", 0)
+            ) if isinstance(ctdm_eval_cfg, dict) else 0
+
+            def _maybe_subset_ctdm(ds):
+                if ctdm_max_eval_samples > 0:
+                    return Subset(ds, list(range(min(len(ds), ctdm_max_eval_samples))))
+                return ds
+
+            def _make_ctdm_loader(ds, shuffle: bool) -> DataLoader:
+                return DataLoader(
+                    ds,
+                    batch_size=ctdm_train_cfg.batch_size,
+                    shuffle=shuffle,
+                    num_workers=ctdm_train_cfg.num_workers,
+                    pin_memory=(device == "cuda"),
+                    persistent_workers=ctdm_train_cfg.num_workers > 0,
+                )
+
+            ctdm_train_ds = ds_train if train_max_samples <= 0 else Subset(
+                ds_train, list(range(min(len(ds_train), train_max_samples)))
+            )
+            ctdm_val_ds = _maybe_subset_ctdm(ds_val)
+            ctdm_pretrain_dir = os.path.join(
+                base_ckpt_dir, source_dataset_name, "rumordiffusion_ctdm", f"seed{seed}"
+            )
+            os.makedirs(ctdm_pretrain_dir, exist_ok=True)
+            ctdm_pretrain_path = os.path.join(ctdm_pretrain_dir, ckpt_filename)
+            if not args.eval_only:
+                logging.info("CTDM pretraining started")
+                ctdm_trainer = Trainer(model=ctdm, cfg=ctdm_train_cfg)
+                ctdm_fit_out = ctdm_trainer.fit(
+                    train_loader=_make_ctdm_loader(ctdm_train_ds, shuffle=True),
+                    val_loader=_make_ctdm_loader(ctdm_val_ds, shuffle=False),
+                    save_path=ctdm_pretrain_path,
+                )
+                logging.info(
+                    "CTDM pretraining best val macro F1: "
+                    f"{ctdm_fit_out.get('best_val_macro_f1', ctdm_fit_out.get('best_val_metric', 0.0)):.4f}"
+                )
+            if os.path.isfile(ctdm_pretrain_path):
+                ctdm_state = torch.load(ctdm_pretrain_path, map_location=device)
+                ctdm.load_state_dict(ctdm_state)
+            elif not args.eval_only:
+                raise FileNotFoundError(
+                    f"Missing CTDM pretraining checkpoint at {ctdm_pretrain_path}"
+                )
 
             # RumorDiffusion arbiter and loss config overrides
             rd_loss_cfg = rd_cfg.get("loss", {})
@@ -1178,9 +1609,30 @@ def main() -> None:
         detailed_eval = True
         rd_eval_cfg = rd_cfg.get("evaluation", model_cfg.get(
             "evaluation", {})) if name == "rumordiffusion" else {}
+        export_pred_cfg = eval_cfg.get("export_predictions", {}) if isinstance(
+            eval_cfg, dict) else {}
+        latency_cfg = eval_cfg.get("latency", {}) if isinstance(
+            eval_cfg, dict) else {}
+        significance_cfg = eval_cfg.get("significance", {}) if isinstance(
+            eval_cfg, dict) else {}
+        revision_rows: List[Dict[str, str]] = []
         eval_start = time.time()
-        test_metrics_base = trainer.evaluate(
-            test_loader, detailed=detailed_eval, class_names=class_names)
+        test_outputs_base = collect_eval_outputs(
+            trainer.model,
+            test_loader,
+            device=device,
+            criterion=trainer.criterion,
+            amp=trainer_cfg.amp,
+            detailed=detailed_eval,
+            class_names=class_names,
+            profile=bool(isinstance(latency_cfg, dict) and latency_cfg.get("enabled", False)),
+            profile_repeat=int(latency_cfg.get("repeat", 1)) if isinstance(latency_cfg, dict) else 1,
+            profile_warmup_batches=int(latency_cfg.get("warmup_batches", 0)) if isinstance(latency_cfg, dict) else 0,
+            profile_max_batches=int(latency_cfg.get("max_batches", 0)) if isinstance(latency_cfg, dict) else 0,
+        )
+        test_metrics_base = test_outputs_base["metrics"]
+        reported_logits = test_outputs_base["logits"]
+        reported_targets = test_outputs_base["targets"]
         eval_seconds = time.time() - eval_start
         logging.info(f"Test loss: {test_metrics_base['loss']:.4f}")
         logging.info(f"Test accuracy: {test_metrics_base['acc']:.4f}")
@@ -1188,6 +1640,22 @@ def main() -> None:
         if "report" in test_metrics_base:
             logging.info("\n=== Test Set Evaluation Report ===")
             logging.info(f"\n{test_metrics_base['report']}")
+        if len(test_outputs_base["latency_ms"]) > 0:
+            latency_stats = summarize_latency_ms(test_outputs_base["latency_ms"])
+            revision_rows.append(
+                build_revision_row(
+                    timestamp=run_ts,
+                    dataset_name=dataset_name,
+                    model_name=name,
+                    seed=int(seed),
+                    artifact_type="latency_profile",
+                    tag="main",
+                    values={
+                        "latency_mean_ms": latency_stats["mean_ms"],
+                        "latency_p95_ms": latency_stats["p95_ms"],
+                    },
+                )
+            )
 
         sweeps_rows: List[List[str]] = []
 
@@ -1214,6 +1682,72 @@ def main() -> None:
                 "" if extras.get(
                     "calibration_temp", None) is None else f"{extras['calibration_temp']:.6f}",
             ])
+
+        def evaluate_early_stop_setting(
+            obs_minutes: int,
+            num_samples: int,
+            tau_low_value: float,
+            tau_high_value: float,
+            gamma_value: float,
+            rumor_classes_value: Sequence[int],
+            max_batches_value: int,
+        ) -> Dict[str, float]:
+            total_seen = 0
+            resolved = 0
+            correct = 0
+            mean_prob_accum = 0.0
+            mean_uncert_accum = 0.0
+            batch_count = 0
+            latency_ms: List[float] = []
+            obs_backup_local = int(getattr(m.ctdm, "obs_minutes", obs_minutes))
+            m.ctdm.obs_minutes = int(obs_minutes)
+            try:
+                for batch in test_loader:
+                    if int(max_batches_value) > 0 and batch_count >= int(max_batches_value):
+                        break
+                    batch_count += 1
+                    profile_cuda_boundary(device)
+                    start = time.perf_counter()
+                    rumor_prob, rumor_var = trainer.model.predict_with_uncertainty(
+                        batch,
+                        num_samples=int(num_samples),
+                        rumor_classes=list(rumor_classes_value),
+                    )
+                    profile_cuda_boundary(device)
+                    latency_ms.append((time.perf_counter() - start) * 1000.0 / max(1, int(rumor_prob.numel())))
+                    decision = torch.full_like(rumor_prob, -1, dtype=torch.long)
+                    decision = torch.where(
+                        (rumor_prob > float(tau_high_value)) & (rumor_var < float(gamma_value)),
+                        torch.ones_like(decision),
+                        decision,
+                    )
+                    decision = torch.where(
+                        (rumor_prob < float(tau_low_value)) & (rumor_var < float(gamma_value)),
+                        torch.zeros_like(decision),
+                        decision,
+                    )
+                    target_bin = torch.isin(
+                        batch.y.view(-1),
+                        torch.tensor(list(rumor_classes_value), device=decision.device),
+                    ).long().view_as(decision)
+                    resolved_mask = decision >= 0
+                    resolved += int(resolved_mask.sum().item())
+                    total_seen += int(decision.numel())
+                    if resolved_mask.any():
+                        correct += int((decision[resolved_mask] == target_bin[resolved_mask]).sum().item())
+                    mean_prob_accum += float(rumor_prob.mean().item())
+                    mean_uncert_accum += float(rumor_var.mean().item())
+            finally:
+                m.ctdm.obs_minutes = obs_backup_local
+            latency_stats = summarize_latency_ms(latency_ms)
+            return {
+                "coverage": float(resolved / max(1, total_seen)),
+                "acc_resolved": float(correct / max(1, resolved)),
+                "mean_prob": float(mean_prob_accum / max(1, batch_count)),
+                "mean_var": float(mean_uncert_accum / max(1, batch_count)),
+                "latency_mean_ms": latency_stats["mean_ms"],
+                "latency_p95_ms": latency_stats["p95_ms"],
+            }
 
         push_sweep("main", test_metrics_base, {
                    "train_seconds": train_seconds, "eval_seconds": eval_seconds})
@@ -1243,6 +1777,12 @@ def main() -> None:
             "gamma", 0.02)) if early_stop_enabled else 0.0
         rumor_classes_cfg = early_stop_cfg.get(
             "rumor_classes", [1, 2, 3]) if early_stop_enabled else []
+        early_stop_max_batches = int(early_stop_cfg.get(
+            "max_batches", 0)) if isinstance(early_stop_cfg, dict) else 0
+        sampling_sweep_cfg = rd_eval_cfg.get(
+            "sampling_sweep", {}) if isinstance(rd_eval_cfg, dict) else {}
+        threshold_sweep_cfg = rd_eval_cfg.get(
+            "threshold_sweep", {}) if isinstance(rd_eval_cfg, dict) else {}
         if name == "rumordiffusion" and hasattr(m, "ctdm") and isinstance(early_windows, (list, tuple)) and len(early_windows) > 0:
             obs_backup = int(getattr(m.ctdm, "obs_minutes", 30))
             for t in early_windows:
@@ -1251,46 +1791,104 @@ def main() -> None:
                     test_loader, detailed=True, class_names=class_names)
                 push_sweep(f"early_{t}", metrics_early, {"obs_minutes": t})
                 if early_stop_enabled and hasattr(trainer.model, "predict_with_uncertainty"):
-                    total_seen = 0
-                    resolved = 0
-                    correct = 0
-                    mean_prob_accum = 0.0
-                    mean_uncert_accum = 0.0
-                    batch_count = 0
-                    max_early_stop_batches = int(early_stop_cfg.get(
-                        "max_batches", 10)) if isinstance(early_stop_cfg, dict) else 10
-                    for batch in test_loader:
-                        if batch_count >= max_early_stop_batches:
-                            break
-                        batch_count += 1
-                        rumor_prob, rumor_var = trainer.model.predict_with_uncertainty(
-                            batch,
-                            num_samples=early_stop_samples,
-                            rumor_classes=rumor_classes_cfg,
-                        )
-                        decision = torch.full_like(
-                            rumor_prob, -1, dtype=torch.long)
-                        decision = torch.where((rumor_prob > tau_high) & (
-                            rumor_var < gamma_uncert), torch.ones_like(decision), decision)
-                        decision = torch.where((rumor_prob < tau_low) & (
-                            rumor_var < gamma_uncert), torch.zeros_like(decision), decision)
-                        target_bin = torch.isin(batch.y.view(-1), torch.tensor(
-                            rumor_classes_cfg, device=decision.device)).long().view_as(decision)
-                        resolved_mask = decision >= 0
-                        resolved += int(resolved_mask.sum().item())
-                        total_seen += int(decision.numel())
-                        if resolved_mask.any():
-                            correct += int((decision[resolved_mask] ==
-                                           target_bin[resolved_mask]).sum().item())
-                        mean_prob_accum += float(rumor_prob.mean().item())
-                        mean_uncert_accum += float(rumor_var.mean().item())
-                    coverage = resolved / max(1, total_seen)
-                    acc_resolved = correct / max(1, resolved)
+                    early_stop_result = evaluate_early_stop_setting(
+                        obs_minutes=int(t),
+                        num_samples=int(early_stop_samples),
+                        tau_low_value=float(tau_low),
+                        tau_high_value=float(tau_high),
+                        gamma_value=float(gamma_uncert),
+                        rumor_classes_value=rumor_classes_cfg,
+                        max_batches_value=int(early_stop_max_batches),
+                    )
                     logging.info(
                         f"[EarlyStop] obs_minutes={t}, samples={early_stop_samples}, "
-                        f"coverage={coverage:.4f}, acc_resolved={acc_resolved:.4f}, "
-                        f"mean_prob={mean_prob_accum/max(1, batch_count):.4f}, mean_var={mean_uncert_accum/max(1, batch_count):.4f}"
+                        f"coverage={early_stop_result['coverage']:.4f}, acc_resolved={early_stop_result['acc_resolved']:.4f}, "
+                        f"mean_prob={early_stop_result['mean_prob']:.4f}, mean_var={early_stop_result['mean_var']:.4f}, "
+                        f"latency_mean_ms={early_stop_result['latency_mean_ms']:.4f}, latency_p95_ms={early_stop_result['latency_p95_ms']:.4f}"
                     )
+                    revision_rows.append(
+                        build_revision_row(
+                            timestamp=run_ts,
+                            dataset_name=dataset_name,
+                            model_name=name,
+                            seed=int(seed),
+                            artifact_type="early_stop",
+                            tag=f"early_{t}",
+                            values={
+                                "obs_minutes": int(t),
+                                "samples": int(early_stop_samples),
+                                "tau_low": float(tau_low),
+                                "tau_high": float(tau_high),
+                                "gamma": float(gamma_uncert),
+                                **early_stop_result,
+                            },
+                        )
+                    )
+                    if isinstance(sampling_sweep_cfg, dict) and bool(sampling_sweep_cfg.get("enabled", False)):
+                        for sweep_samples in sampling_sweep_cfg.get("samples", []):
+                            sweep_result = evaluate_early_stop_setting(
+                                obs_minutes=int(t),
+                                num_samples=int(sweep_samples),
+                                tau_low_value=float(tau_low),
+                                tau_high_value=float(tau_high),
+                                gamma_value=float(gamma_uncert),
+                                rumor_classes_value=rumor_classes_cfg,
+                                max_batches_value=int(sampling_sweep_cfg.get("max_batches", early_stop_max_batches)),
+                            )
+                            revision_rows.append(
+                                build_revision_row(
+                                    timestamp=run_ts,
+                                    dataset_name=dataset_name,
+                                    model_name=name,
+                                    seed=int(seed),
+                                    artifact_type="sampling_sweep",
+                                    tag=f"early_{t}_samples_{int(sweep_samples)}",
+                                    values={
+                                        "obs_minutes": int(t),
+                                        "samples": int(sweep_samples),
+                                        "tau_low": float(tau_low),
+                                        "tau_high": float(tau_high),
+                                        "gamma": float(gamma_uncert),
+                                        **sweep_result,
+                                    },
+                                )
+                            )
+                    if isinstance(threshold_sweep_cfg, dict) and bool(threshold_sweep_cfg.get("enabled", False)):
+                        tau_low_list = threshold_sweep_cfg.get("tau_low", [])
+                        tau_high_list = threshold_sweep_cfg.get("tau_high", [])
+                        gamma_list = threshold_sweep_cfg.get("gamma", [])
+                        for tau_low_value in tau_low_list:
+                            for tau_high_value in tau_high_list:
+                                if float(tau_low_value) >= float(tau_high_value):
+                                    continue
+                                for gamma_value in gamma_list:
+                                    sweep_result = evaluate_early_stop_setting(
+                                        obs_minutes=int(t),
+                                        num_samples=int(threshold_sweep_cfg.get("samples", early_stop_samples)),
+                                        tau_low_value=float(tau_low_value),
+                                        tau_high_value=float(tau_high_value),
+                                        gamma_value=float(gamma_value),
+                                        rumor_classes_value=rumor_classes_cfg,
+                                        max_batches_value=int(threshold_sweep_cfg.get("max_batches", early_stop_max_batches)),
+                                    )
+                                    revision_rows.append(
+                                        build_revision_row(
+                                            timestamp=run_ts,
+                                            dataset_name=dataset_name,
+                                            model_name=name,
+                                            seed=int(seed),
+                                            artifact_type="threshold_sweep",
+                                            tag=f"early_{t}_tau{float(tau_low_value):.2f}_{float(tau_high_value):.2f}_gamma{float(gamma_value):.2f}",
+                                            values={
+                                                "obs_minutes": int(t),
+                                                "samples": int(threshold_sweep_cfg.get("samples", early_stop_samples)),
+                                                "tau_low": float(tau_low_value),
+                                                "tau_high": float(tau_high_value),
+                                                "gamma": float(gamma_value),
+                                                **sweep_result,
+                                            },
+                                        )
+                                    )
             m.ctdm.obs_minutes = obs_backup
         robust_cfg = rd_eval_cfg.get("robustness", {}) if isinstance(
             rd_eval_cfg, dict) else {}
@@ -1386,9 +1984,70 @@ def main() -> None:
                 f"ECE={test_metrics_cal.get('ece', 0.0):.4f}"
             )
             test_metrics = test_metrics_cal
+            reported_logits = logits_scaled
+            reported_targets = test_targets
             calibration_temp = float(temp_opt)
             push_sweep("calibrated", test_metrics_cal, {
                        "calibration_temp": calibration_temp})
+        if bool(isinstance(export_pred_cfg, dict) and export_pred_cfg.get("enabled", False)):
+            export_prediction_rows(
+                csv_path=prediction_csv,
+                dataset_name=dataset_name,
+                model_name=name,
+                seed=int(seed),
+                tag="main",
+                source_ids=test_outputs_base["source_ids"],
+                logits=reported_logits,
+                targets=reported_targets,
+            )
+        if bool(isinstance(significance_cfg, dict) and significance_cfg.get("enabled", False)) and bool(isinstance(export_pred_cfg, dict) and export_pred_cfg.get("enabled", False)):
+            compare_models = significance_cfg.get("baseline_models", [])
+            metric_names = significance_cfg.get("metrics", ["macro_f1", "acc"])
+            bootstrap_rounds = int(significance_cfg.get("n_bootstrap", 1000))
+            current_rows = load_prediction_rows(
+                csv_path=prediction_csv,
+                dataset_name=dataset_name,
+                model_name=name,
+                seed=int(seed),
+                tag="main",
+            )
+            for compare_model in compare_models:
+                baseline_rows = load_prediction_rows(
+                    csv_path=prediction_csv,
+                    dataset_name=dataset_name,
+                    model_name=str(compare_model),
+                    seed=int(seed),
+                    tag="main",
+                )
+                if len(current_rows) == 0 or len(baseline_rows) == 0:
+                    continue
+                for metric_name in metric_names:
+                    stats = bootstrap_compare_predictions(
+                        current_rows=current_rows,
+                        baseline_rows=baseline_rows,
+                        metric_name=str(metric_name),
+                        n_bootstrap=bootstrap_rounds,
+                        random_seed=int(seed),
+                    )
+                    revision_rows.append(
+                        build_revision_row(
+                            timestamp=run_ts,
+                            dataset_name=dataset_name,
+                            model_name=name,
+                            seed=int(seed),
+                            artifact_type="significance",
+                            tag="main",
+                            values={
+                                "compare_model": str(compare_model),
+                                "metric": str(metric_name),
+                                "delta": stats["delta"],
+                                "p_value": stats["p_value"],
+                                "ci_low": stats["ci_low"],
+                                "ci_high": stats["ci_high"],
+                                "notes": f"paired_bootstrap_n={int(bootstrap_rounds)} shared={int(stats['count'])}",
+                            },
+                        )
+                    )
         if wb_enabled:
             import wandb
 
@@ -1449,6 +2108,7 @@ def main() -> None:
             ],
         )
         append_rows_csv(sweeps_csv, sweeps_headers, sweeps_rows)
+        append_dict_rows_csv(revision_artifacts_csv, revision_headers, revision_rows)
         if dataset_name != source_dataset_name:
             transfer_headers = [
                 "timestamp",
@@ -1489,7 +2149,7 @@ def main() -> None:
             }
         )
 
-        if len(seed_results) == len(seeds):
+        if len(seeds) > 1 and len(seed_results) == len(seeds):
             agg_headers = result_headers
             mean_val, std_val = aggregate_numeric(
                 [r["val_macro_f1"] for r in seed_results])

@@ -11,9 +11,16 @@
 source /share/home/hwxu/miniconda3/bin/activate hw
 cd /share/home/hwxu/Researches/D2Plus
 
-EXP_CFG="Libs/configs/exp.yaml"
-MODEL_CFGS="Libs/configs/baselines/rumordiffusion.yaml,Libs/configs/baselines/rumordiffusion_ablate_ddgan.yaml,Libs/configs/baselines/rumordiffusion_ablate_pair.yaml,Libs/configs/baselines/rumordiffusion_ablate_text.yaml,Libs/configs/baselines/rumordiffusion_ablate_temporal.yaml"
-SEEDS="${SEEDS_OVERRIDE:-42,43,44}"
+EXP_CFG=${EXP_CFG:-"Libs/configs/exp.yaml"}
+MODEL_CFGS="${MODEL_CFGS_OVERRIDE:-Libs/configs/baselines/rumordiffusion.yaml,Libs/configs/baselines/rumordiffusion_ablate_ddgan.yaml,Libs/configs/baselines/rumordiffusion_ablate_pair.yaml,Libs/configs/baselines/rumordiffusion_ablate_text.yaml,Libs/configs/baselines/rumordiffusion_ablate_temporal.yaml}"
+SEEDS_DEFAULT=$(python3 - "${EXP_CFG}" <<'PY'
+import yaml
+import sys
+cfg = yaml.safe_load(open(sys.argv[1]))
+print(",".join(str(s) for s in cfg.get("experiment", {}).get("seeds", [42])))
+PY
+)
+SEEDS="${SEEDS_OVERRIDE:-$SEEDS_DEFAULT}"
 DATASET_OVERRIDE="${DATASET_OVERRIDE:-}"
 
 CMD="python3 -m Libs.exp.run --exp ${EXP_CFG} --model ${MODEL_CFGS} --seeds ${SEEDS}"

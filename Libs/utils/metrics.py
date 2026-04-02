@@ -254,7 +254,12 @@ def metrics_from_logits(
     probs = torch.softmax(logits, dim=1)
 
     nll = float(F.cross_entropy(logits, targets).item())
-    result: Dict[str, Union[float, str, Dict]] = {"acc": acc, "macro_f1": macro_f1, "nll": nll}
+    result: Dict[str, Union[float, str, Dict]] = {
+        "acc": acc,
+        "macro_f1": macro_f1,
+        "loss": nll,
+        "nll": nll,
+    }
     if compute_calibration:
         result["ece"] = compute_ece(probs, targets, n_bins=ece_bins)
 
@@ -284,5 +289,4 @@ def metrics_from_logits(
         )
 
     return result
-
 

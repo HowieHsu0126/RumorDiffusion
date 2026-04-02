@@ -215,7 +215,6 @@ class Trainer:
         all_logits = torch.cat(all_logits, dim=0)
         all_targets = torch.cat(all_targets, dim=0)
         
-        from Libs.utils.metrics import metrics_from_logits
         num_classes = all_logits.size(1)
         metrics = metrics_from_logits(all_logits, all_targets, num_classes, detailed=True, class_names=class_names)
         metrics['loss'] = total_loss / max(1, total)

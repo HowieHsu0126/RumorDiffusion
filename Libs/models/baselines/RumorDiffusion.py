@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.cuda.amp import autocast
+from torch_geometric.data import Batch
 
 
 class ArbiterMLP(nn.Module):
@@ -302,12 +303,29 @@ class RumorDiffusion(nn.Module):
         if hasattr(batch, "h0") and hasattr(batch, "h1"):
             return torch.stack([batch.h0, batch.h1], dim=1)
         assert self.ctdm is not None, "CTDM is required when potentials are not present in the batch"
-        if self.training:
-            Hc: Tensor = self.ctdm.potentials_all_grad(batch)
-        else:
-            Hc: Tensor = self.ctdm.infer_potentials_all(batch)
+        Hc = self._compute_ctdm_potentials(batch)
         self._last_potentials = Hc
         return Hc
+
+    def _compute_ctdm_potentials(self, batch) -> Tensor:
+        assert self.ctdm is not None, "CTDM is required when potentials are not present in the batch"
+        ctdm_trainable = self.training and any(p.requires_grad for p in self.ctdm.parameters())
+        if not hasattr(batch, "num_graphs") or int(batch.num_graphs) <= 1:
+            if ctdm_trainable:
+                return self.ctdm.potentials_all_grad(batch)
+            return self.ctdm.infer_potentials_all(batch)
+
+        device = next(self.parameters()).device
+        data_list = batch.to_data_list()
+        potentials: List[Tensor] = []
+        for data in data_list:
+            single_batch = Batch.from_data_list([data]).to(device)
+            if ctdm_trainable:
+                Hc_single = self.ctdm.potentials_all_grad(single_batch)
+            else:
+                Hc_single = self.ctdm.infer_potentials_all(single_batch)
+            potentials.append(Hc_single)
+        return torch.cat(potentials, dim=0)
 
     def forward(self, batch) -> Tensor:
         """Build token sequence and arbitrate via Transformer [CLS] output by default."""
@@ -329,10 +347,7 @@ class RumorDiffusion(nn.Module):
                 x = self.input_drop(self.input_norm(x))
                 return self.arbiter(x)
             assert self.ctdm is not None, "CTDM is required when potentials are not present in the batch"
-            if self.training:
-                Hc = self.ctdm.potentials_all_grad(batch)
-            else:
-                Hc = self.ctdm.infer_potentials_all(batch)
+            Hc = self._compute_ctdm_potentials(batch)
             self._last_potentials = Hc
             x = torch.cat([Hc[:, 0, :], Hc[:, 1, :]], dim=-1)
             x = self.input_drop(self.input_norm(x))
@@ -492,7 +507,7 @@ class RumorDiffusion(nn.Module):
 
         if self.dd_gan_enabled:
             assert self.ctdm is not None, "CTDM is required when dd_gan_enabled=True"
-            Hc: Tensor = self.ctdm.potentials_all_grad(batch)  # [B, C, H]
+            Hc = self._compute_ctdm_potentials(batch)
             self._last_potentials = Hc
 
             B, C, H = int(Hc.size(0)), int(Hc.size(1)), int(Hc.size(2))
@@ -713,5 +728,3 @@ class RumorDiffusion(nn.Module):
         if self.loss_logging:
             self._last_loss_breakdown = loss_dict
         return loss, 0.0
-
-
