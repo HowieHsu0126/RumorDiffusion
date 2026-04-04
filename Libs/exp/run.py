@@ -1,6 +1,8 @@
 import argparse
 import collections
+import copy
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -20,7 +22,8 @@ from torch_geometric.loader import DataLoader
 
 from Libs.data.dataset import GraphDataset
 from Libs.exp.trainer import (CGVAEConfig, CGVAETrainer, LinkPredConfig,
-                              LinkPredTrainer, Trainer, TrainerConfig)
+                              LinkPredTrainer, Trainer, TrainerConfig,
+                              unpack_checkpoint_payload)
 from Libs.models.baselines.APPNPNet import APPNPNet
 from Libs.models.baselines.BiGCN import BiGCN
 from Libs.models.baselines.CTDM_syn import CTDMSyn
@@ -38,7 +41,7 @@ from Libs.models.baselines.TextOnly import TextOnlyClassifier
 from Libs.models.baselines.TGAT import TGAT
 from Libs.models.baselines.TGN import TGN
 from Libs.models.modules.rumor_diffusion import _extract_source_ids_from_batch
-from Libs.utils.metrics import compute_accuracy, compute_macro_f1, metrics_from_logits
+from Libs.utils.metrics import compute_accuracy, compute_ece, compute_macro_f1, metrics_from_logits
 from Libs.utils.seed import set_global_seed
 
 # 屏蔽警告
@@ -50,6 +53,144 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 def read_yaml_like(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def sha256_text(text: str) -> str:
+    """Returns the SHA256 digest for a UTF-8 string."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def canonical_json_hash(payload: Dict[str, Any]) -> str:
+    """Hashes a JSON-serializable mapping with stable key ordering."""
+    return sha256_text(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+
+
+def compute_split_signature(dataset_root: str) -> str:
+    """Computes a stable signature for the split definition of a processed dataset."""
+    splits_path = os.path.join(dataset_root, "splits.json")
+    if not os.path.isfile(splits_path):
+        raise FileNotFoundError(f"Missing split definition: {splits_path}")
+    with open(splits_path, "r", encoding="utf-8") as f:
+        return sha256_text(f.read())
+
+
+def resolve_dataset_label_mapping(dataset_name: str) -> Dict[str, int]:
+    """Returns the label mapping configured for a dataset in `dataset.yaml`."""
+    dataset_cfg = read_yaml_like(os.path.join("Libs", "configs", "dataset.yaml"))
+    label_cfg = dataset_cfg.get("dataset", {}).get("labels", {})
+    overrides = label_cfg.get("overrides", {}) if isinstance(label_cfg.get("overrides", {}), dict) else {}
+    mapping = overrides.get(dataset_name, {}).get("map", label_cfg.get("map", {}))
+    if not isinstance(mapping, dict):
+        raise TypeError(f"Invalid label mapping for dataset={dataset_name}")
+    return {str(key): int(value) for key, value in mapping.items()}
+
+
+def build_checkpoint_metadata(
+    model_name: str,
+    stage: str,
+    dataset_name: str,
+    dataset_root: str,
+    seed: int,
+    label_mapping: Dict[str, int],
+    config_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Builds a strict metadata contract for serialized checkpoints."""
+    return {
+        "format_version": 1,
+        "model_name": str(model_name),
+        "stage": str(stage),
+        "dataset_name": str(dataset_name),
+        "seed": int(seed),
+        "split_signature": compute_split_signature(dataset_root),
+        "label_mapping": {str(key): int(value) for key, value in label_mapping.items()},
+        "config_hash": canonical_json_hash(config_payload),
+    }
+
+
+def validate_checkpoint_metadata(
+    ckpt_path: str,
+    metadata: Dict[str, Any],
+    expected_metadata: Dict[str, Any],
+    ignored_keys: Optional[Sequence[str]] = None,
+) -> None:
+    """Validates a loaded checkpoint against the expected dataset/model contract."""
+    ignored = {str(key) for key in (ignored_keys or [])}
+    missing_keys = [key for key in expected_metadata.keys() if key not in ignored and key not in metadata]
+    if missing_keys:
+        raise ValueError(
+            f"Checkpoint {ckpt_path} is missing metadata keys: {', '.join(sorted(missing_keys))}"
+        )
+    mismatches: List[str] = []
+    for key, expected_value in expected_metadata.items():
+        if key in ignored:
+            continue
+        observed_value = metadata.get(key)
+        if observed_value != expected_value:
+            mismatches.append(
+                f"{key}: expected={expected_value!r}, observed={observed_value!r}"
+            )
+    if mismatches:
+        mismatch_text = "; ".join(mismatches)
+        raise ValueError(f"Checkpoint metadata mismatch for {ckpt_path}: {mismatch_text}")
+
+
+def load_checkpoint_state(
+    ckpt_path: str,
+    device: str,
+    expected_metadata: Optional[Dict[str, Any]] = None,
+    validate_metadata: bool = False,
+    allow_legacy: bool = True,
+    ignored_metadata_keys: Optional[Sequence[str]] = None,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    """Loads a checkpoint payload and optionally enforces metadata validation."""
+    payload = torch.load(ckpt_path, map_location=device)
+    state_dict, metadata_raw = unpack_checkpoint_payload(payload)
+    metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
+    if validate_metadata:
+        if len(metadata) == 0:
+            if allow_legacy:
+                return state_dict, metadata
+            raise ValueError(
+                f"Checkpoint {ckpt_path} has no metadata payload; "
+                "recreate or migrate the checkpoint before evaluation."
+            )
+        if expected_metadata is None:
+            raise ValueError("Expected checkpoint metadata must be provided when validation is enabled.")
+        validate_checkpoint_metadata(
+            ckpt_path,
+            metadata,
+            expected_metadata,
+            ignored_keys=ignored_metadata_keys,
+        )
+    return state_dict, metadata
+
+
+def resolve_max_nodes_setting(scanned_max_nodes: int, configured_max_nodes: int, context: str) -> int:
+    """Resolves `max_nodes` without silent truncation."""
+    if int(scanned_max_nodes) <= 0:
+        raise ValueError(f"{context}: scanned max_nodes must be positive")
+    if int(configured_max_nodes) <= 0:
+        return int(scanned_max_nodes)
+    if int(scanned_max_nodes) > int(configured_max_nodes):
+        raise ValueError(
+            f"{context}: scanned max_nodes={int(scanned_max_nodes)} exceeds configured max_nodes={int(configured_max_nodes)}. "
+            "Use max_nodes: 0 to resolve from the training split or raise the configured budget."
+        )
+    return int(configured_max_nodes)
+
+
+def checkpoint_relevant_rumordiffusion_cfg(rd_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Drops evaluation-only fields before hashing RumorDiffusion checkpoints."""
+    filtered = copy.deepcopy(rd_cfg)
+    for key in ("checkpoint", "evaluation", "explain"):
+        if key in filtered:
+            filtered.pop(key)
+    text_cfg = filtered.get("text", {})
+    if isinstance(text_cfg, dict) and "robust_text" in text_cfg:
+        text_cfg = dict(text_cfg)
+        text_cfg.pop("robust_text")
+        filtered["text"] = text_cfg
+    return filtered
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -146,11 +287,24 @@ def append_dict_rows_csv(csv_path: str, headers: List[str], rows: List[Dict[str,
     if len(rows) == 0:
         return
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    exists = os.path.isfile(csv_path)
-    with open(csv_path, "a", encoding="utf-8", newline="") as f:
+    existing_rows: List[Dict[str, str]] = []
+    if os.path.isfile(csv_path):
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            existing_headers = reader.fieldnames or []
+            if existing_headers == headers:
+                with open(csv_path, "a", encoding="utf-8", newline="") as fa:
+                    writer = csv.DictWriter(fa, fieldnames=headers, extrasaction="ignore")
+                    writer.writerows(rows)
+                return
+            for row in reader:
+                normalized = {key: row.get(key, "") for key in headers}
+                existing_rows.append(normalized)
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
-        if not exists:
-            writer.writeheader()
+        writer.writeheader()
+        if existing_rows:
+            writer.writerows(existing_rows)
         writer.writerows(rows)
 
 
@@ -280,6 +434,11 @@ def collect_eval_outputs(
 
     logits_cat = torch.cat(logits_list, dim=0)
     targets_cat = torch.cat(target_list, dim=0)
+    if len(source_ids) != int(targets_cat.size(0)):
+        raise ValueError(
+            f"Prediction export alignment mismatch: collected {len(source_ids)} source ids "
+            f"for {int(targets_cat.size(0))} targets."
+        )
     metrics = metrics_from_logits(
         logits_cat,
         targets_cat,
@@ -323,6 +482,10 @@ def export_prediction_rows(
     ]
     probs = torch.softmax(logits, dim=1)
     preds = torch.argmax(logits, dim=1)
+    if len(source_ids) != int(targets.size(0)):
+        raise ValueError(
+            f"Cannot export predictions: {len(source_ids)} source ids vs {int(targets.size(0))} targets."
+        )
     rows: List[Dict[str, str]] = []
     for idx, source_id in enumerate(source_ids):
         rows.append(
@@ -388,22 +551,33 @@ def bootstrap_compare_predictions(
     preds_baseline = torch.tensor([int(baseline_rows[sid]["pred"]) for sid in shared_ids], dtype=torch.long)
     metric_name = str(metric_name).lower()
 
-    def metric_value(preds: torch.Tensor) -> float:
+    def metric_value(preds: torch.Tensor, target_subset: torch.Tensor) -> float:
         if metric_name == "acc":
-            return compute_accuracy(preds, targets)
+            return compute_accuracy(preds, target_subset)
         if metric_name == "macro_f1":
-            num_classes = int(max(int(targets.max().item()), int(preds_current.max().item()), int(preds_baseline.max().item())) + 1)
-            return compute_macro_f1(preds, targets, num_classes=num_classes)
+            num_classes = int(
+                max(
+                    int(target_subset.max().item()),
+                    int(preds.max().item()),
+                ) + 1
+            )
+            return compute_macro_f1(preds, target_subset, num_classes=num_classes)
         raise ValueError(f"Unsupported significance metric: {metric_name}")
 
-    delta_full = float(metric_value(preds_current) - metric_value(preds_baseline))
+    delta_full = float(metric_value(preds_current, targets) - metric_value(preds_baseline, targets))
     generator = torch.Generator()
     generator.manual_seed(int(random_seed))
     sample_count = int(targets.numel())
     deltas: List[float] = []
     for _ in range(max(1, int(n_bootstrap))):
         sample_idx = torch.randint(low=0, high=sample_count, size=(sample_count,), generator=generator)
-        deltas.append(float(metric_value(preds_current[sample_idx]) - metric_value(preds_baseline[sample_idx])))
+        sampled_targets = targets[sample_idx]
+        deltas.append(
+            float(
+                metric_value(preds_current[sample_idx], sampled_targets)
+                - metric_value(preds_baseline[sample_idx], sampled_targets)
+            )
+        )
     ordered = sorted(deltas)
     non_positive = sum(1 for delta in ordered if delta <= 0.0)
     non_negative = sum(1 for delta in ordered if delta >= 0.0)
@@ -441,6 +615,8 @@ def build_revision_row(
         "gamma": "",
         "coverage": "",
         "acc_resolved": "",
+        "resolved_macro_f1": "",
+        "resolved_ece": "",
         "mean_prob": "",
         "mean_var": "",
         "latency_mean_ms": "",
@@ -642,6 +818,8 @@ def build_model(name: str, cfg: Dict[str, Any], num_features: int, num_classes: 
         # Optional inference stride
         if "t_stride" in cfg:
             setattr(m, "t_stride", int(cfg["t_stride"]))
+        if "sampling_eta" in cfg:
+            m.sampling_eta = float(cfg["sampling_eta"])
         return m
     if name == "gat":
         m = GAT(
@@ -713,6 +891,10 @@ def setup_logging(log_dir: str, dataset: str, model_name: str, seed: int | None 
     ch = logging.StreamHandler(stream=sys.stdout)
     ch.setFormatter(fmt)
     logger.addHandler(ch)
+    if log_path:
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
     return log_path
 
 
@@ -791,6 +973,8 @@ def main() -> None:
         "gamma",
         "coverage",
         "acc_resolved",
+        "resolved_macro_f1",
+        "resolved_ece",
         "mean_prob",
         "mean_var",
         "latency_mean_ms",
@@ -847,6 +1031,7 @@ def main() -> None:
 
     num_features = ds_train.num_features
     num_classes = ds_train.num_classes
+    dataset_label_mapping = resolve_dataset_label_mapping(source_dataset_name)
 
     os.makedirs(base_results_dir, exist_ok=True)
     csv_path = os.path.join(base_results_dir, f"{dataset_name}.csv")
@@ -1019,13 +1204,16 @@ def main() -> None:
             for raw_idx in ds_train.indices():
                 sample = ds_train.get(raw_idx)
                 max_nodes_scan = max(max_nodes_scan, int(sample.num_nodes))
-            max_nodes_config = int(model_cfg["model"].get("max_nodes", 2048))
-            max_nodes_final = min(max_nodes_scan, max_nodes_config)
-            if max_nodes_final <= 0:
-                raise ValueError("Scanned max nodes must be positive")
+            max_nodes_config = int(model_cfg["model"].get("max_nodes", 0) or 0)
+            max_nodes_final = resolve_max_nodes_setting(
+                scanned_max_nodes=max_nodes_scan,
+                configured_max_nodes=max_nodes_config,
+                context="CTDM-syn",
+            )
             model_cfg["model"]["max_nodes"] = int(max_nodes_final)
             logging.info(
-                f"CTDM-syn: scanned max_nodes={max_nodes_scan}, capped to {max_nodes_final} (config limit: {max_nodes_config})")
+                f"CTDM-syn: scanned max_nodes={max_nodes_scan}, resolved to {max_nodes_final} "
+                f"(config value: {max_nodes_config})")
 
         # Build model for classification or generative baseline
         m = None
@@ -1039,16 +1227,23 @@ def main() -> None:
             rd_cfg_model = model_cfg.get("model", {})
             rd_cfg = _deep_merge(rd_cfg_model, rd_cfg_exp)
             ctdm_cfg = rd_cfg.get("ctdm", {})
+            checkpoint_cfg = rd_cfg.get("checkpoint", {}) if isinstance(rd_cfg.get("checkpoint", {}), dict) else {}
+            validate_ckpt_metadata = bool(checkpoint_cfg.get("validate_metadata", False))
+            allow_legacy_ckpt = bool(checkpoint_cfg.get("allow_legacy", True))
+            ctdm_ckpt_root = str(checkpoint_cfg.get("ctdm_dir", base_ckpt_dir))
             max_nodes_scan = 0
             for split_idx in range(len(ds_train)):
                 sample = ds_train.get(split_idx)
                 max_nodes_scan = max(max_nodes_scan, int(sample.num_nodes))
-            max_nodes_config = int(ctdm_cfg.get("max_nodes", 2048))
-            max_nodes_final = min(max_nodes_scan, max_nodes_config)
-            if max_nodes_final <= 0:
-                raise ValueError("Scanned max nodes must be positive")
+            max_nodes_config = int(ctdm_cfg.get("max_nodes", 0) or 0)
+            max_nodes_final = resolve_max_nodes_setting(
+                scanned_max_nodes=max_nodes_scan,
+                configured_max_nodes=max_nodes_config,
+                context="RumorDiffusion CTDM",
+            )
             logging.info(
-                f"RumorDiffusion CTDM: scanned max_nodes={max_nodes_scan}, capped to {max_nodes_final} (config limit: {max_nodes_config})")
+                f"RumorDiffusion CTDM: scanned max_nodes={max_nodes_scan}, resolved to {max_nodes_final} "
+                f"(config value: {max_nodes_config})")
 
             # 2) Build CTDM
             bb_cfg = ctdm_cfg.get("backbone", {}) if isinstance(
@@ -1123,9 +1318,11 @@ def main() -> None:
             # Defaults per plan: guidance_p=0.2, guidance_scale=2.0
             ctdm.guidance_p = float(ctdm_cfg.get("guidance_p", 0.2))
             ctdm.guidance_scale = float(ctdm_cfg.get("guidance_scale", 2.0))
+            ctdm.sampling_eta = float(ctdm_cfg.get("sampling_eta", 0.0))
             logging.info(
                 f"RD-CTDM cfg -> T={ctdm.T}, stride={getattr(ctdm, 't_stride', 1)}, "
-                f"guidance_scale={ctdm.guidance_scale}, guidance_p={ctdm.guidance_p}"
+                f"guidance_scale={ctdm.guidance_scale}, guidance_p={ctdm.guidance_p}, "
+                f"sampling_eta={ctdm.sampling_eta}"
             )
             if "use_attn_readout" in ctdm_cfg:
                 ctdm.use_attn_readout = bool(ctdm_cfg["use_attn_readout"])
@@ -1241,24 +1438,66 @@ def main() -> None:
             )
             ctdm_val_ds = _maybe_subset_ctdm(ds_val)
             ctdm_pretrain_dir = os.path.join(
-                base_ckpt_dir, source_dataset_name, "rumordiffusion_ctdm", f"seed{seed}"
+                ctdm_ckpt_root, source_dataset_name, "rumordiffusion_ctdm", f"seed{seed}"
             )
             os.makedirs(ctdm_pretrain_dir, exist_ok=True)
             ctdm_pretrain_path = os.path.join(ctdm_pretrain_dir, ckpt_filename)
-            if not args.eval_only:
+            reuse_ctdm_pretrain = bool(exp_cfg["training"].get("reuse_ctdm_pretrain", False))
+            ctdm_checkpoint_metadata = build_checkpoint_metadata(
+                model_name=name,
+                stage="ctdm",
+                dataset_name=source_dataset_name,
+                dataset_root=dataset_root,
+                seed=int(seed),
+                label_mapping=dataset_label_mapping,
+                config_payload={
+                    "ctdm": _deep_merge(ctdm_cfg, {"max_nodes": int(max_nodes_final)}),
+                    "training": {
+                        "epochs_ctdm": int(exp_cfg["training"].get("epochs_ctdm", exp_cfg["training"]["epochs"])),
+                        "lr_ctdm": float(exp_cfg["training"].get("lr_ctdm", exp_cfg["training"].get("lr", 3e-4))),
+                        "weight_decay_ctdm": float(exp_cfg["training"].get("weight_decay_ctdm", exp_cfg["training"].get("weight_decay", 0.0))),
+                        "batch_size_ctdm": int(exp_cfg["training"].get("batch_size_ctdm", 1)),
+                        "early_stopping_patience_ctdm": int(
+                            exp_cfg["training"].get(
+                                "early_stopping_patience_ctdm",
+                                exp_cfg["training"].get("early_stopping_patience", 20),
+                            )
+                        ),
+                        "min_epochs_ctdm": int(
+                            exp_cfg["training"].get(
+                                "min_epochs_ctdm",
+                                exp_cfg["training"].get("min_epochs", 30),
+                            )
+                        ),
+                    },
+                    "prefix": prefix_cfg,
+                    "observability": observability_cfg,
+                },
+            )
+            if (not args.eval_only) and not (reuse_ctdm_pretrain and os.path.isfile(ctdm_pretrain_path)):
                 logging.info("CTDM pretraining started")
                 ctdm_trainer = Trainer(model=ctdm, cfg=ctdm_train_cfg)
                 ctdm_fit_out = ctdm_trainer.fit(
                     train_loader=_make_ctdm_loader(ctdm_train_ds, shuffle=True),
                     val_loader=_make_ctdm_loader(ctdm_val_ds, shuffle=False),
                     save_path=ctdm_pretrain_path,
+                    checkpoint_metadata=ctdm_checkpoint_metadata,
                 )
                 logging.info(
                     "CTDM pretraining best val macro F1: "
                     f"{ctdm_fit_out.get('best_val_macro_f1', ctdm_fit_out.get('best_val_metric', 0.0)):.4f}"
                 )
-            if os.path.isfile(ctdm_pretrain_path):
-                ctdm_state = torch.load(ctdm_pretrain_path, map_location=device)
+            elif (not args.eval_only) and reuse_ctdm_pretrain and os.path.isfile(ctdm_pretrain_path):
+                logging.info(f"Reusing existing CTDM pretraining checkpoint: {ctdm_pretrain_path}")
+            if not args.eval_only and os.path.isfile(ctdm_pretrain_path):
+                ctdm_state, _ = load_checkpoint_state(
+                    ckpt_path=ctdm_pretrain_path,
+                    device=device,
+                    expected_metadata=ctdm_checkpoint_metadata,
+                    validate_metadata=validate_ckpt_metadata,
+                    allow_legacy=allow_legacy_ckpt,
+                    ignored_metadata_keys=["config_hash"],
+                )
                 ctdm.load_state_dict(ctdm_state)
             elif not args.eval_only:
                 raise FileNotFoundError(
@@ -1339,6 +1578,7 @@ def main() -> None:
                     "class_embed_mode", "concat_proj")),
                 cache_potentials=bool(arb_cfg.get("cache_potentials", False)),
                 infer_amp=bool(arb_cfg.get("infer_amp", False)),
+                uncertainty_force_ctdm=bool(arb_cfg.get("uncertainty_force_ctdm", False)),
                 loss_logging=bool(rd_loss_cfg.get("loss_logging", False)),
             )
             # Inject loss hyperparameters and class priors
@@ -1530,10 +1770,14 @@ def main() -> None:
             min_epochs=int(exp_cfg["training"].get("min_epochs", 30)),
         )
 
-        def make_loader(ds: GraphDataset, shuffle: bool, sampler=None) -> DataLoader:
+        eval_cfg = exp_cfg.get("evaluation", {})
+        eval_batch_size = int(eval_cfg.get("batch_size", trainer_cfg.batch_size)) if isinstance(eval_cfg, dict) else int(trainer_cfg.batch_size)
+
+        def make_loader(ds: GraphDataset, shuffle: bool, sampler=None, batch_size: Optional[int] = None) -> DataLoader:
+            resolved_batch_size = int(batch_size) if batch_size is not None else int(trainer_cfg.batch_size)
             return DataLoader(
                 ds,
-                batch_size=trainer_cfg.batch_size,
+                batch_size=resolved_batch_size,
                 shuffle=(False if sampler is not None else shuffle),
                 sampler=sampler,
                 num_workers=trainer_cfg.num_workers,
@@ -1543,7 +1787,6 @@ def main() -> None:
 
         # Use regular shuffle instead of WeightedRandomSampler for balanced datasets
         # (Data is already balanced, so WeightedRandomSampler may introduce noise)
-        eval_cfg = exp_cfg.get("evaluation", {})
         max_eval_samples = int(eval_cfg.get(
             "max_samples", 0)) if isinstance(eval_cfg, dict) else 0
 
@@ -1556,9 +1799,9 @@ def main() -> None:
 
         ds_train_eff = ds_train if train_max_samples <= 0 else Subset(
             ds_train, list(range(min(len(ds_train), train_max_samples))))
-        train_loader = make_loader(ds_train_eff, shuffle=True)
-        val_loader = make_loader(ds_val_eval, shuffle=False)
-        test_loader = make_loader(ds_test_eval, shuffle=False)
+        train_loader = make_loader(ds_train_eff, shuffle=True, batch_size=trainer_cfg.batch_size)
+        val_loader = make_loader(ds_val_eval, shuffle=False, batch_size=eval_batch_size)
+        test_loader = make_loader(ds_test_eval, shuffle=False, batch_size=eval_batch_size)
 
         ckpt_dir = os.path.join(
             base_ckpt_dir, source_dataset_name, name, f"seed{seed}")
@@ -1566,7 +1809,6 @@ def main() -> None:
         ckpt_path = os.path.join(ckpt_dir, ckpt_filename)
         actual_ckpt_path = args.ckpt if args.ckpt else ckpt_path
 
-        logging.info("Training started")
         wb_cfg = exp_cfg.get("training", {}).get("wandb", {})
         wb_enabled = bool(wb_cfg.get("enabled", False))
         if wb_enabled:
@@ -1587,10 +1829,34 @@ def main() -> None:
         trainer = Trainer(model=m, cfg=trainer_cfg)
         fit_out = {"best_val_macro_f1": 0.0, "best_val_metric": 0.0}
         train_seconds = 0.0
+        checkpoint_metadata: Optional[Dict[str, Any]] = None
+        if name == "rumordiffusion":
+            checkpoint_metadata = build_checkpoint_metadata(
+                model_name=name,
+                stage="arbiter",
+                dataset_name=source_dataset_name,
+                dataset_root=dataset_root,
+                seed=int(seed),
+                label_mapping=dataset_label_mapping,
+                config_payload={
+                    "rumordiffusion": checkpoint_relevant_rumordiffusion_cfg(rd_cfg),
+                    "training": {
+                        "epochs": int(exp_cfg["training"]["epochs"]),
+                        "lr": float(exp_cfg["training"].get("lr", 3e-4)),
+                        "weight_decay": float(exp_cfg["training"].get("weight_decay", 0.0)),
+                        "batch_size": int(exp_cfg["training"]["batch_size"]),
+                        "early_stopping_patience": int(exp_cfg["training"].get("early_stopping_patience", 20)),
+                        "min_epochs": int(exp_cfg["training"].get("min_epochs", 30)),
+                    },
+                    "prefix": prefix_cfg,
+                    "observability": observability_cfg,
+                },
+            )
         if not args.eval_only:
+            logging.info("Training started")
             train_start = time.time()
             fit_out = trainer.fit(train_loader=train_loader,
-                                  val_loader=val_loader, save_path=ckpt_path)
+                                  val_loader=val_loader, save_path=ckpt_path, checkpoint_metadata=checkpoint_metadata)
             train_seconds = time.time() - train_start
             logging.info(
                 f"Best val macro F1: {fit_out.get('best_val_macro_f1', fit_out.get('best_val_metric', 0.0)):.4f}")
@@ -1598,8 +1864,16 @@ def main() -> None:
                 wandb.log({"best_val_macro_f1": float(fit_out.get(
                     'best_val_macro_f1', fit_out.get('best_val_metric', 0.0)))})
         else:
-            state = torch.load(actual_ckpt_path, map_location=device)
+            logging.info("Evaluation-only run: loading checkpoint without optimizer updates")
+            state, _ = load_checkpoint_state(
+                ckpt_path=actual_ckpt_path,
+                device=device,
+                expected_metadata=checkpoint_metadata,
+                validate_metadata=bool(name == "rumordiffusion" and checkpoint_metadata is not None and validate_ckpt_metadata),
+                allow_legacy=bool(name != "rumordiffusion" or allow_legacy_ckpt),
+            )
             trainer.model.load_state_dict(state)
+            logging.info(f"Checkpoint loaded from {actual_ckpt_path}")
         eval_cfg = exp_cfg.get("evaluation", {})
         class_names = eval_cfg.get(
             "class_names", {0: "non-rumor", 1: "true", 2: "false", 3: "unverified"})
@@ -1615,8 +1889,14 @@ def main() -> None:
             eval_cfg, dict) else {}
         significance_cfg = eval_cfg.get("significance", {}) if isinstance(
             eval_cfg, dict) else {}
-        revision_rows: List[Dict[str, str]] = []
+        def persist_revision_row(row: Dict[str, str]) -> None:
+            append_dict_rows_csv(revision_artifacts_csv, revision_headers, [row])
+
+        def persist_sweep_row(row: List[str]) -> None:
+            append_rows_csv(sweeps_csv, sweeps_headers, [row])
+
         eval_start = time.time()
+        logging.info("Main test evaluation started")
         test_outputs_base = collect_eval_outputs(
             trainer.model,
             test_loader,
@@ -1642,7 +1922,7 @@ def main() -> None:
             logging.info(f"\n{test_metrics_base['report']}")
         if len(test_outputs_base["latency_ms"]) > 0:
             latency_stats = summarize_latency_ms(test_outputs_base["latency_ms"])
-            revision_rows.append(
+            persist_revision_row(
                 build_revision_row(
                     timestamp=run_ts,
                     dataset_name=dataset_name,
@@ -1657,10 +1937,8 @@ def main() -> None:
                 )
             )
 
-        sweeps_rows: List[List[str]] = []
-
         def push_sweep(tag: str, metrics: Dict[str, Any], extras: Dict[str, Any]) -> None:
-            sweeps_rows.append([
+            persist_sweep_row([
                 run_ts,
                 dataset_name,
                 name,
@@ -1699,6 +1977,9 @@ def main() -> None:
             mean_uncert_accum = 0.0
             batch_count = 0
             latency_ms: List[float] = []
+            resolved_preds: List[Tensor] = []
+            resolved_targets: List[Tensor] = []
+            resolved_probs: List[Tensor] = []
             obs_backup_local = int(getattr(m.ctdm, "obs_minutes", obs_minutes))
             m.ctdm.obs_minutes = int(obs_minutes)
             try:
@@ -1734,15 +2015,37 @@ def main() -> None:
                     resolved += int(resolved_mask.sum().item())
                     total_seen += int(decision.numel())
                     if resolved_mask.any():
-                        correct += int((decision[resolved_mask] == target_bin[resolved_mask]).sum().item())
+                        resolved_decision = decision[resolved_mask]
+                        resolved_target = target_bin[resolved_mask]
+                        correct += int((resolved_decision == resolved_target).sum().item())
+                        resolved_prob = rumor_prob[resolved_mask].clamp(0.0, 1.0)
+                        resolved_preds.append(resolved_decision.detach().cpu())
+                        resolved_targets.append(resolved_target.detach().cpu())
+                        resolved_probs.append(
+                            torch.stack(
+                                [1.0 - resolved_prob, resolved_prob],
+                                dim=1,
+                            ).detach().cpu()
+                        )
                     mean_prob_accum += float(rumor_prob.mean().item())
                     mean_uncert_accum += float(rumor_var.mean().item())
             finally:
                 m.ctdm.obs_minutes = obs_backup_local
             latency_stats = summarize_latency_ms(latency_ms)
+            if resolved_preds:
+                preds_tensor = torch.cat(resolved_preds, dim=0)
+                targets_tensor = torch.cat(resolved_targets, dim=0)
+                probs_tensor = torch.cat(resolved_probs, dim=0)
+                resolved_macro_f1 = compute_macro_f1(preds_tensor, targets_tensor, num_classes=2)
+                resolved_ece = compute_ece(probs_tensor, targets_tensor, n_bins=15)
+            else:
+                resolved_macro_f1 = 0.0
+                resolved_ece = 0.0
             return {
                 "coverage": float(resolved / max(1, total_seen)),
                 "acc_resolved": float(correct / max(1, resolved)),
+                "resolved_macro_f1": float(resolved_macro_f1),
+                "resolved_ece": float(resolved_ece),
                 "mean_prob": float(mean_prob_accum / max(1, batch_count)),
                 "mean_var": float(mean_uncert_accum / max(1, batch_count)),
                 "latency_mean_ms": latency_stats["mean_ms"],
@@ -1751,6 +2054,206 @@ def main() -> None:
 
         push_sweep("main", test_metrics_base, {
                    "train_seconds": train_seconds, "eval_seconds": eval_seconds})
+
+        test_metrics = test_metrics_base
+        calibration_temp = None
+        cal_cfg = rd_eval_cfg.get("calibration", {}) if isinstance(
+            rd_eval_cfg, dict) else {}
+        if name == "rumordiffusion" and isinstance(cal_cfg, dict) and cal_cfg.get("enabled", False):
+            calibration_fit_split = str(cal_cfg.get("fit_split", "val")).lower()
+            if calibration_fit_split != "val":
+                raise ValueError(
+                    f"Unsupported calibration fit split: {calibration_fit_split}. Only 'val' is allowed."
+                )
+            val_logits, val_targets = collect_logits(
+                trainer.model, val_loader, device, amp=trainer_cfg.amp)
+            temp_opt = tune_temperature(
+                val_logits.to(device),
+                val_targets.to(device),
+                init_temp=float(cal_cfg.get("init_temp", 1.0)),
+                max_iter=int(cal_cfg.get("max_iter", 50)),
+                lr=float(cal_cfg.get("lr", 0.01)),
+            )
+            test_logits = test_outputs_base["logits"]
+            test_targets = test_outputs_base["targets"]
+            logits_scaled = (test_logits.to(device) / float(temp_opt)).cpu()
+            if not torch.equal(
+                torch.argmax(test_logits, dim=1),
+                torch.argmax(logits_scaled, dim=1),
+            ):
+                raise RuntimeError(
+                    "Temperature scaling changed predicted labels on the stored test logits."
+                )
+            test_metrics_cal = metrics_from_logits(
+                logits_scaled,
+                test_targets,
+                num_classes=num_classes,
+                detailed=detailed_eval,
+                class_names=class_names,
+                compute_calibration=True,
+                ece_bins=int(cal_cfg.get("ece_bins", 15)),
+            )
+            logging.info(
+                f"[Calibration] Temperature={temp_opt:.3f}; "
+                f"Test acc={test_metrics_cal.get('acc', 0.0):.4f}, "
+                f"macro_f1={test_metrics_cal.get('macro_f1', 0.0):.4f}, "
+                f"ECE={test_metrics_cal.get('ece', 0.0):.4f}"
+            )
+            test_metrics = test_metrics_cal
+            reported_logits = logits_scaled
+            reported_targets = test_targets
+            calibration_temp = float(temp_opt)
+            push_sweep("calibrated", test_metrics_cal, {
+                       "calibration_temp": calibration_temp})
+        if bool(isinstance(export_pred_cfg, dict) and export_pred_cfg.get("enabled", False)):
+            export_prediction_rows(
+                csv_path=prediction_csv,
+                dataset_name=dataset_name,
+                model_name=name,
+                seed=int(seed),
+                tag="main",
+                source_ids=test_outputs_base["source_ids"],
+                logits=reported_logits,
+                targets=reported_targets,
+            )
+        if bool(isinstance(significance_cfg, dict) and significance_cfg.get("enabled", False)) and bool(isinstance(export_pred_cfg, dict) and export_pred_cfg.get("enabled", False)):
+            compare_models = significance_cfg.get("baseline_models", [])
+            metric_names = significance_cfg.get("metrics", ["macro_f1", "acc"])
+            bootstrap_rounds = int(significance_cfg.get("n_bootstrap", 1000))
+            current_rows = load_prediction_rows(
+                csv_path=prediction_csv,
+                dataset_name=dataset_name,
+                model_name=name,
+                seed=int(seed),
+                tag="main",
+            )
+            for compare_model in compare_models:
+                baseline_rows = load_prediction_rows(
+                    csv_path=prediction_csv,
+                    dataset_name=dataset_name,
+                    model_name=str(compare_model),
+                    seed=int(seed),
+                    tag="main",
+                )
+                if len(current_rows) == 0 or len(baseline_rows) == 0:
+                    continue
+                for metric_name in metric_names:
+                    stats = bootstrap_compare_predictions(
+                        current_rows=current_rows,
+                        baseline_rows=baseline_rows,
+                        metric_name=str(metric_name),
+                        n_bootstrap=bootstrap_rounds,
+                        random_seed=int(seed),
+                    )
+                    persist_revision_row(
+                        build_revision_row(
+                            timestamp=run_ts,
+                            dataset_name=dataset_name,
+                            model_name=name,
+                            seed=int(seed),
+                            artifact_type="significance",
+                            tag="main",
+                            values={
+                                "compare_model": str(compare_model),
+                                "metric": str(metric_name),
+                                "delta": stats["delta"],
+                                "p_value": stats["p_value"],
+                                "ci_low": stats["ci_low"],
+                                "ci_high": stats["ci_high"],
+                                "notes": f"paired_bootstrap_n={int(bootstrap_rounds)} shared={int(stats['count'])}",
+                            },
+                        )
+                    )
+
+        result_headers = [
+            "timestamp",
+            "dataset",
+            "model",
+            "model_cfg",
+            "exp_cfg",
+            "ckpt_path",
+            "log_path",
+            "seed",
+            "best_val_macro_f1",
+            "test_loss",
+            "test_nll",
+            "test_acc",
+            "test_macro_f1",
+            "test_macro_precision",
+            "test_macro_recall",
+            "test_weighted_f1",
+            "test_weighted_precision",
+            "test_weighted_recall",
+            "ece",
+            "calibration_temp",
+        ]
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        append_results_csv(
+            csv_path=csv_path,
+            headers=result_headers,
+            row=[
+                ts,
+                dataset_name,
+                name,
+                model_path,
+                args.exp,
+                actual_ckpt_path,
+                log_path,
+                str(seed),
+                f"{fit_out.get('best_val_macro_f1', fit_out.get('best_val_metric', 0.0)):.6f}",
+                f"{test_metrics.get('loss', 0.0):.6f}",
+                f"{test_metrics.get('nll', 0.0):.6f}",
+                f"{test_metrics.get('acc', 0.0):.6f}",
+                f"{test_metrics.get('macro_f1', 0.0):.6f}",
+                f"{test_metrics.get('macro_precision', 0.0):.6f}",
+                f"{test_metrics.get('macro_recall', 0.0):.6f}",
+                f"{test_metrics.get('weighted_f1', 0.0):.6f}",
+                f"{test_metrics.get('weighted_precision', 0.0):.6f}",
+                f"{test_metrics.get('weighted_recall', 0.0):.6f}",
+                f"{test_metrics.get('ece', 0.0):.6f}",
+                "" if calibration_temp is None else f"{calibration_temp:.6f}",
+            ],
+        )
+        if dataset_name != source_dataset_name:
+            transfer_headers = [
+                "timestamp",
+                "train_dataset",
+                "test_dataset",
+                "model",
+                "seed",
+                "ckpt_path",
+                "acc",
+                "macro_f1",
+                "nll",
+                "ece",
+                "calibration_temp",
+            ]
+            append_results_csv(
+                csv_path=transfer_csv,
+                headers=transfer_headers,
+                row=[
+                    ts,
+                    source_dataset_name,
+                    dataset_name,
+                    name,
+                    str(seed),
+                    actual_ckpt_path,
+                    f"{test_metrics.get('acc', 0.0):.6f}",
+                    f"{test_metrics.get('macro_f1', 0.0):.6f}",
+                    f"{test_metrics.get('nll', 0.0):.6f}",
+                    f"{test_metrics.get('ece', 0.0):.6f}",
+                    "" if calibration_temp is None else f"{calibration_temp:.6f}",
+                ],
+            )
+        if wb_enabled:
+            import wandb
+
+            wandb.log({
+                "test/loss": float(test_metrics.get("loss", 0.0)),
+                "test/acc": float(test_metrics.get("acc", 0.0)),
+                "test/macro_f1": float(test_metrics.get("macro_f1", 0.0)),
+            })
+            wandb.finish()
 
         early_windows = rd_eval_cfg.get(
             "early_obs_minutes", []) if isinstance(rd_eval_cfg, dict) else []
@@ -1803,10 +2306,12 @@ def main() -> None:
                     logging.info(
                         f"[EarlyStop] obs_minutes={t}, samples={early_stop_samples}, "
                         f"coverage={early_stop_result['coverage']:.4f}, acc_resolved={early_stop_result['acc_resolved']:.4f}, "
+                        f"macro_f1_resolved={early_stop_result['resolved_macro_f1']:.4f}, "
+                        f"ece_resolved={early_stop_result['resolved_ece']:.4f}, "
                         f"mean_prob={early_stop_result['mean_prob']:.4f}, mean_var={early_stop_result['mean_var']:.4f}, "
                         f"latency_mean_ms={early_stop_result['latency_mean_ms']:.4f}, latency_p95_ms={early_stop_result['latency_p95_ms']:.4f}"
                     )
-                    revision_rows.append(
+                    persist_revision_row(
                         build_revision_row(
                             timestamp=run_ts,
                             dataset_name=dataset_name,
@@ -1835,7 +2340,7 @@ def main() -> None:
                                 rumor_classes_value=rumor_classes_cfg,
                                 max_batches_value=int(sampling_sweep_cfg.get("max_batches", early_stop_max_batches)),
                             )
-                            revision_rows.append(
+                            persist_revision_row(
                                 build_revision_row(
                                     timestamp=run_ts,
                                     dataset_name=dataset_name,
@@ -1871,7 +2376,7 @@ def main() -> None:
                                         rumor_classes_value=rumor_classes_cfg,
                                         max_batches_value=int(threshold_sweep_cfg.get("max_batches", early_stop_max_batches)),
                                     )
-                                    revision_rows.append(
+                                    persist_revision_row(
                                         build_revision_row(
                                             timestamp=run_ts,
                                             dataset_name=dataset_name,
@@ -1950,196 +2455,6 @@ def main() -> None:
                         test_loader_obs, detailed=True, class_names=class_names)
                     push_sweep(f"robust_obs_node{dn}_edge{de}", metrics_obs, {
                                "drop_node": dn, "drop_edge": de})
-
-        test_metrics = test_metrics_base
-        calibration_temp = None
-        cal_cfg = rd_eval_cfg.get("calibration", {}) if isinstance(
-            rd_eval_cfg, dict) else {}
-        if name == "rumordiffusion" and isinstance(cal_cfg, dict) and cal_cfg.get("enabled", False):
-            val_logits, val_targets = collect_logits(
-                trainer.model, val_loader, device, amp=trainer_cfg.amp)
-            temp_opt = tune_temperature(
-                val_logits.to(device),
-                val_targets.to(device),
-                init_temp=float(cal_cfg.get("init_temp", 1.0)),
-                max_iter=int(cal_cfg.get("max_iter", 50)),
-                lr=float(cal_cfg.get("lr", 0.01)),
-            )
-            test_logits, test_targets = collect_logits(
-                trainer.model, test_loader, device, amp=trainer_cfg.amp)
-            logits_scaled = (test_logits.to(device) / float(temp_opt)).cpu()
-            test_metrics_cal = metrics_from_logits(
-                logits_scaled,
-                test_targets,
-                num_classes=num_classes,
-                detailed=detailed_eval,
-                class_names=class_names,
-                compute_calibration=True,
-                ece_bins=int(cal_cfg.get("ece_bins", 15)),
-            )
-            logging.info(
-                f"[Calibration] Temperature={temp_opt:.3f}; "
-                f"Test acc={test_metrics_cal.get('acc', 0.0):.4f}, "
-                f"macro_f1={test_metrics_cal.get('macro_f1', 0.0):.4f}, "
-                f"ECE={test_metrics_cal.get('ece', 0.0):.4f}"
-            )
-            test_metrics = test_metrics_cal
-            reported_logits = logits_scaled
-            reported_targets = test_targets
-            calibration_temp = float(temp_opt)
-            push_sweep("calibrated", test_metrics_cal, {
-                       "calibration_temp": calibration_temp})
-        if bool(isinstance(export_pred_cfg, dict) and export_pred_cfg.get("enabled", False)):
-            export_prediction_rows(
-                csv_path=prediction_csv,
-                dataset_name=dataset_name,
-                model_name=name,
-                seed=int(seed),
-                tag="main",
-                source_ids=test_outputs_base["source_ids"],
-                logits=reported_logits,
-                targets=reported_targets,
-            )
-        if bool(isinstance(significance_cfg, dict) and significance_cfg.get("enabled", False)) and bool(isinstance(export_pred_cfg, dict) and export_pred_cfg.get("enabled", False)):
-            compare_models = significance_cfg.get("baseline_models", [])
-            metric_names = significance_cfg.get("metrics", ["macro_f1", "acc"])
-            bootstrap_rounds = int(significance_cfg.get("n_bootstrap", 1000))
-            current_rows = load_prediction_rows(
-                csv_path=prediction_csv,
-                dataset_name=dataset_name,
-                model_name=name,
-                seed=int(seed),
-                tag="main",
-            )
-            for compare_model in compare_models:
-                baseline_rows = load_prediction_rows(
-                    csv_path=prediction_csv,
-                    dataset_name=dataset_name,
-                    model_name=str(compare_model),
-                    seed=int(seed),
-                    tag="main",
-                )
-                if len(current_rows) == 0 or len(baseline_rows) == 0:
-                    continue
-                for metric_name in metric_names:
-                    stats = bootstrap_compare_predictions(
-                        current_rows=current_rows,
-                        baseline_rows=baseline_rows,
-                        metric_name=str(metric_name),
-                        n_bootstrap=bootstrap_rounds,
-                        random_seed=int(seed),
-                    )
-                    revision_rows.append(
-                        build_revision_row(
-                            timestamp=run_ts,
-                            dataset_name=dataset_name,
-                            model_name=name,
-                            seed=int(seed),
-                            artifact_type="significance",
-                            tag="main",
-                            values={
-                                "compare_model": str(compare_model),
-                                "metric": str(metric_name),
-                                "delta": stats["delta"],
-                                "p_value": stats["p_value"],
-                                "ci_low": stats["ci_low"],
-                                "ci_high": stats["ci_high"],
-                                "notes": f"paired_bootstrap_n={int(bootstrap_rounds)} shared={int(stats['count'])}",
-                            },
-                        )
-                    )
-        if wb_enabled:
-            import wandb
-
-            wandb.log({
-                "test/loss": float(test_metrics.get("loss", 0.0)),
-                "test/acc": float(test_metrics.get("acc", 0.0)),
-                "test/macro_f1": float(test_metrics.get("macro_f1", 0.0)),
-            })
-            wandb.finish()
-
-        result_headers = [
-            "timestamp",
-            "dataset",
-            "model",
-            "model_cfg",
-            "exp_cfg",
-            "ckpt_path",
-            "log_path",
-            "seed",
-            "best_val_macro_f1",
-            "test_loss",
-            "test_nll",
-            "test_acc",
-            "test_macro_f1",
-            "test_macro_precision",
-            "test_macro_recall",
-            "test_weighted_f1",
-            "test_weighted_precision",
-            "test_weighted_recall",
-            "ece",
-            "calibration_temp",
-        ]
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        append_results_csv(
-            csv_path=csv_path,
-            headers=result_headers,
-            row=[
-                ts,
-                dataset_name,
-                name,
-                model_path,
-                args.exp,
-                actual_ckpt_path,
-                log_path,
-                str(seed),
-                f"{fit_out.get('best_val_macro_f1', fit_out.get('best_val_metric', 0.0)):.6f}",
-                f"{test_metrics.get('loss', 0.0):.6f}",
-                f"{test_metrics.get('nll', 0.0):.6f}",
-                f"{test_metrics.get('acc', 0.0):.6f}",
-                f"{test_metrics.get('macro_f1', 0.0):.6f}",
-                f"{test_metrics.get('macro_precision', 0.0):.6f}",
-                f"{test_metrics.get('macro_recall', 0.0):.6f}",
-                f"{test_metrics.get('weighted_f1', 0.0):.6f}",
-                f"{test_metrics.get('weighted_precision', 0.0):.6f}",
-                f"{test_metrics.get('weighted_recall', 0.0):.6f}",
-                f"{test_metrics.get('ece', 0.0):.6f}",
-                "" if calibration_temp is None else f"{calibration_temp:.6f}",
-            ],
-        )
-        append_rows_csv(sweeps_csv, sweeps_headers, sweeps_rows)
-        append_dict_rows_csv(revision_artifacts_csv, revision_headers, revision_rows)
-        if dataset_name != source_dataset_name:
-            transfer_headers = [
-                "timestamp",
-                "train_dataset",
-                "test_dataset",
-                "model",
-                "seed",
-                "ckpt_path",
-                "acc",
-                "macro_f1",
-                "nll",
-                "ece",
-                "calibration_temp",
-            ]
-            append_results_csv(
-                csv_path=transfer_csv,
-                headers=transfer_headers,
-                row=[
-                    ts,
-                    source_dataset_name,
-                    dataset_name,
-                    name,
-                    str(seed),
-                    actual_ckpt_path,
-                    f"{test_metrics.get('acc', 0.0):.6f}",
-                    f"{test_metrics.get('macro_f1', 0.0):.6f}",
-                    f"{test_metrics.get('nll', 0.0):.6f}",
-                    f"{test_metrics.get('ece', 0.0):.6f}",
-                    "" if calibration_temp is None else f"{calibration_temp:.6f}",
-                ],
-            )
         seed_results.append(
             {
                 "val_macro_f1": float(fit_out.get("best_val_macro_f1", fit_out.get("best_val_metric", 0.0))),

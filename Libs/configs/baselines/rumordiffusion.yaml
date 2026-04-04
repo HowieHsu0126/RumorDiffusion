@@ -9,9 +9,10 @@ model:
     obs_minutes: 30
     t_embed_dim: 128
     film_hidden: 128
-    max_nodes: 2048
+    max_nodes: 0
     guidance_scale: 3.0
     guidance_p: 0.2
+    sampling_eta: 1.0
     backbone:
       name: gat
       dropout: 0.2
@@ -59,6 +60,7 @@ model:
     class_embed_mode: concat_proj
     cache_potentials: false
     infer_amp: true
+    uncertainty_force_ctdm: true
     # Optional class embedding to enhance class-awareness (disabled by default for stability)
     use_class_embedding: false
     transformer:
@@ -115,6 +117,7 @@ evaluation:
   calibration:
     enabled: true
     type: temperature
+    fit_split: val
     ece_bins: 15
     max_iter: 75
     lr: 0.05
@@ -140,3 +143,6 @@ evaluation:
     max_batches: 0
   robustness:
     edge_dropout: [0.0, 0.1]
+checkpoint:
+  validate_metadata: true
+  allow_legacy: false

@@ -4,7 +4,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.cuda.amp import autocast
-from torch_geometric.data import Batch
 
 
 class ArbiterMLP(nn.Module):
@@ -100,6 +99,7 @@ class RumorDiffusion(nn.Module):
         # Inference/efficiency
         cache_potentials: bool = False,
         infer_amp: bool = False,
+        uncertainty_force_ctdm: bool = False,
         # Diagnostics
         loss_logging: bool = False,
     ) -> None:
@@ -116,6 +116,7 @@ class RumorDiffusion(nn.Module):
         assert self.arbiter_readout in ["cls", "token"], f"arbiter_readout must be 'cls' or 'token', got {self.arbiter_readout}"
         self.cache_potentials = bool(cache_potentials)
         self.infer_amp = bool(infer_amp)
+        self.uncertainty_force_ctdm = bool(uncertainty_force_ctdm)
         self.loss_logging = bool(loss_logging)
         norm_choices = {
             "layernorm": nn.LayerNorm(self.hidden_channels),
@@ -307,33 +308,35 @@ class RumorDiffusion(nn.Module):
         self._last_potentials = Hc
         return Hc
 
+    def _logits_from_tokens(self, tokens: Tensor) -> Tensor:
+        """Maps potential tokens to class logits for both arbiter variants."""
+        if self.arbiter_type == "transformer":
+            logits, _cls = self._encode_from_tokens(tokens)
+            return logits
+        x = torch.cat([tokens[:, 0, :], tokens[:, 1, :]], dim=-1)
+        x = self.input_drop(self.input_norm(x))
+        return self.arbiter(x)
+
+    def _forward_from_ctdm(self, batch) -> Tensor:
+        """Forces on-the-fly CTDM potential inference regardless of cached fields."""
+        assert self.ctdm is not None, "CTDM is required for sampled uncertainty inference"
+        Hc = self._compute_ctdm_potentials(batch)
+        self._last_potentials = Hc
+        return self._logits_from_tokens(Hc)
+
     def _compute_ctdm_potentials(self, batch) -> Tensor:
         assert self.ctdm is not None, "CTDM is required when potentials are not present in the batch"
         ctdm_trainable = self.training and any(p.requires_grad for p in self.ctdm.parameters())
-        if not hasattr(batch, "num_graphs") or int(batch.num_graphs) <= 1:
-            if ctdm_trainable:
-                return self.ctdm.potentials_all_grad(batch)
-            return self.ctdm.infer_potentials_all(batch)
-
-        device = next(self.parameters()).device
-        data_list = batch.to_data_list()
-        potentials: List[Tensor] = []
-        for data in data_list:
-            single_batch = Batch.from_data_list([data]).to(device)
-            if ctdm_trainable:
-                Hc_single = self.ctdm.potentials_all_grad(single_batch)
-            else:
-                Hc_single = self.ctdm.infer_potentials_all(single_batch)
-            potentials.append(Hc_single)
-        return torch.cat(potentials, dim=0)
+        if ctdm_trainable:
+            return self.ctdm.potentials_all_grad(batch)
+        return self.ctdm.infer_potentials_all(batch)
 
     def forward(self, batch) -> Tensor:
         """Build token sequence and arbitrate via Transformer [CLS] output by default."""
         def _compute():
             if self.arbiter_type == "transformer":
                 tokens = self._build_tokens_from_batch(batch)
-                logits, _cls = self._encode_from_tokens(tokens)
-                return logits
+                return self._logits_from_tokens(tokens)
             # Fallback MLP over two potentials if explicitly requested
             if hasattr(batch, "h_cat"):
                 x = batch.h_cat  # [B, K*H]
@@ -347,11 +350,7 @@ class RumorDiffusion(nn.Module):
                 x = self.input_drop(self.input_norm(x))
                 return self.arbiter(x)
             assert self.ctdm is not None, "CTDM is required when potentials are not present in the batch"
-            Hc = self._compute_ctdm_potentials(batch)
-            self._last_potentials = Hc
-            x = torch.cat([Hc[:, 0, :], Hc[:, 1, :]], dim=-1)
-            x = self.input_drop(self.input_norm(x))
-            return self.arbiter(x)
+            return self._forward_from_ctdm(batch)
 
         if (not self.training) and self.infer_amp:
             with autocast():
@@ -375,11 +374,18 @@ class RumorDiffusion(nn.Module):
         samples = max(1, int(num_samples))
         probs = []
         for _ in range(samples):
-            if (not self.training) and self.infer_amp:
-                with autocast():
-                    logits = self(batch)
+            if self.uncertainty_force_ctdm and self.ctdm is not None:
+                if (not self.training) and self.infer_amp:
+                    with autocast():
+                        logits = self._forward_from_ctdm(batch)
+                else:
+                    logits = self._forward_from_ctdm(batch)
             else:
-                logits = self(batch)
+                if (not self.training) and self.infer_amp:
+                    with autocast():
+                        logits = self(batch)
+                else:
+                    logits = self(batch)
             probs.append(F.softmax(logits, dim=1))
         prob_stack = torch.stack(probs, dim=0)  # [S, B, C]
         mean_prob = prob_stack.mean(dim=0)

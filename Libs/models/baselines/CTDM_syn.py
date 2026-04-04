@@ -506,6 +506,7 @@ class CTDMSyn(nn.Module):
         self.parameterization = "v"  # one of {"v", "eps"}
         self.guidance_p = 0.1        # classifier-free guidance dropout prob during training
         self.guidance_scale = 1.5    # classifier-free guidance scale during inference
+        self.sampling_eta = 0.0      # DDIM/DDPM interpolation factor for reverse sampling
         # Readout and training policy toggles
         self.use_attn_readout = True
         self.readout = AttentionReadout(hidden_channels=self.hidden_channels, attn_dim=self.hidden_channels, dropout=self.dropout)
@@ -844,17 +845,12 @@ class CTDMSyn(nn.Module):
         """
         n = int(data.num_nodes)
         if n > self.max_nodes:
-            # Truncate to max_nodes by keeping the first max_nodes nodes
-            n = self.max_nodes
-            edge_index = data.edge_index.to(torch.long)
-            # Filter edges to only include nodes within max_nodes
-            mask = (edge_index[0] < n) & (edge_index[1] < n)
-            edge_index = edge_index[:, mask]
-            A = _build_adj_from_edge_index(edge_index, n)
-            X = data.x[:n].to(torch.float32)
-        else:
-            A = _build_adj_from_edge_index(data.edge_index.to(torch.long), n)
-            X = data.x.to(torch.float32)
+            raise ValueError(
+                f"Full graph has {n} nodes, which exceeds configured max_nodes={self.max_nodes}. "
+                "Increase max_nodes or resolve it automatically from the training split."
+            )
+        A = _build_adj_from_edge_index(data.edge_index.to(torch.long), n)
+        X = data.x.to(torch.float32)
         A = _pad_adj(A, self.max_nodes)
         X = _pad_x(X, self.max_nodes)
         return A, X
@@ -875,18 +871,11 @@ class CTDMSyn(nn.Module):
         if hasattr(data, "prefix_edge_index"):
             edge_src = data.prefix_edge_index.to(torch.long)
         edge_obs, n_obs = _reindex_edges_for_mask(edge_src, mask)
-        
-        # Truncate if necessary
         if n_obs > self.max_nodes:
-            n_obs = self.max_nodes
-            edge_mask = (edge_obs[0] < n_obs) & (edge_obs[1] < n_obs)
-            edge_obs = edge_obs[:, edge_mask]
-            # Also truncate the mask to match
-            mask_indices = torch.nonzero(mask, as_tuple=False).view(-1)
-            mask_indices = mask_indices[:n_obs]
-            mask = torch.zeros_like(mask)
-            mask[mask_indices] = True
-        
+            raise ValueError(
+                f"Observed prefix has {n_obs} nodes, which exceeds configured max_nodes={self.max_nodes}. "
+                "Increase max_nodes or resolve it automatically from the training split."
+            )
         A_obs = _build_adj_from_edge_index(edge_obs, n_obs)
         X_obs = data.x[mask].to(torch.float32)
         if float(getattr(self, "edge_drop_rate", 0.0)) > 0.0:
@@ -1361,13 +1350,44 @@ class CTDMSyn(nn.Module):
         return loss, 0.0
 
     def _posterior_mean_variance(self, Gt: Tensor, t: Tensor, eps_pred: Tensor) -> Tuple[Tensor, Tensor]:
+        beta_t = self.betas[(t - 1).to(torch.long)].view(-1, 1)
         alpha_t = self.alphas[(t - 1).to(torch.long)].view(-1, 1)
         alpha_bar_t = self.alphas_cumprod[(t - 1).to(torch.long)].view(-1, 1)
+        alpha_bar_prev = torch.ones_like(alpha_bar_t)
+        prev_mask = t > 1
+        if prev_mask.any():
+            alpha_bar_prev[prev_mask] = self.alphas_cumprod[(t[prev_mask] - 2).to(torch.long)].view(-1, 1)
         coef1 = (1.0 / alpha_t.sqrt())
         coef2 = ((1.0 - alpha_t) / (1.0 - alpha_bar_t).sqrt())
         mean = coef1 * (Gt - coef2 * eps_pred)
-        var = ((1.0 - alpha_bar_t) / (1.0 - self.alphas_cumprod[(t - 2).clamp(min=0)].view(-1, 1))).clamp(min=1e-5)
+        var = (beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t).clamp_min(self._eps)).clamp(min=0.0)
+        var = torch.where((t > 1).view(-1, 1), var, torch.zeros_like(var))
         return mean, var
+
+    def _alpha_bar_at(self, t: Tensor) -> Tensor:
+        alpha_bar = torch.ones((int(t.size(0)), 1), dtype=self.alphas_cumprod.dtype, device=t.device)
+        valid = t > 0
+        if valid.any():
+            alpha_bar[valid] = self.alphas_cumprod[(t[valid] - 1).to(torch.long)].view(-1, 1)
+        return alpha_bar
+
+    def _reverse_step(self, Gt: Tensor, t: Tensor, eps_pred: Tensor, prev_t: Tensor) -> Tensor:
+        alpha_bar_t = self._alpha_bar_at(t)
+        alpha_bar_prev = self._alpha_bar_at(prev_t)
+        x0_pred = (Gt - (1.0 - alpha_bar_t).sqrt() * eps_pred) / alpha_bar_t.sqrt().clamp_min(self._eps)
+        eta = max(0.0, float(self.sampling_eta))
+        sigma = torch.zeros_like(alpha_bar_t)
+        if eta > 0.0:
+            ratio = ((1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t).clamp_min(self._eps)).clamp(min=0.0)
+            step_gap = (1.0 - (alpha_bar_t / alpha_bar_prev.clamp_min(self._eps))).clamp(min=0.0)
+            sigma = eta * torch.sqrt(ratio * step_gap)
+        direction = torch.sqrt((1.0 - alpha_bar_prev - sigma.pow(2)).clamp(min=0.0)) * eps_pred
+        G_prev = alpha_bar_prev.sqrt() * x0_pred + direction
+        if eta > 0.0:
+            noise = torch.randn_like(Gt)
+            nonzero_mask = (prev_t > 0).to(Gt.dtype).view(-1, 1)
+            G_prev = G_prev + nonzero_mask * sigma * noise
+        return G_prev
 
     def _get_c1_c2(self, t: Tensor) -> Tuple[Tensor, Tensor]:
         """Returns (c1, c2) where x_t = c1*x0 + c2*eps and v = c1*eps - c2*x0."""
@@ -1418,8 +1438,7 @@ class CTDMSyn(nn.Module):
                 pred_u = self._pred_theta(Gt, t, None, Gobs, drop_mask=None)
                 pred = pred_u + self.guidance_scale * (pred_c - pred_u)
                 eps_pred = self._to_eps(Gt, t, pred)
-                mean, var = self._posterior_mean_variance(Gt, t, eps_pred)
-                # Deterministic DDIM-like update (no extra noise) for stability
+                mean, _var = self._posterior_mean_variance(Gt, t, eps_pred)
                 Gt = mean
                 # Data consistency on observed entries
                 Gt = self._mask_observed(Gt, Gobs, Mobs)
@@ -1429,5 +1448,3 @@ class CTDMSyn(nn.Module):
             scores.append(total_score)
         logits = torch.stack(scores, dim=1)
         return logits
-
-

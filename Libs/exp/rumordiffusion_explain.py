@@ -22,7 +22,8 @@ from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader as PyGDataLoader
 
 from Libs.data.dataset import GraphDataset
-from Libs.exp.run import _deep_merge, read_yaml_like
+from Libs.exp.run import (_deep_merge, load_checkpoint_state, read_yaml_like,
+                          resolve_max_nodes_setting)
 from Libs.models.baselines.CTDM_syn import CTDMSyn
 from Libs.models.baselines.RumorDiffusion import RumorDiffusion
 from Libs.models.modules.rumor_diffusion import _extract_source_ids_from_batch
@@ -50,7 +51,21 @@ def resolve_rd_cfg(exp_cfg: Dict, model_cfg: Dict) -> Tuple[Dict, Dict]:
     return rd_cfg, rd_eval_cfg
 
 
-def build_ctdm(ctdm_cfg: Dict, text_cfg: Dict, num_features: int, num_classes: int) -> CTDMSyn:
+def resolve_ctdm_max_nodes(ds: GraphDataset, ctdm_cfg: Dict) -> int:
+    """Resolves CTDM max-nodes budget from the dataset split and YAML config."""
+    scanned_max_nodes = 0
+    for idx in range(len(ds)):
+        sample = ds.get(idx)
+        scanned_max_nodes = max(scanned_max_nodes, int(sample.num_nodes))
+    configured_max_nodes = int(ctdm_cfg.get("max_nodes", 0) or 0)
+    return resolve_max_nodes_setting(
+        scanned_max_nodes=scanned_max_nodes,
+        configured_max_nodes=configured_max_nodes,
+        context="RumorDiffusion explain CTDM",
+    )
+
+
+def build_ctdm(ctdm_cfg: Dict, text_cfg: Dict, num_features: int, num_classes: int, max_nodes: int) -> CTDMSyn:
     """Constructs CTDMSyn with backbone, text, and regularizer settings."""
     bb_cfg = ctdm_cfg.get("backbone", {}) if isinstance(ctdm_cfg.get("backbone", {}), dict) else {}
     text_enabled = bool(text_cfg.get("enabled", False))
@@ -67,7 +82,7 @@ def build_ctdm(ctdm_cfg: Dict, text_cfg: Dict, num_features: int, num_classes: i
         obs_minutes=int(ctdm_cfg.get("obs_minutes", 30)),
         t_embed_dim=int(ctdm_cfg.get("t_embed_dim", ctdm_cfg.get("hidden", 128))),
         film_hidden=int(ctdm_cfg.get("film_hidden", 128)),
-        max_nodes=int(ctdm_cfg.get("max_nodes", 2048)),
+        max_nodes=int(max_nodes),
         backbone_name=str(bb_cfg.get("name", "gcn")).lower(),
         backbone_heads=int(bb_cfg.get("heads", 1)),
         backbone_dropout=float(bb_cfg.get("dropout", ctdm_cfg.get("dropout", 0.3))),
@@ -83,6 +98,7 @@ def build_ctdm(ctdm_cfg: Dict, text_cfg: Dict, num_features: int, num_classes: i
         model.parameterization = str(ctdm_cfg["parameterization"]).lower()
     model.guidance_p = float(ctdm_cfg.get("guidance_p", 0.2))
     model.guidance_scale = float(ctdm_cfg.get("guidance_scale", 2.0))
+    model.sampling_eta = float(ctdm_cfg.get("sampling_eta", 0.0))
     if "use_attn_readout" in ctdm_cfg:
         model.use_attn_readout = bool(ctdm_cfg["use_attn_readout"])
 
@@ -147,7 +163,8 @@ def build_rumor_diffusion(model_cfg: Dict, exp_cfg: Dict, ds: GraphDataset, devi
 
     num_features = ds.num_features
     num_classes = ds.num_classes
-    ctdm = build_ctdm(ctdm_cfg, text_cfg, num_features, num_classes)
+    max_nodes = resolve_ctdm_max_nodes(ds, ctdm_cfg)
+    ctdm = build_ctdm(ctdm_cfg, text_cfg, num_features, num_classes, max_nodes)
     ctdm = ctdm.to(device)
 
     hidden_dim, _ = infer_hidden_channels(ds, ctdm, device)
@@ -186,6 +203,7 @@ def build_rumor_diffusion(model_cfg: Dict, exp_cfg: Dict, ds: GraphDataset, devi
         class_embed_mode=str(arb_cfg.get("class_embed_mode", "concat_proj")),
         cache_potentials=bool(arb_cfg.get("cache_potentials", False)),
         infer_amp=bool(arb_cfg.get("infer_amp", False)),
+        uncertainty_force_ctdm=bool(arb_cfg.get("uncertainty_force_ctdm", False)),
         loss_logging=bool(loss_cfg.get("loss_logging", False)),
     )
 
@@ -225,7 +243,13 @@ def build_rumor_diffusion(model_cfg: Dict, exp_cfg: Dict, ds: GraphDataset, devi
 
 def load_checkpoint(model: RumorDiffusion, ckpt_path: str, device: torch.device) -> None:
     """Loads model weights from checkpoint path."""
-    state = torch.load(ckpt_path, map_location=device)
+    state, _ = load_checkpoint_state(
+        ckpt_path=ckpt_path,
+        device=str(device),
+        expected_metadata=None,
+        validate_metadata=False,
+        allow_legacy=True,
+    )
     model.load_state_dict(state)
 
 

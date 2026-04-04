@@ -8,6 +8,5 @@ model:
   t_embed_dim: 128
   film_hidden: 128
   t_stride: 20
-  max_nodes: 2048
-
+  max_nodes: 0
 

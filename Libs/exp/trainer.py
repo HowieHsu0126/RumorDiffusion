@@ -15,6 +15,39 @@ from tqdm.auto import tqdm
 from Libs.models.baselines.TGN import TGN
 from Libs.utils.metrics import metrics_from_logits
 
+CHECKPOINT_STATE_KEY = "state_dict"
+CHECKPOINT_METADATA_KEY = "metadata"
+
+
+def build_checkpoint_payload(
+    state_dict: Dict[str, Tensor],
+    metadata: Optional[Dict[str, Union[str, int, float, bool, Dict[str, int]]]] = None,
+) -> Dict[str, object]:
+    """Builds a checkpoint payload with explicit metadata."""
+    payload: Dict[str, object] = {
+        CHECKPOINT_STATE_KEY: {
+            key: value.detach().cpu().clone() for key, value in state_dict.items()
+        }
+    }
+    if metadata is not None:
+        payload[CHECKPOINT_METADATA_KEY] = dict(metadata)
+    return payload
+
+
+def unpack_checkpoint_payload(payload: object) -> Tuple[Dict[str, Tensor], Dict[str, object]]:
+    """Returns `(state_dict, metadata)` from either payload or legacy state dict."""
+    if not isinstance(payload, dict):
+        raise TypeError(f"Checkpoint payload must be a dict, got {type(payload)}")
+    if CHECKPOINT_STATE_KEY in payload:
+        state_dict = payload[CHECKPOINT_STATE_KEY]
+        metadata = payload.get(CHECKPOINT_METADATA_KEY, {})
+        if not isinstance(state_dict, dict):
+            raise TypeError("Checkpoint state_dict must be a dict")
+        if not isinstance(metadata, dict):
+            raise TypeError("Checkpoint metadata must be a dict")
+        return state_dict, metadata
+    return payload, {}
+
 
 @dataclass
 class TrainerConfig:
@@ -145,6 +178,7 @@ class Trainer:
         train_loader: DataLoader,
         val_loader: DataLoader,
         save_path: Optional[str] = None,
+        checkpoint_metadata: Optional[Dict[str, Union[str, int, float, bool, Dict[str, int]]]] = None,
     ) -> Dict[str, float]:
         best_val_metric = -1.0
         best_state = None
@@ -166,7 +200,13 @@ class Trainer:
                 patience = 0
                 if save_path is not None:
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                    torch.save(best_state, save_path)
+                    checkpoint_obj: object = best_state
+                    if checkpoint_metadata is not None:
+                        checkpoint_obj = build_checkpoint_payload(
+                            best_state,
+                            checkpoint_metadata,
+                        )
+                    torch.save(checkpoint_obj, save_path)
             else:
                 patience += 1
                 # Only allow early stopping after minimum epochs

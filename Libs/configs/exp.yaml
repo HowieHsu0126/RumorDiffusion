@@ -79,20 +79,17 @@ transfer:
   pairs:
     - source: twitter15
       target: twitter16
-    - source: twitter16
-      target: twitter15
     - source: weibo
       target: pheme
-    - source: pheme
-      target: weibo
   models:
     - Libs/configs/baselines/rumordiffusion.yaml
-    - Libs/configs/baselines/dga_fake.yaml
-    - Libs/configs/baselines/lp_gcn.yaml
   ckpt_name: best.pt
   lp_edges_policy: require_existing
   results_path: Output/results/round1/transfer.csv
 rumordiffusion:
+  checkpoint:
+    validate_metadata: true
+    allow_legacy: false
   arbiter:
     dropout: 0.3
     freeze_ctdm: true
@@ -110,6 +107,7 @@ rumordiffusion:
       weight: 0.5
     tf_head_enabled: true
     tf_infer_adjust_alpha: 0.15
+    uncertainty_force_ctdm: true
     transformer:
       dim_feedforward: 512
       dropout: 0.3
@@ -136,8 +134,9 @@ rumordiffusion:
     film_hidden: 128
     guidance_p: 0.2
     guidance_scale: 3.0
+    sampling_eta: 1.0
     hidden: 256
-    max_nodes: 2048
+    max_nodes: 0
     multiwindow:
       enabled: true
       max: 60
@@ -212,9 +211,10 @@ training:
   amp: true
   batch_size: 4
   batch_size_ctdm: 1
-  early_stopping_patience: 20
-  epochs: 120
-  epochs_ctdm: 80
+  early_stopping_patience: 5
+  early_stopping_patience_ctdm: 4
+  epochs: 20
+  epochs_ctdm: 12
   grad_clip: 1.0
   lr: 0.0003
   lr_ctdm: 0.0003
@@ -222,6 +222,8 @@ training:
   use_tqdm: true
   weight_decay: 0.0001
   weight_decay_ctdm: 0.0001
+  reuse_ctdm_pretrain: true
   max_batches_per_epoch:
-  min_epochs: 30
+  min_epochs: 3
+  min_epochs_ctdm: 3
   max_samples: 0
