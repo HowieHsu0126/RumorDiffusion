@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 #SBATCH --job-name=rd-explain-summary
 #SBATCH --partition=gpu1
 #SBATCH --gres=gpu:0
@@ -8,8 +9,14 @@
 #SBATCH --time=2:00:00
 #SBATCH --output=/share/home/hwxu/Researches/D2Plus/Output/logs/rd_explain_summary_%j.out
 
+set +u
 source /share/home/hwxu/miniconda3/bin/activate hw
+set -u
 cd /share/home/hwxu/Researches/D2Plus
+
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
 
 EXP_CFG=${EXP_CFG:-"Libs/configs/exp.yaml"}
 DATASET_NAME=${DATASET_NAME_OVERRIDE:-$(python3 - "${EXP_CFG}" <<'PY'
@@ -33,10 +40,12 @@ INPUT_PATH=${INPUT_PATH:-"${RESULTS_DIR}/${DATASET_NAME}_explain.jsonl"}
 OUT_PATH=${OUT_PATH:-"${RESULTS_DIR}/${DATASET_NAME}_explain_summary.csv"}
 TOPK=${TOPK:-20}
 
-echo "Summarizing explain outputs:"
-echo "  input: ${INPUT_PATH}"
-echo "  out:   ${OUT_PATH}"
-echo "  topk:  ${TOPK}"
+log "Summarizing explain outputs"
+log "Input: ${INPUT_PATH}"
+log "Output: ${OUT_PATH}"
+log "Topk: ${TOPK}"
+log "Python: $(python3 --version)"
+log "Git HEAD: $(git rev-parse HEAD)"
 
 python3 -m Libs.exp.explain_summary \
   --input "${INPUT_PATH}" \

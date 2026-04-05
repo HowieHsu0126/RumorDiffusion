@@ -300,9 +300,13 @@ class RumorDiffusion(nn.Module):
             B = int(x.size(0))
             H = self.hidden_channels
             K = int(x.size(1)) // H
-            return x.view(B, K, H)
+            tokens = x.view(B, K, H)
+            self._last_potentials = tokens
+            return tokens
         if hasattr(batch, "h0") and hasattr(batch, "h1"):
-            return torch.stack([batch.h0, batch.h1], dim=1)
+            tokens = torch.stack([batch.h0, batch.h1], dim=1)
+            self._last_potentials = tokens
+            return tokens
         assert self.ctdm is not None, "CTDM is required when potentials are not present in the batch"
         Hc = self._compute_ctdm_potentials(batch)
         self._last_potentials = Hc
@@ -505,16 +509,14 @@ class RumorDiffusion(nn.Module):
         """
         targets = batch.y.view(-1).long()
         loss_dict = {}
+        has_cached_potentials = hasattr(batch, "h_cat") or (hasattr(batch, "h0") and hasattr(batch, "h1"))
+        ctdm_trainable = self.ctdm is not None and any(p.requires_grad for p in self.ctdm.parameters())
         diffusion_loss: Optional[Tensor] = None
-        if self.ctdm is not None and float(self.lambda_diffusion) > 0.0:
-            has_trainable = any(p.requires_grad for p in self.ctdm.parameters())
-            if has_trainable:
-                diffusion_loss, _ = self.ctdm.training_step(batch)
+        if ctdm_trainable and float(self.lambda_diffusion) > 0.0:
+            diffusion_loss, _ = self.ctdm.training_step(batch)
 
         if self.dd_gan_enabled:
-            assert self.ctdm is not None, "CTDM is required when dd_gan_enabled=True"
-            Hc = self._compute_ctdm_potentials(batch)
-            self._last_potentials = Hc
+            Hc = self._build_tokens_from_batch(batch)
 
             B, C, H = int(Hc.size(0)), int(Hc.size(1)), int(Hc.size(2))
             Hc_detached = Hc.detach().view(B * C, H)
@@ -596,7 +598,7 @@ class RumorDiffusion(nn.Module):
                 loss = loss + float(self.lambda_brier) * loss_brier
                 loss_dict["brier"] = float(loss_brier.detach().item())
 
-            if self.ctdm is not None and float(self.lambda_consistency) > 0.0:
+            if self.ctdm is not None and float(self.lambda_consistency) > 0.0 and not has_cached_potentials:
                 obs_backup = int(self.ctdm.obs_minutes)
                 min_c = int(getattr(self.ctdm, "cutoff_min", 10))
                 max_c = int(getattr(self.ctdm, "cutoff_max", 30))
@@ -613,7 +615,7 @@ class RumorDiffusion(nn.Module):
                 loss = loss + float(self.lambda_consistency) * loss_cons
                 loss_dict["consistency"] = float(loss_cons.detach().item())
 
-            if self.ctdm is not None:
+            if ctdm_trainable:
                 if hasattr(self, "_last_potentials"):
                     Hc_cached = self._last_potentials  # [B, C, H]
                     idx = torch.arange(Hc_cached.size(0), device=Hc_cached.device)
@@ -688,7 +690,7 @@ class RumorDiffusion(nn.Module):
             loss = loss + float(self.lambda_brier) * loss_brier
             loss_dict["brier"] = float(loss_brier.detach().item())
 
-        if self.ctdm is not None and float(self.lambda_consistency) > 0.0:
+        if self.ctdm is not None and float(self.lambda_consistency) > 0.0 and not has_cached_potentials:
             obs_backup = int(self.ctdm.obs_minutes)
             min_c = int(getattr(self.ctdm, "cutoff_min", 10))
             max_c = int(getattr(self.ctdm, "cutoff_max", 30))
@@ -705,7 +707,7 @@ class RumorDiffusion(nn.Module):
             loss = loss + float(self.lambda_consistency) * loss_cons
             loss_dict["consistency"] = float(loss_cons.detach().item())
 
-        if self.ctdm is not None:
+        if ctdm_trainable:
             if hasattr(self, "_last_potentials"):
                 Hc = self._last_potentials  # [B, C, H]
                 idx = torch.arange(Hc.size(0), device=Hc.device)

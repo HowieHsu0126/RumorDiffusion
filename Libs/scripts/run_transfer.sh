@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 #SBATCH --job-name=rd-transfer
 #SBATCH --partition=gpu1
 #SBATCH --gres=gpu:1
@@ -8,8 +9,14 @@
 #SBATCH --time=12:00:00
 #SBATCH --output=/share/home/hwxu/Researches/D2Plus/Output/logs/rd_transfer_%j.out
 
+set +u
 source /share/home/hwxu/miniconda3/bin/activate hw
+set -u
 cd /share/home/hwxu/Researches/D2Plus
+
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
 
 EXP_CFG=${EXP_CFG:-"Libs/configs/exp.yaml"}
 MODEL_CFG=${MODEL_CFG:-"Libs/configs/baselines/rumordiffusion.yaml"}
@@ -22,6 +29,18 @@ PY
 )
 SEEDS="${SEEDS_OVERRIDE:-$SEEDS_DEFAULT}"
 
-CMD="python3 -m Libs.exp.run --exp ${EXP_CFG} --model ${MODEL_CFG} --seeds ${SEEDS} --transfer_eval --lp_edges_policy require_existing"
-echo "Running transfer_eval using config ${EXP_CFG}, seeds=${SEEDS}"
-eval ${CMD}
+ARGS=(
+  python3 -m Libs.exp.run
+  --exp "${EXP_CFG}"
+  --model "${MODEL_CFG}"
+  --seeds "${SEEDS}"
+  --transfer_eval
+  --lp_edges_policy require_existing
+)
+log "Running transfer evaluation"
+log "EXP_CFG: ${EXP_CFG}"
+log "MODEL_CFG: ${MODEL_CFG}"
+log "Seeds: ${SEEDS}"
+log "Python: $(python3 --version)"
+log "Git HEAD: $(git rev-parse HEAD)"
+"${ARGS[@]}"

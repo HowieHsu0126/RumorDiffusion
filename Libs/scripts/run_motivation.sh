@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 #SBATCH --job-name=motivation
 #SBATCH --partition=gpu1
 #SBATCH --gres=gpu:0
@@ -8,20 +9,26 @@
 #SBATCH --time=8:00:00
 #SBATCH --output=/share/home/hwxu/Researches/D2Plus/Output/logs/motivation_%j.out
 
+set +u
 source /share/home/hwxu/miniconda3/bin/activate hw
+set -u
 cd /share/home/hwxu/Researches/D2Plus
 
-CONFIG=${CONFIG:-"Libs/configs/motivation.yaml"}
-EXPERIMENT=${EXPERIMENT_OVERRIDE:-""}  # nodecount / timecutoff / both
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
 
-CMD="python3 -m Libs.exp.motivation_experiment --config ${CONFIG}"
+CONFIG=${CONFIG:-"Libs/configs/motivation.yaml"}
+EXPERIMENT=${EXPERIMENT_OVERRIDE:-""}
+
+ARGS=(python3 -m Libs.exp.motivation_experiment --config "${CONFIG}")
 if [ -n "${EXPERIMENT}" ]; then
-  CMD+=" --experiment ${EXPERIMENT}"
+  ARGS+=(--experiment "${EXPERIMENT}")
 fi
 
-echo "Running motivation experiment:"
-echo "  config: ${CONFIG}"
-echo "  experiment: ${EXPERIMENT:-auto}"
-
-eval ${CMD}
-
+log "Running motivation experiment"
+log "Config: ${CONFIG}"
+log "Experiment: ${EXPERIMENT:-auto}"
+log "Python: $(python3 --version)"
+log "Git HEAD: $(git rev-parse HEAD)"
+"${ARGS[@]}"

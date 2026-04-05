@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 #SBATCH --job-name=rd-explain
 #SBATCH --partition=gpu1
 #SBATCH --gres=gpu:1
@@ -8,8 +9,14 @@
 #SBATCH --time=8:00:00
 #SBATCH --output=/share/home/hwxu/Researches/D2Plus/Output/logs/rd_explain_%j.out
 
+set +u
 source /share/home/hwxu/miniconda3/bin/activate hw
+set -u
 cd /share/home/hwxu/Researches/D2Plus
+
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
 
 EXP_CFG=${EXP_CFG:-"Libs/configs/exp.yaml"}
 MODEL_CFG=${MODEL_CFG:-"Libs/configs/baselines/rumordiffusion.yaml"}
@@ -55,14 +62,16 @@ SELECTED_OUT=${SELECTED_OUT_OVERRIDE:-"${RESULTS_DIR}/${DATASET_NAME}_selected_c
 SPLIT=${SPLIT_OVERRIDE:-test}
 SOURCE_IDS=${SOURCE_IDS_OVERRIDE:-}
 
-echo "Running RumorDiffusion explain"
-echo "  exp: ${EXP_CFG}"
-echo "  model: ${MODEL_CFG}"
-echo "  ckpt: ${CKPT_PATH}"
-echo "  out: ${OUT_PATH}"
-echo "  trace_out: ${TRACE_OUT}"
-echo "  selected_out: ${SELECTED_OUT}"
-echo "  split: ${SPLIT}"
+log "Running RumorDiffusion explain"
+log "EXP_CFG: ${EXP_CFG}"
+log "MODEL_CFG: ${MODEL_CFG}"
+log "Checkpoint: ${CKPT_PATH}"
+log "Output: ${OUT_PATH}"
+log "Trace output: ${TRACE_OUT}"
+log "Selected output: ${SELECTED_OUT}"
+log "Split: ${SPLIT}"
+log "Python: $(python3 --version)"
+log "Git HEAD: $(git rev-parse HEAD)"
 
 if [ ! -f "${CKPT_PATH}" ]; then
   echo "Missing checkpoint: ${CKPT_PATH}" >&2

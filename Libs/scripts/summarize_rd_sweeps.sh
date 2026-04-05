@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # Aggregate mean±std for sweeps, supporting both rd_sweeps.csv 和各 dataset 结果表。
 # 可选环境变量：
@@ -147,4 +148,3 @@ if len(rows_out) > 0:
         for r in rows_out:
             writer.writerow(r)
 PY
-

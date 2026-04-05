@@ -104,6 +104,7 @@ def build_checkpoint_metadata(
         "split_signature": compute_split_signature(dataset_root),
         "label_mapping": {str(key): int(value) for key, value in label_mapping.items()},
         "config_hash": canonical_json_hash(config_payload),
+        "config_payload": copy.deepcopy(config_payload),
     }
 
 
@@ -115,7 +116,11 @@ def validate_checkpoint_metadata(
 ) -> None:
     """Validates a loaded checkpoint against the expected dataset/model contract."""
     ignored = {str(key) for key in (ignored_keys or [])}
-    missing_keys = [key for key in expected_metadata.keys() if key not in ignored and key not in metadata]
+    optional_keys = {"config_payload"}
+    missing_keys = [
+        key for key in expected_metadata.keys()
+        if key not in ignored and key not in optional_keys and key not in metadata
+    ]
     if missing_keys:
         raise ValueError(
             f"Checkpoint {ckpt_path} is missing metadata keys: {', '.join(sorted(missing_keys))}"
@@ -125,6 +130,8 @@ def validate_checkpoint_metadata(
         if key in ignored:
             continue
         observed_value = metadata.get(key)
+        if key in optional_keys and observed_value is None:
+            continue
         if observed_value != expected_value:
             mismatches.append(
                 f"{key}: expected={expected_value!r}, observed={observed_value!r}"
@@ -1218,6 +1225,9 @@ def main() -> None:
         # Build model for classification or generative baseline
         m = None
         class_weights = None
+        model_use_potentials = False
+        model_potentials_dir: Optional[str] = None
+        model_potentials_pair: List[int] = []
         if name == "rumordiffusion":
             # Stage 1: train CTDM if needed; then generate potentials
             logging.info("Running RumorDiffusion two-stage training...")
@@ -1229,8 +1239,16 @@ def main() -> None:
             ctdm_cfg = rd_cfg.get("ctdm", {})
             checkpoint_cfg = rd_cfg.get("checkpoint", {}) if isinstance(rd_cfg.get("checkpoint", {}), dict) else {}
             validate_ckpt_metadata = bool(checkpoint_cfg.get("validate_metadata", False))
+            require_config_hash = bool(checkpoint_cfg.get("require_config_hash", True))
             allow_legacy_ckpt = bool(checkpoint_cfg.get("allow_legacy", True))
             ctdm_ckpt_root = str(checkpoint_cfg.get("ctdm_dir", base_ckpt_dir))
+            use_potentials = bool(rd_cfg.get("use_potentials", False))
+            potentials_pair = [int(v) for v in rd_cfg.get("potentials_pair", [0, 1])]
+            potentials_dir_cfg = str(rd_cfg.get("potentials_dir", "rd_potentials"))
+            potentials_dir = potentials_dir_cfg if os.path.isabs(potentials_dir_cfg) else os.path.join(dataset_root, potentials_dir_cfg)
+            model_use_potentials = use_potentials
+            model_potentials_dir = potentials_dir
+            model_potentials_pair = list(potentials_pair)
             max_nodes_scan = 0
             for split_idx in range(len(ds_train)):
                 sample = ds_train.get(split_idx)
@@ -1496,7 +1514,7 @@ def main() -> None:
                     expected_metadata=ctdm_checkpoint_metadata,
                     validate_metadata=validate_ckpt_metadata,
                     allow_legacy=allow_legacy_ckpt,
-                    ignored_metadata_keys=["config_hash"],
+                    ignored_metadata_keys=["config_hash"] if not require_config_hash else None,
                 )
                 ctdm.load_state_dict(ctdm_state)
             elif not args.eval_only:
@@ -1504,16 +1522,66 @@ def main() -> None:
                     f"Missing CTDM pretraining checkpoint at {ctdm_pretrain_path}"
                 )
 
+            if use_potentials:
+                if not os.path.isdir(potentials_dir):
+                    raise FileNotFoundError(f"Missing RumorDiffusion potentials directory: {potentials_dir}")
+                ds_train = GraphDataset(
+                    root=dataset_root,
+                    split="train",
+                    use_lp_edges=use_lp_edges,
+                    use_potentials=True,
+                    potentials_dir=potentials_dir,
+                    potentials_pair=potentials_pair,
+                    prefix_cfg=prefix_cfg,
+                    observability_cfg=observability_cfg,
+                )
+                ds_val = GraphDataset(
+                    root=dataset_root,
+                    split="val",
+                    use_lp_edges=use_lp_edges,
+                    use_potentials=True,
+                    potentials_dir=potentials_dir,
+                    potentials_pair=potentials_pair,
+                    prefix_cfg=prefix_cfg,
+                    observability_cfg=observability_cfg,
+                )
+                ds_test = GraphDataset(
+                    root=dataset_root,
+                    split="test",
+                    use_lp_edges=use_lp_edges,
+                    use_potentials=True,
+                    potentials_dir=potentials_dir,
+                    potentials_pair=potentials_pair,
+                    prefix_cfg=prefix_cfg,
+                    observability_cfg=observability_cfg,
+                )
+
             # RumorDiffusion arbiter and loss config overrides
             rd_loss_cfg = rd_cfg.get("loss", {})
             # Build RumorDiffusion arbiter
             arb_cfg = rd_cfg.get("arbiter", {})
+            if use_potentials and str(arb_cfg.get("type", "transformer")).lower() == "transformer":
+                if len(potentials_pair) != int(num_classes):
+                    raise ValueError(
+                        "RumorDiffusion with cached potentials requires one token per class. "
+                        f"Expected {int(num_classes)} entries in potentials_pair, got {len(potentials_pair)}."
+                    )
             # Get actual potential vector dimension from loaded data
             sample_data = ds_train.get(0)
             if hasattr(sample_data, 'h0') and hasattr(sample_data, 'h1'):
                 actual_hidden_dim = int(sample_data.h0.size(-1))
                 concat_dim = int(
                     torch.cat([sample_data.h0, sample_data.h1], dim=-1).size(-1))
+            elif hasattr(sample_data, 'h_cat'):
+                token_count = len(potentials_pair) if use_potentials else int(num_classes)
+                if token_count <= 0:
+                    raise ValueError("RumorDiffusion cached potentials require a positive token count.")
+                concat_dim = int(sample_data.h_cat.size(-1))
+                if concat_dim % int(token_count) != 0:
+                    raise ValueError(
+                        f"Invalid cached potentials width {concat_dim} for token_count={token_count}."
+                    )
+                actual_hidden_dim = int(concat_dim // int(token_count))
             else:
                 # Fallback to CTDM inference if potentials not loaded
                 sample_batch = next(
@@ -1871,6 +1939,7 @@ def main() -> None:
                 expected_metadata=checkpoint_metadata,
                 validate_metadata=bool(name == "rumordiffusion" and checkpoint_metadata is not None and validate_ckpt_metadata),
                 allow_legacy=bool(name != "rumordiffusion" or allow_legacy_ckpt),
+                ignored_metadata_keys=["config_hash"] if (name == "rumordiffusion" and not require_config_hash) else None,
             )
             trainer.model.load_state_dict(state)
             logging.info(f"Checkpoint loaded from {actual_ckpt_path}")
@@ -2446,6 +2515,9 @@ def main() -> None:
                         root=dataset_root,
                         split="test",
                         use_lp_edges=use_lp,
+                        use_potentials=model_use_potentials,
+                        potentials_dir=model_potentials_dir,
+                        potentials_pair=model_potentials_pair,
                         prefix_cfg=prefix_cfg,
                         observability_cfg={"drop_node": float(dn), "drop_edge": float(
                             de), "seed": observability_cfg.get("seed", 0)},

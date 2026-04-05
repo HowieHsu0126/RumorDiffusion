@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 #SBATCH --job-name=rd-hparam
 #SBATCH --partition=gpu1
 #SBATCH --gres=gpu:1
@@ -8,8 +9,14 @@
 #SBATCH --time=24:00:00
 #SBATCH --output=/share/home/hwxu/Researches/D2Plus/Output/logs/rd_hparam_%j.out
 
+set +u
 source /share/home/hwxu/miniconda3/bin/activate hw
+set -u
 cd /share/home/hwxu/Researches/D2Plus
+
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
 
 EXP_CFG=${EXP_CFG:-"Libs/configs/exp.yaml"}
 MODEL_CFGS_DEFAULT="Libs/configs/baselines/rumordiffusion.yaml,Libs/configs/baselines/rumordiffusion_hparam_depth.yaml,Libs/configs/baselines/rumordiffusion_hparam_guidance.yaml"
@@ -24,9 +31,17 @@ PY
 SEEDS="${SEEDS_OVERRIDE:-$SEEDS_DEFAULT}"
 DATASET_OVERRIDE="${DATASET_OVERRIDE:-}"
 
-CMD="python3 -m Libs.exp.run --exp ${EXP_CFG} --model ${MODEL_CFGS} --seeds ${SEEDS}"
+ARGS=(python3 -m Libs.exp.run --exp "${EXP_CFG}" --model "${MODEL_CFGS}" --seeds "${SEEDS}")
 if [ -n "$DATASET_OVERRIDE" ]; then
-  CMD+=" --dataset_override ${DATASET_OVERRIDE}"
+  ARGS+=(--dataset_override "${DATASET_OVERRIDE}")
 fi
-echo "Running: $CMD"
-eval $CMD
+log "Running RumorDiffusion hyperparameter sweeps"
+log "EXP_CFG: ${EXP_CFG}"
+log "MODEL_CFGS: ${MODEL_CFGS}"
+log "Seeds: ${SEEDS}"
+if [ -n "${DATASET_OVERRIDE}" ]; then
+  log "Dataset override: ${DATASET_OVERRIDE}"
+fi
+log "Python: $(python3 --version)"
+log "Git HEAD: $(git rev-parse HEAD)"
+"${ARGS[@]}"

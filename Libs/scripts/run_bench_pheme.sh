@@ -1,4 +1,9 @@
 #!/bin/bash
+set -euo pipefail
+
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
 
 EXP_CFG_DEFAULT="${EXP_CFG:-Libs/configs/exp.yaml}"
 
@@ -54,7 +59,7 @@ devs = cfg.get("sbatch", {}).get("cuda_devices", [0,1,2,3])
 print(devs[0] if len(devs) > 0 else 0)
 PY
 )
-  SEEDS=$(python3 - "${EXP_CFG_DEFAULT}" <<'PY'
+  SEEDS_DEFAULT=$(python3 - "${EXP_CFG_DEFAULT}" <<'PY'
 import yaml
 import sys
 
@@ -63,7 +68,8 @@ seeds = cfg.get("experiment", {}).get("seeds", [42, 3047, 126])
 print(",".join(str(s) for s in seeds))
 PY
 )
-  MODELS=$(python3 - "${EXP_CFG_DEFAULT}" <<'PY'
+  SEEDS="${SEEDS_OVERRIDE:-${SEEDS_DEFAULT}}"
+  MODELS_DEFAULT=$(python3 - "${EXP_CFG_DEFAULT}" <<'PY'
 import yaml
 import sys
 
@@ -73,22 +79,27 @@ models = models_cfg.get("pheme", models_cfg.get("default", ["rumordiffusion"]))
 print(" ".join(models))
 PY
 )
+  MODELS="${MODELS_OVERRIDE:-${MODELS_DEFAULT}}"
+  EVAL_ONLY="${EVAL_ONLY_OVERRIDE:-0}"
+  CKPT_OVERRIDE_VALUE="${CKPT_OVERRIDE:-}"
   mkdir -p "${LOG_DIR}"
   sbatch \
     --job-name=bench_pheme \
     --partition="${PARTITION}" \
     ${NODELIST:+--nodelist=${NODELIST}} \
-    --gres="${GRES}" \
+    ${GRES:+--gres=${GRES}} \
     --time="${TIME}" \
     --output="${LOG_DIR}/bench_pheme_%j.log" \
     --error="${LOG_DIR}/bench_pheme_%j.err" \
-    --export=ALL,EXP_CFG="${EXP_CFG_DEFAULT}",SEEDS_OVERRIDE="${SEEDS}",MODELS_OVERRIDE="${MODELS}",CUDA_VISIBLE_DEVICES=${CUDA_DEV} \
+    --export=ALL,EXP_CFG="${EXP_CFG_DEFAULT}",SEEDS_OVERRIDE="${SEEDS}",MODELS_OVERRIDE="${MODELS}",EVAL_ONLY_OVERRIDE="${EVAL_ONLY}",CKPT_OVERRIDE="${CKPT_OVERRIDE_VALUE}",CUDA_VISIBLE_DEVICES=${CUDA_DEV} \
     Libs/scripts/run_bench_pheme.sh sbatch
   exit $?
 fi
 
 # Running inside Slurm job
+set +u
 source /share/home/hwxu/miniconda3/bin/activate hw
+set -u
 cd /share/home/hwxu/Researches/D2Plus
 mkdir -p Output/logs
 
@@ -106,10 +117,12 @@ for model in "${MODELS[@]}"; do
     fi
 done
 
-echo "Starting benchmark for pheme dataset"
-echo "Models: ${MODELS[*]}"
-echo "Seeds: ${SEEDS}"
-echo "=========================================="
+log "Dataset: pheme"
+log "EXP_CFG: ${EXP_CFG_DEFAULT}"
+log "Models: ${MODELS[*]}"
+log "Seeds: ${SEEDS}"
+log "Python: $(python3 --version)"
+log "Git HEAD: $(git rev-parse HEAD)"
 
 RUN_ARGS=()
 if [ "${EVAL_ONLY}" = "1" ]; then
