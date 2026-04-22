@@ -8,9 +8,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import yaml
-from sentence_transformers import SentenceTransformer
 from torch import Tensor
 from torch_geometric.data import Data, InMemoryDataset
+
+os.environ["USE_TF"] = "0"
+os.environ["USE_TORCH"] = "1"
+os.environ["TRANSFORMERS_NO_TF"] = "1"
 
 
 @dataclass
@@ -56,6 +59,9 @@ class DatasetConfig:
     augment_method: str
     text_encoder_path: Optional[str]
     text_normalize: bool
+    text_cache_name: str
+    text_batch_size: int
+    text_normalization: Dict[str, object]
     text_noise_std: float
     text_dropout: float
     saving_format: str
@@ -118,6 +124,9 @@ def load_config(config_path: str) -> DatasetConfig:
         augment_method=str(augment["method"]),
         text_encoder_path=text_cfg.get("encoder_path"),
         text_normalize=bool(text_cfg.get("normalize", False)),
+        text_cache_name=str(text_cfg.get("cache_name", "text_embs.pt")),
+        text_batch_size=int(text_cfg.get("batch_size", 64)),
+        text_normalization=dict(text_cfg.get("normalization", {})),
         text_noise_std=float(augment.get("text_noise_std", 0.0)),
         text_dropout=float(augment.get("text_dropout", 0.0)),
         saving_format=str(saving["format"]),
@@ -147,6 +156,39 @@ def resolve_label_config(dataset: str, cfg: DatasetConfig) -> LabelConfig:
 def resolve_time_source(dataset: str, cfg: DatasetConfig) -> str:
     """Returns dataset-specific time source selection."""
     return cfg.time_source_overrides.get(dataset, cfg.time_source_default)
+
+
+def normalize_tweet_text(text: str, normalization_cfg: Optional[Dict[str, object]] = None) -> str:
+    """Normalizes tweet text using configurable, non-destructive substitutions."""
+    cfg = normalization_cfg if isinstance(normalization_cfg, dict) else {}
+    normalized = str(text)
+    if bool(cfg.get("lowercase", False)):
+        normalized = normalized.lower()
+    if bool(cfg.get("replace_url", False)):
+        normalized = re.sub(r"https?://\S+|www\.\S+", " <url> ", normalized)
+    if bool(cfg.get("replace_mention", False)):
+        normalized = re.sub(r"@\w+", " <user> ", normalized)
+    if bool(cfg.get("replace_number", False)):
+        normalized = re.sub(r"\b\d+(?:[\.,]\d+)?\b", " <num> ", normalized)
+    if bool(cfg.get("keep_hashtag_text", False)):
+        normalized = re.sub(r"#([A-Za-z0-9_]+)", r" \1 ", normalized)
+    if bool(cfg.get("compress_repeated_chars", False)):
+        normalized = re.sub(r"(.)\1{2,}", r"\1\1", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def resolve_text_model_path(model_name_or_path: str, raw_root: str) -> str:
+    """Resolves a configured model path, preferring explicit local paths when present."""
+    model_text = str(model_name_or_path).strip()
+    if len(model_text) == 0:
+        return os.path.join(os.path.dirname(raw_root), "sentence_transformers_all_MiniLM_L6v2")
+    if os.path.isdir(model_text):
+        return model_text
+    local_candidate = os.path.join(os.path.dirname(raw_root), model_text)
+    if os.path.isdir(local_candidate):
+        return local_candidate
+    return model_text
 
 
 def parse_source_texts(raw_dir: str) -> Dict[str, str]:
@@ -202,7 +244,9 @@ def build_text_embedding_cache(dataset: str,
                                raw_root: str,
                                processed_root: str,
                                model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-                               batch_size: int = 64) -> str:
+                               batch_size: int = 64,
+                               normalization_cfg: Optional[Dict[str, object]] = None,
+                               cache_name: str = "text_embs.pt") -> str:
     """Builds and saves `{source_id -> text_emb}` cache to processed dir.
 
     The output file path is `{processed_root}/{dataset}/text_embs.pt` and contains:
@@ -211,24 +255,23 @@ def build_text_embedding_cache(dataset: str,
     raw_dir = os.path.join(raw_root, dataset)
     out_dir = os.path.join(processed_root, dataset)
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "text_embs.pt")
+    out_path = os.path.join(out_dir, str(cache_name))
 
     # Parse all available source texts
     sid_to_text = parse_source_texts(raw_dir)
     ids = sorted(sid_to_text.keys())
-    texts = [sid_to_text[sid] for sid in ids]
+    texts = [normalize_tweet_text(sid_to_text[sid], normalization_cfg) for sid in ids]
 
     # Encode texts using sentence-transformers
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Use local model path from Input directory
-    local_model_path = os.path.join(os.path.dirname(raw_root), "sentence_transformers_all_MiniLM_L6v2")
-    print(f"Loading model from: {local_model_path}")
+    model_path = resolve_text_model_path(model_name, raw_root)
+    print(f"Loading model from: {model_path}")
     
     # Try to load with transformers directly first
     try:
         from transformers import AutoModel, AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(local_model_path)
-        model = AutoModel.from_pretrained(local_model_path)
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModel.from_pretrained(model_path)
         model.to(device)
         
         # Create a simple encoder function
@@ -251,7 +294,9 @@ def build_text_embedding_cache(dataset: str,
     except Exception as e:
         print(f"Failed to load with transformers: {e}")
         # Fallback to sentence-transformers
-        encoder = SentenceTransformer(local_model_path, device=device)
+        from sentence_transformers import SentenceTransformer
+
+        encoder = SentenceTransformer(model_path, device=device)
         emb = encoder.encode(texts, batch_size=int(batch_size), convert_to_tensor=True, normalize_embeddings=False)
         emb = emb.to(torch.float32).cpu()
     
@@ -271,6 +316,11 @@ def build_text_embedding_cache(dataset: str,
 def _encode_texts_sentence_transformer(texts: List[str],
                                        model_path: str,
                                        batch_size: int = 64) -> Tensor:
+    os.environ["USE_TF"] = "0"
+    os.environ["USE_TORCH"] = "1"
+    os.environ["TRANSFORMERS_NO_TF"] = "1"
+    from sentence_transformers import SentenceTransformer
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     encoder = SentenceTransformer(model_path, device=device)
     emb = encoder.encode(
@@ -286,7 +336,13 @@ def _encode_texts_sentence_transformer(texts: List[str],
 def _encode_texts_transformer_mean_pool(texts: List[str],
                                         model_path: str,
                                         batch_size: int = 64) -> Tensor:
-    """Encodes texts using HuggingFace transformers with mean pooling."""
+    """Encodes texts using a local sentence-transformer, with HF mean-pool fallback."""
+    os.environ["USE_TF"] = "0"
+    os.environ["USE_TORCH"] = "1"
+    os.environ["TRANSFORMERS_NO_TF"] = "1"
+    if os.path.isfile(os.path.join(model_path, "modules.json")):
+        return _encode_texts_sentence_transformer(texts, model_path=model_path, batch_size=batch_size)
+
     from transformers import AutoModel, AutoTokenizer
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -326,13 +382,15 @@ def build_text_embedding_cache_from_mapping(dataset: str,
                                             processed_root: str,
                                             mapping: Dict[str, str],
                                             model_path: str,
-                                            batch_size: int = 64) -> str:
+                                            batch_size: int = 64,
+                                            normalization_cfg: Optional[Dict[str, object]] = None,
+                                            cache_name: str = "text_embs.pt") -> str:
     """Builds text embedding cache from provided id->text mapping."""
     out_dir = os.path.join(processed_root, dataset)
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "text_embs.pt")
+    out_path = os.path.join(out_dir, str(cache_name))
     ids = sorted(mapping.keys())
-    texts = [mapping[i] for i in ids]
+    texts = [normalize_tweet_text(mapping[i], normalization_cfg) for i in ids]
     emb = _encode_texts_transformer_mean_pool(texts, model_path=model_path, batch_size=batch_size)
     obj = {
         "model": str(model_path),
@@ -344,9 +402,9 @@ def build_text_embedding_cache_from_mapping(dataset: str,
     return out_path
 
 
-def _load_text_embedding_cache(processed_root: str, dataset: str) -> Tuple[Dict[str, int], Tensor]:
+def _load_text_embedding_cache(processed_root: str, dataset: str, cache_name: str = "text_embs.pt") -> Tuple[Dict[str, int], Tensor]:
     """Loads text embedding cache and returns (id_to_index, emb_matrix)."""
-    path = os.path.join(processed_root, dataset, "text_embs.pt")
+    path = os.path.join(processed_root, dataset, str(cache_name))
     obj = torch.load(path, weights_only=False)
     ids: List[str] = list(obj["ids"])  # type: ignore[index]
     emb: Tensor = obj["emb"].to(torch.float32)  # type: ignore[index]
@@ -800,22 +858,27 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
     label_cfg = resolve_label_config(ds, cfg)
     time_source = resolve_time_source(ds, cfg)
     raw_dir = os.path.join(cfg.raw_root, ds)
-    local_model_path = cfg.text_encoder_path or os.path.join(os.path.dirname(cfg.raw_root), "sentence_transformers_all_MiniLM_L6v2")
+    text_model_path = resolve_text_model_path(
+        cfg.text_encoder_path or "sentence_transformers_all_MiniLM_L6v2",
+        cfg.raw_root,
+    )
 
     # JSON-format datasets (weibo, pheme)
     if ds in {"weibo", "pheme"}:
         assert os.path.isdir(raw_dir), f"Missing raw dir: {raw_dir}"
-        cache_path = os.path.join(cfg.processed_root, ds, "text_embs.pt")
+        source_texts = collect_json_source_texts(raw_dir)
+        cache_path = os.path.join(cfg.processed_root, ds, cfg.text_cache_name)
         if not os.path.isfile(cache_path):
-            source_texts = collect_json_source_texts(raw_dir)
             build_text_embedding_cache_from_mapping(
                 dataset=ds,
                 processed_root=cfg.processed_root,
                 mapping=source_texts,
-                model_path=local_model_path,
-                batch_size=64,
+                model_path=text_model_path,
+                batch_size=cfg.text_batch_size,
+                normalization_cfg=cfg.text_normalization,
+                cache_name=cfg.text_cache_name,
             )
-        id_to_idx, emb_matrix = _load_text_embedding_cache(cfg.processed_root, ds)
+        id_to_idx, emb_matrix = _load_text_embedding_cache(cfg.processed_root, ds, cfg.text_cache_name)
 
         data_list: List[Data] = []
         labels: List[int] = []
@@ -904,10 +967,18 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
     if not os.path.isfile(label_path):
         raise FileNotFoundError(f"Missing label file: {label_path}")
 
-    cache_path = os.path.join(cfg.processed_root, ds, "text_embs.pt")
-    if not os.path.isfile(cache_path) and os.path.isdir(local_model_path):
-        build_text_embedding_cache(ds, cfg.raw_root, cfg.processed_root, model_name="sentence-transformers/all-MiniLM-L6-v2", batch_size=64)
-    id_to_idx, emb_matrix = _load_text_embedding_cache(cfg.processed_root, ds)
+    cache_path = os.path.join(cfg.processed_root, ds, cfg.text_cache_name)
+    if not os.path.isfile(cache_path):
+        build_text_embedding_cache(
+            ds,
+            cfg.raw_root,
+            cfg.processed_root,
+            model_name=text_model_path,
+            batch_size=cfg.text_batch_size,
+            normalization_cfg=cfg.text_normalization,
+            cache_name=cfg.text_cache_name,
+        )
+    id_to_idx, emb_matrix = _load_text_embedding_cache(cfg.processed_root, ds, cfg.text_cache_name)
 
     sid_to_text = parse_source_texts(raw_dir)
     label_map_raw = read_labels(label_path)

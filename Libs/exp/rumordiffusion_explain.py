@@ -22,8 +22,12 @@ from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader as PyGDataLoader
 
 from Libs.data.dataset import GraphDataset
-from Libs.exp.run import (_deep_merge, load_checkpoint_state, read_yaml_like,
-                          resolve_max_nodes_setting)
+from Libs.exp.run import (apply_dataset_overrides, _deep_merge,
+                          ensure_text_embedding_cache, load_checkpoint_state,
+                          make_graph_dataset, read_yaml_like,
+                          resolve_dataset_text_runtime_cfg,
+                          resolve_max_nodes_setting,
+                          validate_rumordiffusion_pair_config)
 from Libs.models.baselines.CTDM_syn import CTDMSyn
 from Libs.models.baselines.RumorDiffusion import RumorDiffusion
 from Libs.models.modules.rumor_diffusion import _extract_source_ids_from_batch
@@ -40,11 +44,13 @@ def build_device(device_cfg: Dict) -> str:
     return cfg_type
 
 
-def resolve_rd_cfg(exp_cfg: Dict, model_cfg: Dict) -> Tuple[Dict, Dict]:
+def resolve_rd_cfg(exp_cfg: Dict, model_cfg: Dict, dataset_name: str, num_classes: int) -> Tuple[Dict, Dict]:
     """Mimics the main runner's merge order: model defaults, exp overrides."""
     rd_cfg_model = model_cfg.get("model", {}) if isinstance(model_cfg.get("model", {}), dict) else {}
     rd_cfg_exp = exp_cfg.get("rumordiffusion", {}) if isinstance(exp_cfg.get("rumordiffusion", {}), dict) else {}
     rd_cfg = _deep_merge(rd_cfg_model, rd_cfg_exp)
+    rd_cfg = apply_dataset_overrides(rd_cfg, dataset_name)
+    rd_cfg = validate_rumordiffusion_pair_config(rd_cfg, dataset_name, num_classes)
     rd_eval_model = model_cfg.get("evaluation", {}) if isinstance(model_cfg.get("evaluation", {}), dict) else {}
     rd_eval_exp = rd_cfg.get("evaluation", {}) if isinstance(rd_cfg.get("evaluation", {}), dict) else {}
     rd_eval_cfg = _deep_merge(rd_eval_model, rd_eval_exp)
@@ -154,15 +160,15 @@ def infer_hidden_channels(ds: GraphDataset, ctdm: CTDMSyn, device: torch.device)
 
 def build_rumor_diffusion(model_cfg: Dict, exp_cfg: Dict, ds: GraphDataset, device: torch.device) -> RumorDiffusion:
     """Builds RumorDiffusion model using YAML configuration."""
-    rd_cfg, _rd_eval_cfg = resolve_rd_cfg(exp_cfg, model_cfg)
+    num_features = ds.num_features
+    num_classes = ds.num_classes
+    dataset_name = os.path.basename(os.path.normpath(ds.root))
+    rd_cfg, _rd_eval_cfg = resolve_rd_cfg(exp_cfg, model_cfg, dataset_name, int(num_classes))
     ctdm_cfg = rd_cfg.get("ctdm", {})
     arb_cfg = rd_cfg.get("arbiter", {})
     loss_cfg = rd_cfg.get("loss", {})
     dd_cfg = rd_cfg.get("dd_gan", {})
     text_cfg = rd_cfg.get("text", {})
-
-    num_features = ds.num_features
-    num_classes = ds.num_classes
     max_nodes = resolve_ctdm_max_nodes(ds, ctdm_cfg)
     ctdm = build_ctdm(ctdm_cfg, text_cfg, num_features, num_classes, max_nodes)
     ctdm = ctdm.to(device)
@@ -544,8 +550,6 @@ def main() -> None:
 
     exp_cfg = read_yaml_like(args.exp)
     model_cfg = read_yaml_like(args.model)
-    rd_cfg, rd_eval_cfg = resolve_rd_cfg(exp_cfg, model_cfg)
-
     device_cfg = exp_cfg.get("device", {})
     device_str = build_device(device_cfg)
     device = torch.device(device_str)
@@ -559,13 +563,17 @@ def main() -> None:
     use_lp_edges = bool(dataset_cfg.get("use_lp_edges", False))
     prefix_cfg = dataset_cfg.get("prefix", {})
     observability_cfg = dataset_cfg.get("observability", {})
-    ds = GraphDataset(
+    text_runtime_cfg = resolve_dataset_text_runtime_cfg(exp_cfg)
+    ensure_text_embedding_cache(dataset_name, text_runtime_cfg)
+    ds = make_graph_dataset(
         root=dataset_root,
         split=args.split,
         use_lp_edges=use_lp_edges,
         prefix_cfg=prefix_cfg,
         observability_cfg=observability_cfg,
+        text_runtime_cfg=text_runtime_cfg,
     )
+    rd_cfg, rd_eval_cfg = resolve_rd_cfg(exp_cfg, model_cfg, dataset_name, int(ds.num_classes))
     eval_cfg = exp_cfg.get("evaluation", {}) if isinstance(exp_cfg.get("evaluation", {}), dict) else {}
     train_cfg = exp_cfg.get("training", {}) if isinstance(exp_cfg.get("training", {}), dict) else {}
     max_samples = int(eval_cfg.get("max_samples", train_cfg.get("max_samples", 0)))

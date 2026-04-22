@@ -4,6 +4,21 @@ dataset:
   name: twitter15
   root: Input/processed
   use_lp_edges: false
+  text_normalization:
+    lowercase: true
+    replace_url: true
+    replace_mention: true
+    replace_number: true
+    compress_repeated_chars: true
+    keep_hashtag_text: true
+  text_encoder:
+    model_name_or_path: sentence-transformers/all-mpnet-base-v2
+    batch_size: 32
+    cache_tag: mpnet_round1
+    cache_name: text_embs_mpnet_round1.pt
+    force_text_cache: true
+    normalize_embeddings: true
+    rebuild_cache: false
   observability_sweep:
     drop_node: [0.0, 0.1, 0.2]
     drop_edge: [0.0, 0.1, 0.2]
@@ -76,6 +91,7 @@ sbatch:
 bench_models:
   default: ["bigcn", "cgvae_gcn", "dga_fake", "gat", "gcn", "lp_gcn", "resgcn", "tgat", "rumordiffusion"]
 transfer:
+  mode: source_only
   pairs:
     - source: twitter15
       target: twitter16
@@ -86,6 +102,10 @@ transfer:
   ckpt_name: best.pt
   lp_edges_policy: require_existing
   results_path: Output/results/round1/transfer.csv
+  adaptation:
+    target_split: train
+    selection_split: val
+    adapt_ckpt_name: best_target_adapt.pt
 rumordiffusion:
   checkpoint:
     validate_metadata: true
@@ -177,6 +197,48 @@ rumordiffusion:
     source_ids: ""
     case_selection:
       enabled: true
+  dataset_overrides:
+    weibo:
+      arbiter:
+        pair_ids: [0, 1]
+      ctdm:
+        regularizers:
+          pair_ids: [0, 1]
+    pheme:
+      arbiter:
+        pair_ids: [0, 1]
+      ctdm:
+        regularizers:
+          pair_ids: [0, 1]
+  adaptation:
+    epochs: 6
+    batch_size: 4
+    lr: 0.0001
+    arbiter_lr: 0.0001
+    ctdm_lr: 0.00003
+    weight_decay: 0.0001
+    ema_decay: 0.995
+    confidence_threshold: 0.80
+    min_samples_per_class: 2
+    pseudo_label_weight: 1.0
+    consistency_weight: 0.15
+    prototype_align_weight: 0.10
+    use_class_reweighting: true
+    logit_adjustment_strength: 0.15
+    ctdm_unfreeze_last_layers: 1
+    consistency_text_dropout: 0.10
+    consistency_text_noise_std: 0.01
+    consistency_edge_drop_rate: 0.10
+    consistency_obs_min: 10
+    consistency_obs_max: 30
+    target_prefix:
+      strategy: minutes
+      minutes: 30
+      include_root: true
+    target_observability:
+      drop_node: 0.05
+      drop_edge: 0.10
+      seed: 1024
   loss:
     la_gamma: 2.2
     la_smooth: 0.05

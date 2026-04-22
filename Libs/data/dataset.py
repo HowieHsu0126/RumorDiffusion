@@ -159,6 +159,9 @@ class GraphDataset(InMemoryDataset):
         potentials_pair: Optional[List[int]] = None,
         prefix_cfg: Optional[Dict] = None,
         observability_cfg: Optional[Dict] = None,
+        text_cache_name: Optional[str] = None,
+        force_text_cache: bool = False,
+        text_normalize: bool = False,
     ) -> None:
         super().__init__(root=root, transform=transform, pre_transform=pre_transform)
 
@@ -201,9 +204,12 @@ class GraphDataset(InMemoryDataset):
         self._drop_edge = float(observability_cfg.get("drop_edge", 0.0))
         self._drop_node = float(observability_cfg.get("drop_node", 0.0))
         self._obs_seed = int(observability_cfg.get("seed", 0))
+        self._force_text_cache = bool(force_text_cache)
+        self._text_normalize = bool(text_normalize)
 
         # Optional text embedding cache (graph-level). Load once if present.
-        text_cache_path = os.path.join(self.root, "text_embs.pt")
+        resolved_text_cache_name = str(text_cache_name).strip() if text_cache_name is not None else "text_embs.pt"
+        text_cache_path = os.path.join(self.root, resolved_text_cache_name)
         self._text_cache_loaded = False
         self._text_id_to_idx: Optional[Dict[str, int]] = None
         self._text_emb_matrix: Optional[Tensor] = None
@@ -338,10 +344,12 @@ class GraphDataset(InMemoryDataset):
             assert hasattr(data, "source_id"), "source_id metadata is required for text cache lookup"
             sid = str(data.source_id)
             assert self._text_id_to_idx is not None and self._text_emb_matrix is not None
-            if not hasattr(data, "text_emb"):
+            if self._force_text_cache or not hasattr(data, "text_emb"):
                 assert sid in self._text_id_to_idx, f"text_emb missing for source_id={sid}"
                 row = int(self._text_id_to_idx[sid])
                 vec = self._text_emb_matrix[row].to(torch.float32).unsqueeze(0)
+                if self._text_normalize:
+                    vec = torch.nn.functional.normalize(vec, p=2, dim=-1)
                 data.text_emb = vec
 
         # Build prefix view and observability-aware subgraph if configured
@@ -398,5 +406,4 @@ class GraphDataset(InMemoryDataset):
             labels: List[int] = [int(self._data.y[i].view(-1)[0].item()) for i in unique_indices]
             self._num_classes = int(max(labels) + 1)
         return self._num_classes
-
 

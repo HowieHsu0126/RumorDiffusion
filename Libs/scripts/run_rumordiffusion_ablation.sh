@@ -1,46 +1,101 @@
 #!/bin/bash
 set -euo pipefail
-#SBATCH --job-name=rd-ablate
-#SBATCH --partition=gpu1
-#SBATCH --gres=gpu:1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=24:00:00
-#SBATCH --output=/share/home/hwxu/Researches/D2Plus/Output/logs/rd_ablate_%j.out
 
-set +u
-source /share/home/hwxu/miniconda3/bin/activate hw
-set -u
-cd /share/home/hwxu/Researches/D2Plus
+source /share/home/hwxu/Researches/D2Plus/Libs/scripts/slurm_common.sh
 
 log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "$*"
 }
 
-EXP_CFG=${EXP_CFG:-"Libs/configs/exp.yaml"}
-MODEL_CFGS="${MODEL_CFGS_OVERRIDE:-Libs/configs/baselines/rumordiffusion.yaml,Libs/configs/baselines/rumordiffusion_ablate_ddgan.yaml,Libs/configs/baselines/rumordiffusion_ablate_pair.yaml,Libs/configs/baselines/rumordiffusion_ablate_text.yaml,Libs/configs/baselines/rumordiffusion_ablate_temporal.yaml}"
-SEEDS_DEFAULT=$(python3 - "${EXP_CFG}" <<'PY'
-import yaml
+PROFILE="ablation"
+EXP_CFG_DEFAULT="${EXP_CFG:-Libs/configs/exp_paper_ready.yaml}"
+
+if [ -z "${SLURM_JOB_ID:-}" ]; then
+  cd /share/home/hwxu/Researches/D2Plus
+  JOB_PREFIX=$(resolve_project_prefix)
+  PARTITION=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "partition" "gpu1")
+  NODELIST=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "nodelist" "gpu03")
+  GRES=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "gres" "gpu:1")
+  CPUS_PER_TASK=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "cpus_per_task" "8")
+  MEM=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "mem" "32G")
+  LOG_DIR=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "log_dir" "Output/logs/paper_ready")
+  CONDA_ENV=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "conda_env" "hw")
+  SEEDS_DEFAULT=$(python3 - "${EXP_CFG_DEFAULT}" <<'PY'
 import sys
-cfg = yaml.safe_load(open(sys.argv[1]))
-print(",".join(str(s) for s in cfg.get("experiment", {}).get("seeds", [42])))
+import yaml
+
+cfg = yaml.safe_load(open(sys.argv[1], "r", encoding="utf-8"))
+seeds = cfg.get("experiment", {}).get("seeds", [42, 3407, 126, 218, 91])
+print(",".join(str(seed) for seed in seeds))
 PY
 )
-SEEDS="${SEEDS_OVERRIDE:-$SEEDS_DEFAULT}"
-DATASET_OVERRIDE="${DATASET_OVERRIDE:-}"
+  MODEL_CFGS_DEFAULT="Libs/configs/baselines/rumordiffusion.yaml,Libs/configs/baselines/rumordiffusion_ablate_ddgan.yaml,Libs/configs/baselines/rumordiffusion_ablate_pair.yaml,Libs/configs/baselines/rumordiffusion_ablate_text.yaml,Libs/configs/baselines/rumordiffusion_ablate_temporal.yaml"
+  MODEL_CFGS="${MODEL_CFGS_OVERRIDE:-${MODEL_CFGS_DEFAULT}}"
+  SEEDS="${SEEDS_OVERRIDE:-${SEEDS_DEFAULT}}"
+  DATASET_VALUE="${DATASET_OVERRIDE:-all}"
+  DEPENDENCY_VALUE="${SBATCH_DEPENDENCY:-}"
+  JOB_NAME="${JOB_PREFIX}_ablation_${DATASET_VALUE}"
+  mkdir -p "${LOG_DIR}"
+  sinfo
+  SBATCH_ARGS=(
+    --job-name="${JOB_NAME}"
+    --partition="${PARTITION}"
+    --ntasks=1
+    --cpus-per-task="${CPUS_PER_TASK}"
+    --mem="${MEM}"
+    --output="${LOG_DIR}/${JOB_NAME}_%j.log"
+    --error="${LOG_DIR}/${JOB_NAME}_%j.err"
+    --export=ALL,EXP_CFG="${EXP_CFG_DEFAULT}",MODEL_CFGS_OVERRIDE="${MODEL_CFGS}",SEEDS_OVERRIDE="${SEEDS}",DATASET_OVERRIDE="${DATASET_OVERRIDE:-}",SOURCE_DATASET_OVERRIDE="${SOURCE_DATASET_OVERRIDE:-}",CONDA_ENV_OVERRIDE="${CONDA_ENV}"
+  )
+  if [ -n "${NODELIST}" ]; then
+    SBATCH_ARGS+=(--nodelist="${NODELIST}")
+  fi
+  if [ -n "${GRES}" ]; then
+    SBATCH_ARGS+=(--gres="${GRES}")
+  fi
+  if [ -n "${DEPENDENCY_VALUE}" ]; then
+    SBATCH_ARGS+=(--dependency="${DEPENDENCY_VALUE}")
+  fi
+  sbatch "${SBATCH_ARGS[@]}" Libs/scripts/run_rumordiffusion_ablation.sh sbatch
+  exit $?
+fi
 
-ARGS=(python3 -m Libs.exp.run --exp "${EXP_CFG}" --model "${MODEL_CFGS}" --seeds "${SEEDS}")
-if [ -n "$DATASET_OVERRIDE" ]; then
-  ARGS+=(--dataset_override "${DATASET_OVERRIDE}")
+CONDA_ENV="${CONDA_ENV_OVERRIDE:-$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "conda_env" "hw")}"
+LOG_DIR=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "log_dir" "Output/logs/paper_ready")
+activate_conda_env "${CONDA_ENV}"
+cd /share/home/hwxu/Researches/D2Plus
+mkdir -p "${LOG_DIR}"
+record_env_snapshot "${LOG_DIR}" "${SLURM_JOB_NAME:-DPlus_ablation}"
+
+SEEDS_DEFAULT=$(python3 - "${EXP_CFG_DEFAULT}" <<'PY'
+import sys
+import yaml
+
+cfg = yaml.safe_load(open(sys.argv[1], "r", encoding="utf-8"))
+seeds = cfg.get("experiment", {}).get("seeds", [42, 3407, 126, 218, 91])
+print(",".join(str(seed) for seed in seeds))
+PY
+)
+MODEL_CFGS_DEFAULT="Libs/configs/baselines/rumordiffusion.yaml,Libs/configs/baselines/rumordiffusion_ablate_ddgan.yaml,Libs/configs/baselines/rumordiffusion_ablate_pair.yaml,Libs/configs/baselines/rumordiffusion_ablate_text.yaml,Libs/configs/baselines/rumordiffusion_ablate_temporal.yaml"
+MODEL_CFGS="${MODEL_CFGS_OVERRIDE:-${MODEL_CFGS_DEFAULT}}"
+SEEDS="${SEEDS_OVERRIDE:-${SEEDS_DEFAULT}}"
+DATASET_VALUE="${DATASET_OVERRIDE:-}"
+SOURCE_DATASET_NAME="${SOURCE_DATASET_OVERRIDE:-${DATASET_VALUE}}"
+RUN_CMD=(
+  python3 -m Libs.exp.run
+  --exp "${EXP_CFG_DEFAULT}"
+  --model "${MODEL_CFGS}"
+  --seeds "${SEEDS}"
+)
+if [ -n "${DATASET_VALUE}" ]; then
+  RUN_CMD+=(--dataset_override "${DATASET_VALUE}")
+  RUN_CMD+=(--source_dataset_override "${SOURCE_DATASET_NAME}")
 fi
-log "Running RumorDiffusion ablation"
-log "EXP_CFG: ${EXP_CFG}"
-log "MODEL_CFGS: ${MODEL_CFGS}"
+log "Ablation configs: ${MODEL_CFGS}"
 log "Seeds: ${SEEDS}"
-if [ -n "${DATASET_OVERRIDE}" ]; then
-  log "Dataset override: ${DATASET_OVERRIDE}"
+if [ -n "${DATASET_VALUE}" ]; then
+  log "Dataset override: ${DATASET_VALUE}"
+  log "Source dataset: ${SOURCE_DATASET_NAME}"
 fi
-log "Python: $(python3 --version)"
-log "Git HEAD: $(git rev-parse HEAD)"
-"${ARGS[@]}"
+log_run_header "${RUN_CMD[*]}"
+"${RUN_CMD[@]}"

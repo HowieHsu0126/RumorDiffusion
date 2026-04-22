@@ -16,13 +16,19 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader
 
+from Libs.data.processor import (build_text_embedding_cache,
+                                 build_text_embedding_cache_from_mapping,
+                                 collect_json_source_texts, parse_source_texts,
+                                 resolve_text_model_path)
 from Libs.data.dataset import GraphDataset
 from Libs.exp.trainer import (CGVAEConfig, CGVAETrainer, LinkPredConfig,
                               LinkPredTrainer, Trainer, TrainerConfig,
+                              build_checkpoint_payload,
                               unpack_checkpoint_payload)
 from Libs.models.baselines.APPNPNet import APPNPNet
 from Libs.models.baselines.BiGCN import BiGCN
@@ -172,6 +178,19 @@ def load_checkpoint_state(
     return state_dict, metadata
 
 
+def rumordiffusion_metadata_ignored_keys(
+    require_config_hash: bool,
+    transfer_run: bool,
+) -> Optional[List[str]]:
+    """Returns metadata keys that should not block RumorDiffusion checkpoint loading."""
+    ignored: List[str] = []
+    if (not bool(require_config_hash)) or bool(transfer_run):
+        ignored.extend(["config_hash", "config_payload"])
+    if len(ignored) == 0:
+        return None
+    return list(dict.fromkeys(ignored))
+
+
 def resolve_max_nodes_setting(scanned_max_nodes: int, configured_max_nodes: int, context: str) -> int:
     """Resolves `max_nodes` without silent truncation."""
     if int(scanned_max_nodes) <= 0:
@@ -224,6 +243,57 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return merged
 
 
+def apply_dataset_overrides(cfg: Dict[str, Any], dataset_name: str) -> Dict[str, Any]:
+    """Applies dataset-specific overrides stored under ``dataset_overrides``."""
+    overrides = cfg.get("dataset_overrides", {}) if isinstance(cfg.get("dataset_overrides", {}), dict) else {}
+    dataset_override = overrides.get(dataset_name, {}) if isinstance(overrides.get(dataset_name, {}), dict) else {}
+    if len(dataset_override) == 0:
+        return cfg
+    merged = _deep_merge(cfg, dataset_override)
+    merged["dataset_overrides"] = overrides
+    return merged
+
+
+def validate_class_pair(pair_ids: Sequence[int], num_classes: int, context: str, dataset_name: str) -> List[int]:
+    """Validates that a configured class pair exists for the target dataset."""
+    resolved = [int(v) for v in pair_ids]
+    if len(resolved) != 2:
+        raise ValueError(
+            f"{context} requires exactly two class ids for dataset '{dataset_name}', got {resolved}."
+        )
+    if min(resolved) < 0 or max(resolved) >= int(num_classes):
+        raise ValueError(
+            f"{context} pair_ids {resolved} invalid for dataset '{dataset_name}' with {int(num_classes)} classes."
+        )
+    return resolved
+
+
+def validate_rumordiffusion_pair_config(rd_cfg: Dict[str, Any], dataset_name: str, num_classes: int) -> Dict[str, Any]:
+    """Validates and normalizes RumorDiffusion class-pair settings."""
+    normalized = _deep_merge({}, rd_cfg)
+    ctdm_cfg = normalized.get("ctdm", {}) if isinstance(normalized.get("ctdm", {}), dict) else {}
+    reg_cfg = ctdm_cfg.get("regularizers", {}) if isinstance(ctdm_cfg.get("regularizers", {}), dict) else {}
+    if "pair_ids" in reg_cfg:
+        reg_cfg["pair_ids"] = validate_class_pair(
+            pair_ids=reg_cfg["pair_ids"],
+            num_classes=num_classes,
+            context="RumorDiffusion CTDM regularizers",
+            dataset_name=dataset_name,
+        )
+        ctdm_cfg["regularizers"] = reg_cfg
+        normalized["ctdm"] = ctdm_cfg
+    arb_cfg = normalized.get("arbiter", {}) if isinstance(normalized.get("arbiter", {}), dict) else {}
+    if "pair_ids" in arb_cfg:
+        arb_cfg["pair_ids"] = validate_class_pair(
+            pair_ids=arb_cfg["pair_ids"],
+            num_classes=num_classes,
+            context="RumorDiffusion arbiter",
+            dataset_name=dataset_name,
+        )
+        normalized["arbiter"] = arb_cfg
+    return normalized
+
+
 def collect_logits(model: torch.nn.Module, loader: DataLoader, device: str, amp: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """Collect logits and targets from a loader without altering model state."""
     model.eval()
@@ -238,11 +308,31 @@ def collect_logits(model: torch.nn.Module, loader: DataLoader, device: str, amp:
                     out = model(batch)
             else:
                 out = model(batch)
-            logits_list.append(out.detach().cpu())
+            logits_list.append(out.detach().to(torch.float32).cpu())
             target_list.append(batch.y.view(-1).cpu())
     if len(logits_list) == 0:
         return torch.empty(0), torch.empty(0, dtype=torch.long)
     return torch.cat(logits_list, dim=0), torch.cat(target_list, dim=0)
+
+
+def calibration_preserves_non_tied_argmax(
+    original_logits: torch.Tensor,
+    scaled_logits: torch.Tensor,
+    atol: float = 1e-6,
+) -> bool:
+    """Checks whether temperature scaling only changes predictions on tied logits."""
+    original_logits = original_logits.to(torch.float32)
+    scaled_logits = scaled_logits.to(torch.float32)
+    original_pred = torch.argmax(original_logits, dim=1)
+    scaled_pred = torch.argmax(scaled_logits, dim=1)
+    changed_mask = original_pred != scaled_pred
+    if not bool(changed_mask.any()):
+        return True
+    topk_vals = torch.topk(original_logits, k=min(2, int(original_logits.size(1))), dim=1).values
+    if int(topk_vals.size(1)) < 2:
+        return True
+    top_margin = torch.abs(topk_vals[:, 0] - topk_vals[:, 1])
+    return bool(torch.all(top_margin[changed_mask] <= float(atol)).item())
 
 
 def tune_temperature(logits: torch.Tensor, targets: torch.Tensor, init_temp: float = 1.0, max_iter: int = 100, lr: float = 0.01) -> float:
@@ -325,6 +415,121 @@ def parse_seeds(arg_seeds: str, exp_cfg: Dict[str, Any]) -> List[int]:
     return [int(exp_block.get("seed", 42)) if isinstance(exp_block, dict) else 42]
 
 
+def sanitize_cache_token(text: str) -> str:
+    """Returns a filesystem-safe token for derived cache names."""
+    safe = "".join(ch if ch.isalnum() else "_" for ch in str(text).strip())
+    while "__" in safe:
+        safe = safe.replace("__", "_")
+    safe = safe.strip("_")
+    return safe or "default"
+
+
+def resolve_dataset_text_runtime_cfg(exp_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolves runtime text encoder/cache configuration from the experiment config."""
+    dataset_cfg = exp_cfg.get("dataset", {}) if isinstance(exp_cfg.get("dataset", {}), dict) else {}
+    text_encoder_cfg = dataset_cfg.get("text_encoder", {}) if isinstance(dataset_cfg.get("text_encoder", {}), dict) else {}
+    normalization_cfg = dataset_cfg.get("text_normalization", {}) if isinstance(dataset_cfg.get("text_normalization", {}), dict) else {}
+    model_name_or_path = str(text_encoder_cfg.get("model_name_or_path", "")).strip()
+    enabled = len(model_name_or_path) > 0
+    cache_tag = str(text_encoder_cfg.get("cache_tag", "")).strip()
+    if len(cache_tag) == 0 and enabled:
+        cache_tag = sanitize_cache_token(os.path.basename(model_name_or_path) or model_name_or_path)
+    cache_name = str(text_encoder_cfg.get("cache_name", "")).strip()
+    if len(cache_name) == 0:
+        cache_name = "text_embs.pt" if not enabled else f"text_embs_{cache_tag}.pt"
+    return {
+        "enabled": enabled,
+        "model_name_or_path": model_name_or_path,
+        "batch_size": int(text_encoder_cfg.get("batch_size", 64)),
+        "cache_name": cache_name,
+        "force_text_cache": bool(text_encoder_cfg.get("force_text_cache", enabled)),
+        "normalize_embeddings": bool(text_encoder_cfg.get("normalize_embeddings", False)),
+        "rebuild_cache": bool(text_encoder_cfg.get("rebuild_cache", False)),
+        "normalization": normalization_cfg,
+    }
+
+
+def resolve_local_text_model_path(text_runtime_cfg: Dict[str, Any]) -> str:
+    """Resolves a configured local text model path and rejects missing local models."""
+    dataset_cfg = read_yaml_like(os.path.join("Libs", "configs", "dataset.yaml")).get("dataset", {})
+    raw_root = str(dataset_cfg.get("raw_root", os.path.join("Input", "raw")))
+    model_name_or_path = str(text_runtime_cfg.get("model_name_or_path", "")).strip()
+    model_path = resolve_text_model_path(model_name_or_path, raw_root)
+    if len(model_name_or_path) == 0:
+        raise ValueError("text_encoder.model_name_or_path must be set when runtime text encoder is enabled.")
+    if os.path.isabs(model_name_or_path) or os.sep in model_name_or_path:
+        if not os.path.isdir(model_path):
+            raise FileNotFoundError(
+                f"Configured local text model directory does not exist: {model_path}"
+            )
+        return model_path
+    return model_path
+
+
+def ensure_text_embedding_cache(dataset_name: str, text_runtime_cfg: Dict[str, Any]) -> None:
+    """Ensures the configured text embedding cache exists for a dataset."""
+    if not bool(text_runtime_cfg.get("enabled", False)):
+        return
+    dataset_cfg = read_yaml_like(os.path.join("Libs", "configs", "dataset.yaml")).get("dataset", {})
+    raw_root = str(dataset_cfg.get("raw_root", os.path.join("Input", "raw")))
+    processed_root = str(dataset_cfg.get("processed_root", os.path.join("Input", "processed")))
+    cache_name = str(text_runtime_cfg.get("cache_name", "text_embs.pt"))
+    cache_path = os.path.join(processed_root, dataset_name, cache_name)
+    if os.path.isfile(cache_path) and not bool(text_runtime_cfg.get("rebuild_cache", False)):
+        return
+    model_path = resolve_local_text_model_path(text_runtime_cfg)
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    if dataset_name in {"weibo", "pheme"}:
+        mapping = collect_json_source_texts(os.path.join(raw_root, dataset_name))
+        build_text_embedding_cache_from_mapping(
+            dataset=dataset_name,
+            processed_root=processed_root,
+            mapping=mapping,
+            model_path=model_path,
+            batch_size=int(text_runtime_cfg.get("batch_size", 64)),
+            normalization_cfg=text_runtime_cfg.get("normalization", {}),
+            cache_name=cache_name,
+        )
+    else:
+        build_text_embedding_cache(
+            dataset=dataset_name,
+            raw_root=raw_root,
+            processed_root=processed_root,
+            model_name=model_path,
+            batch_size=int(text_runtime_cfg.get("batch_size", 64)),
+            normalization_cfg=text_runtime_cfg.get("normalization", {}),
+            cache_name=cache_name,
+        )
+
+
+def make_graph_dataset(
+    root: str,
+    split: str,
+    use_lp_edges: bool,
+    prefix_cfg: Dict[str, Any],
+    observability_cfg: Dict[str, Any],
+    text_runtime_cfg: Optional[Dict[str, Any]] = None,
+    use_potentials: bool = False,
+    potentials_dir: Optional[str] = None,
+    potentials_pair: Optional[List[int]] = None,
+) -> GraphDataset:
+    """Builds a GraphDataset with consistent runtime text-cache overrides."""
+    text_cfg = text_runtime_cfg if isinstance(text_runtime_cfg, dict) else {}
+    return GraphDataset(
+        root=root,
+        split=split,
+        use_lp_edges=use_lp_edges,
+        use_potentials=use_potentials,
+        potentials_dir=potentials_dir,
+        potentials_pair=potentials_pair,
+        prefix_cfg=prefix_cfg,
+        observability_cfg=observability_cfg,
+        text_cache_name=str(text_cfg.get("cache_name", "text_embs.pt")),
+        force_text_cache=bool(text_cfg.get("force_text_cache", False)),
+        text_normalize=bool(text_cfg.get("normalize_embeddings", False)),
+    )
+
+
 def aggregate_numeric(values: List[float]) -> tuple[float, float]:
     """Returns (mean, std) for numeric list; std=0 if len<2."""
     if len(values) == 0:
@@ -332,6 +537,499 @@ def aggregate_numeric(values: List[float]) -> tuple[float, float]:
     if len(values) == 1:
         return float(values[0]), 0.0
     return float(mean(values)), float(pstdev(values))
+
+
+def scan_max_nodes_across_splits(datasets: Sequence[GraphDataset]) -> int:
+    """Returns the maximum node count observed across multiple dataset splits."""
+    max_nodes_scan = 0
+    for ds in datasets:
+        for split_idx in range(len(ds)):
+            sample = ds.get(split_idx)
+            max_nodes_scan = max(max_nodes_scan, int(sample.num_nodes))
+    if int(max_nodes_scan) <= 0:
+        raise ValueError("Failed to scan a positive max_nodes budget from dataset splits.")
+    return int(max_nodes_scan)
+
+
+def parse_numeric_cell(text: str) -> Optional[float]:
+    """Parses a numeric CSV cell, ignoring aggregate strings like mean±std."""
+    cell = str(text).strip()
+    if cell == "" or "±" in cell:
+        return None
+    try:
+        return float(cell)
+    except ValueError:
+        return None
+
+
+def read_csv_rows(csv_path: str) -> Tuple[List[str], List[Dict[str, str]]]:
+    """Loads CSV headers and rows, returning empty structures if missing."""
+    if not os.path.isfile(csv_path):
+        return [], []
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        headers = reader.fieldnames or []
+        rows = [{key: row.get(key, "") for key in headers} for row in reader]
+    return headers, rows
+
+
+def rewrite_csv_rows(csv_path: str, headers: List[str], rows: List[Dict[str, str]]) -> None:
+    """Rewrites a CSV file with normalized rows."""
+    if len(headers) == 0:
+        return
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def dedupe_csv_rows(rows: List[Dict[str, str]], key_fields: Sequence[str]) -> List[Dict[str, str]]:
+    """Keeps the latest row per composite key while preserving row order."""
+    seen = set()
+    deduped_reversed: List[Dict[str, str]] = []
+    for row in reversed(rows):
+        key = tuple(str(row.get(field, "")) for field in key_fields)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_reversed.append(row)
+    deduped_reversed.reverse()
+    return deduped_reversed
+
+
+def refresh_result_aggregate_row(
+    csv_path: str,
+    dataset_name: str,
+    source_dataset_name: str,
+    transfer_mode: str,
+    model_name: str,
+    model_cfg_path: str,
+    exp_cfg_path: str,
+    seeds: Sequence[int],
+) -> None:
+    """Refreshes the aggregate row for one dataset/model/config slice."""
+    headers, rows = read_csv_rows(csv_path)
+    if len(headers) == 0:
+        return
+    numeric_fields = [
+        "best_val_macro_f1",
+        "test_loss",
+        "test_nll",
+        "test_acc",
+        "test_macro_f1",
+        "test_macro_precision",
+        "test_macro_recall",
+        "test_weighted_f1",
+        "test_weighted_precision",
+        "test_weighted_recall",
+        "ece",
+        "calibration_temp",
+    ]
+    deduped_rows = dedupe_csv_rows(
+        rows,
+        key_fields=["dataset", "source_dataset", "run_kind", "transfer_mode", "model", "model_cfg", "exp_cfg", "seed"],
+    )
+    seed_keys = {str(int(seed)) for seed in seeds}
+    matched_rows = [
+        row for row in deduped_rows
+        if row.get("dataset", "") == dataset_name
+        and row.get("source_dataset", "") == source_dataset_name
+        and row.get("run_kind", "") == ("transfer" if dataset_name != source_dataset_name else "main")
+        and row.get("transfer_mode", "") == transfer_mode
+        and row.get("model", "") == model_name
+        and row.get("model_cfg", "") == model_cfg_path
+        and row.get("exp_cfg", "") == exp_cfg_path
+        and row.get("seed", "") in seed_keys
+    ]
+    if len(matched_rows) == 0:
+        return
+    preserved_rows = [
+        row for row in deduped_rows
+        if not (
+            row.get("dataset", "") == dataset_name
+            and row.get("source_dataset", "") == source_dataset_name
+            and row.get("run_kind", "") == ("transfer" if dataset_name != source_dataset_name else "main")
+            and row.get("transfer_mode", "") == transfer_mode
+            and row.get("model", "") == f"{model_name}_agg"
+            and row.get("model_cfg", "") == model_cfg_path
+            and row.get("exp_cfg", "") == exp_cfg_path
+            and row.get("seed", "") == "agg"
+        )
+    ]
+    agg_row = {key: "" for key in headers}
+    agg_row["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    agg_row["dataset"] = dataset_name
+    if "source_dataset" in headers:
+        agg_row["source_dataset"] = source_dataset_name
+    if "run_kind" in headers:
+        agg_row["run_kind"] = "transfer" if dataset_name != source_dataset_name else "main"
+    if "transfer_mode" in headers:
+        agg_row["transfer_mode"] = transfer_mode
+    agg_row["model"] = f"{model_name}_agg"
+    agg_row["model_cfg"] = model_cfg_path
+    agg_row["exp_cfg"] = exp_cfg_path
+    agg_row["seed"] = "agg"
+    for field in numeric_fields:
+        values = [parse_numeric_cell(row.get(field, "")) for row in matched_rows]
+        values = [value for value in values if value is not None]
+        if len(values) == 0:
+            continue
+        mean_value, std_value = aggregate_numeric(values)
+        agg_row[field] = f"{mean_value:.6f}±{std_value:.6f}"
+    preserved_rows.append(agg_row)
+    rewrite_csv_rows(csv_path, headers, preserved_rows)
+
+
+def refresh_transfer_aggregate_row(
+    csv_path: str,
+    train_dataset: str,
+    test_dataset: str,
+    transfer_mode: str,
+    model_name: str,
+    seeds: Sequence[int],
+) -> None:
+    """Refreshes the aggregate row for one transfer slice."""
+    headers, rows = read_csv_rows(csv_path)
+    if len(headers) == 0:
+        return
+    numeric_fields = ["acc", "macro_f1", "nll", "ece", "calibration_temp"]
+    deduped_rows = dedupe_csv_rows(
+        rows,
+        key_fields=["train_dataset", "test_dataset", "transfer_mode", "model", "seed"],
+    )
+    seed_keys = {str(int(seed)) for seed in seeds}
+    matched_rows = [
+        row for row in deduped_rows
+        if row.get("train_dataset", "") == train_dataset
+        and row.get("test_dataset", "") == test_dataset
+        and row.get("transfer_mode", "") == transfer_mode
+        and row.get("model", "") == model_name
+        and row.get("seed", "") in seed_keys
+    ]
+    if len(matched_rows) == 0:
+        return
+    preserved_rows = [
+        row for row in deduped_rows
+        if not (
+            row.get("train_dataset", "") == train_dataset
+            and row.get("test_dataset", "") == test_dataset
+            and row.get("transfer_mode", "") == transfer_mode
+            and row.get("model", "") == f"{model_name}_agg"
+            and row.get("seed", "") == "agg"
+        )
+    ]
+    agg_row = {key: "" for key in headers}
+    agg_row["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    agg_row["train_dataset"] = train_dataset
+    agg_row["test_dataset"] = test_dataset
+    if "transfer_mode" in headers:
+        agg_row["transfer_mode"] = transfer_mode
+    agg_row["model"] = f"{model_name}_agg"
+    agg_row["seed"] = "agg"
+    for field in numeric_fields:
+        values = [parse_numeric_cell(row.get(field, "")) for row in matched_rows]
+        values = [value for value in values if value is not None]
+        if len(values) == 0:
+            continue
+        mean_value, std_value = aggregate_numeric(values)
+        agg_row[field] = f"{mean_value:.6f}±{std_value:.6f}"
+    preserved_rows.append(agg_row)
+    rewrite_csv_rows(csv_path, headers, preserved_rows)
+
+
+def freeze_ctdm_for_target_adaptation(model: RumorDiffusion, unfreeze_last_layers: int) -> None:
+    """Freezes the CTDM backbone except for the highest layers and heads."""
+    if model.ctdm is None:
+        return
+    for param in model.ctdm.parameters():
+        param.requires_grad = False
+    for attr_name in ("film", "readout", "full_to_latent", "eps_x", "eps_a", "time_embed", "class_embed"):
+        module = getattr(model.ctdm, attr_name, None)
+        if isinstance(module, nn.Module):
+            for param in module.parameters():
+                param.requires_grad = True
+    for attr_name in ("text_proj", "text_fusion_layer", "gated_text_fusion", "multiscale_proj", "forecast_head"):
+        module = getattr(model.ctdm, attr_name, None)
+        if isinstance(module, nn.Module):
+            for param in module.parameters():
+                param.requires_grad = True
+    backbone = getattr(model.ctdm, "backbone", None)
+    if isinstance(backbone, nn.Module) and hasattr(backbone, "layers"):
+        layers = list(getattr(backbone, "layers"))
+        depth = max(1, int(unfreeze_last_layers))
+        for layer in layers[-depth:]:
+            if isinstance(layer, nn.Module):
+                for param in layer.parameters():
+                    param.requires_grad = True
+
+
+def build_adaptation_optimizer(model: RumorDiffusion, adaptation_cfg: Dict[str, Any]) -> torch.optim.Optimizer:
+    """Builds a target-adaptation optimizer with distinct LR groups."""
+    arbiter_lr = float(adaptation_cfg.get("arbiter_lr", adaptation_cfg.get("lr", 1e-4)))
+    ctdm_lr = float(adaptation_cfg.get("ctdm_lr", arbiter_lr * 0.3))
+    weight_decay = float(adaptation_cfg.get("weight_decay", 1e-4))
+    arbiter_params: List[nn.Parameter] = []
+    ctdm_params: List[nn.Parameter] = []
+    other_params: List[nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("ctdm."):
+            ctdm_params.append(param)
+        elif "arbiter" in name or "tf_head" in name or "class_embedding" in name or "class_embed" in name:
+            arbiter_params.append(param)
+        else:
+            other_params.append(param)
+    param_groups = []
+    if arbiter_params:
+        param_groups.append({"params": arbiter_params, "lr": arbiter_lr})
+    if ctdm_params:
+        param_groups.append({"params": ctdm_params, "lr": ctdm_lr})
+    if other_params:
+        param_groups.append({"params": other_params, "lr": arbiter_lr})
+    if len(param_groups) == 0:
+        raise ValueError("No trainable parameters available for target adaptation.")
+    return torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+
+
+def set_model_mode_for_adaptation(model: RumorDiffusion, adaptation_cfg: Dict[str, Any]) -> None:
+    """Sets trainable modules to training mode while keeping frozen CTDM parts stable."""
+    model.train()
+    if model.ctdm is not None:
+        model.ctdm.eval()
+        backbone = getattr(model.ctdm, "backbone", None)
+        if isinstance(backbone, nn.Module) and hasattr(backbone, "layers"):
+            layers = list(getattr(backbone, "layers"))
+            depth = max(1, int(adaptation_cfg.get("ctdm_unfreeze_last_layers", 1)))
+            for layer in layers[-depth:]:
+                if isinstance(layer, nn.Module):
+                    layer.train()
+        for attr_name in ("film", "readout", "full_to_latent", "eps_x", "eps_a", "time_embed", "class_embed"):
+            module = getattr(model.ctdm, attr_name, None)
+            if isinstance(module, nn.Module):
+                module.train()
+        for attr_name in ("text_proj", "text_fusion_layer", "gated_text_fusion", "multiscale_proj", "forecast_head"):
+            module = getattr(model.ctdm, attr_name, None)
+            if isinstance(module, nn.Module):
+                module.train()
+
+
+def update_ema_teacher(student: RumorDiffusion, teacher: RumorDiffusion, momentum: float) -> None:
+    """Updates EMA teacher weights from the student model."""
+    with torch.no_grad():
+        for teacher_param, student_param in zip(teacher.parameters(), student.parameters()):
+            teacher_param.data.mul_(float(momentum)).add_(student_param.data, alpha=1.0 - float(momentum))
+        for teacher_buffer, student_buffer in zip(teacher.buffers(), student.buffers()):
+            teacher_buffer.data.copy_(student_buffer.data)
+
+
+def symmetric_kl_from_logits(logits_a: torch.Tensor, logits_b: torch.Tensor) -> torch.Tensor:
+    """Computes symmetric KL divergence between two logits tensors."""
+    probs_a = torch.softmax(logits_a, dim=1)
+    probs_b = torch.softmax(logits_b, dim=1)
+    return 0.5 * (
+        F.kl_div(torch.log(probs_a.clamp_min(1e-8)), probs_b, reduction="batchmean")
+        + F.kl_div(torch.log(probs_b.clamp_min(1e-8)), probs_a, reduction="batchmean")
+    )
+
+
+def apply_transfer_logit_adjustment(logits: torch.Tensor, class_priors: torch.Tensor, strength: float) -> torch.Tensor:
+    """Applies logit adjustment using class priors."""
+    if float(strength) <= 0.0:
+        return logits
+    priors = class_priors.to(device=logits.device, dtype=logits.dtype).clamp_min(1e-8)
+    return logits - float(strength) * torch.log(priors).unsqueeze(0)
+
+
+def compute_target_prototype_alignment_loss(
+    model: RumorDiffusion,
+    pseudo_labels: torch.Tensor,
+    confidence_mask: torch.Tensor,
+    min_samples_per_class: int,
+) -> torch.Tensor:
+    """Aligns target pseudo-label prototypes with source prototypes."""
+    if model.ctdm is None or not hasattr(model, "_last_potentials"):
+        return torch.zeros((), device=pseudo_labels.device)
+    source_prototypes = getattr(model.ctdm, "prototypes", None)
+    if source_prototypes is None:
+        return torch.zeros((), device=pseudo_labels.device)
+    potentials = getattr(model, "_last_potentials")
+    if not isinstance(potentials, torch.Tensor) or potentials.dim() != 3:
+        return torch.zeros((), device=pseudo_labels.device)
+    confident_idx = torch.where(confidence_mask)[0]
+    if confident_idx.numel() == 0:
+        return torch.zeros((), device=pseudo_labels.device)
+    confident_potentials = potentials[confident_idx]
+    confident_labels = pseudo_labels[confident_idx]
+    losses: List[torch.Tensor] = []
+    for class_idx in range(int(model.num_classes)):
+        class_mask = confident_labels == int(class_idx)
+        if int(class_mask.sum().item()) < int(min_samples_per_class):
+            continue
+        target_proto = confident_potentials[class_mask, int(class_idx), :].mean(dim=0)
+        source_proto = source_prototypes[int(class_idx)].to(target_proto.device, dtype=target_proto.dtype)
+        losses.append(1.0 - F.cosine_similarity(target_proto.unsqueeze(0), source_proto.unsqueeze(0)).mean())
+    if len(losses) == 0:
+        return torch.zeros((), device=pseudo_labels.device)
+    return torch.stack(losses).mean()
+
+
+def adapt_rumordiffusion_to_target(
+    model: RumorDiffusion,
+    trainer: Trainer,
+    source_checkpoint_path: str,
+    target_train_loader: DataLoader,
+    target_val_loader: DataLoader,
+    adaptation_cfg: Dict[str, Any],
+    class_names: Dict[int, str],
+    device: str,
+    save_path: str,
+) -> Dict[str, Any]:
+    """Performs unsupervised target adaptation with pseudo-labeling and consistency."""
+    if model.ctdm is None:
+        raise ValueError("RumorDiffusion target adaptation requires a CTDM module.")
+    freeze_ctdm_for_target_adaptation(model, int(adaptation_cfg.get("ctdm_unfreeze_last_layers", 1)))
+    optimizer = build_adaptation_optimizer(model, adaptation_cfg)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, int(adaptation_cfg.get("epochs", 5))),
+    )
+    teacher = copy.deepcopy(model).to(device)
+    teacher.eval()
+    ema_decay = float(adaptation_cfg.get("ema_decay", 0.995))
+    pseudo_weight = float(adaptation_cfg.get("pseudo_label_weight", 1.0))
+    consistency_weight = float(adaptation_cfg.get("consistency_weight", 0.1))
+    prototype_weight = float(adaptation_cfg.get("prototype_align_weight", 0.1))
+    confidence_threshold = float(adaptation_cfg.get("confidence_threshold", 0.8))
+    min_samples_per_class = int(adaptation_cfg.get("min_samples_per_class", 2))
+    grad_clip = float(adaptation_cfg.get("grad_clip", trainer.cfg.grad_clip))
+    logit_adjust_strength = float(adaptation_cfg.get("logit_adjustment_strength", 0.0))
+    adapt_text_dropout = float(adaptation_cfg.get("consistency_text_dropout", 0.1))
+    adapt_text_noise = float(adaptation_cfg.get("consistency_text_noise_std", 0.0))
+    adapt_edge_drop = float(adaptation_cfg.get("consistency_edge_drop_rate", 0.1))
+    obs_min = int(adaptation_cfg.get("consistency_obs_min", getattr(model.ctdm, "cutoff_min", 10)))
+    obs_max = int(adaptation_cfg.get("consistency_obs_max", getattr(model.ctdm, "cutoff_max", getattr(model.ctdm, "obs_minutes", 30))))
+    use_class_reweight = bool(adaptation_cfg.get("use_class_reweighting", False))
+    source_priors = model.class_priors.detach().clone() if hasattr(model, "class_priors") else torch.ones(model.num_classes, device=device) / float(model.num_classes)
+    class_weight_tensor = None
+    if use_class_reweight:
+        class_weight_tensor = (1.0 / source_priors.clamp_min(1e-6))
+        class_weight_tensor = class_weight_tensor / class_weight_tensor.mean()
+        class_weight_tensor = class_weight_tensor.to(device=device, dtype=torch.float32)
+
+    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    best_val_metric = -1.0
+    best_pseudo_coverage = 0.0
+    best_epoch = 0
+    for epoch in range(int(adaptation_cfg.get("epochs", 5))):
+        set_model_mode_for_adaptation(model, adaptation_cfg)
+        epoch_batches = 0
+        epoch_confident = 0
+        epoch_seen = 0
+        epoch_loss = 0.0
+        for batch in target_train_loader:
+            batch = batch.to(device)
+            batch_size = int(batch.y.view(-1).size(0))
+            epoch_seen += batch_size
+            optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                teacher_logits = teacher(batch)
+                teacher_probs = torch.softmax(teacher_logits, dim=1)
+                teacher_confidence, pseudo_labels = torch.max(teacher_probs, dim=1)
+                confident_mask = teacher_confidence >= float(confidence_threshold)
+            model.train()
+            set_model_mode_for_adaptation(model, adaptation_cfg)
+            clean_logits = model(batch)
+            adjusted_logits = apply_transfer_logit_adjustment(clean_logits, source_priors, logit_adjust_strength)
+            if confident_mask.any():
+                loss_pseudo = F.cross_entropy(
+                    adjusted_logits[confident_mask],
+                    pseudo_labels[confident_mask],
+                    weight=class_weight_tensor,
+                )
+                epoch_confident += int(confident_mask.sum().item())
+            else:
+                loss_pseudo = clean_logits.new_zeros(())
+
+            text_noise_backup = float(getattr(model.ctdm, "text_noise_std", 0.0))
+            text_drop_backup = float(getattr(model.ctdm, "text_dropout_p", 0.0))
+            edge_drop_backup = float(getattr(model.ctdm, "edge_drop_rate", 0.0))
+            obs_backup = int(getattr(model.ctdm, "obs_minutes", obs_max))
+            model.ctdm.text_noise_std = float(adapt_text_noise)
+            model.ctdm.text_dropout_p = float(adapt_text_dropout)
+            model.ctdm.edge_drop_rate = float(adapt_edge_drop)
+            model.ctdm.obs_minutes = int(torch.randint(low=min(obs_min, obs_max), high=max(obs_min, obs_max) + 1, size=(1,)).item())
+            noisy_logits = model(batch)
+            model.ctdm.text_noise_std = text_noise_backup
+            model.ctdm.text_dropout_p = text_drop_backup
+            model.ctdm.edge_drop_rate = edge_drop_backup
+            model.ctdm.obs_minutes = obs_backup
+
+            loss_consistency = symmetric_kl_from_logits(clean_logits, noisy_logits)
+            loss_proto = compute_target_prototype_alignment_loss(
+                model=model,
+                pseudo_labels=pseudo_labels,
+                confidence_mask=confident_mask,
+                min_samples_per_class=min_samples_per_class,
+            )
+            total_loss = (
+                pseudo_weight * loss_pseudo
+                + consistency_weight * loss_consistency
+                + prototype_weight * loss_proto
+            )
+            total_loss.backward()
+            if grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            update_ema_teacher(model, teacher, ema_decay)
+            epoch_loss += float(total_loss.detach().item())
+            epoch_batches += 1
+        scheduler.step()
+        model.eval()
+        val_metrics = trainer.evaluate(target_val_loader, detailed=True, class_names=class_names)
+        current_metric = float(val_metrics.get("macro_f1", 0.0))
+        pseudo_coverage = float(epoch_confident / max(1, epoch_seen))
+        logging.info(
+            f"[TargetAdapt] epoch={epoch + 1}, loss={epoch_loss / max(1, epoch_batches):.4f}, "
+            f"pseudo_coverage={pseudo_coverage:.4f}, val_macro_f1={current_metric:.4f}"
+        )
+        if current_metric > best_val_metric:
+            best_val_metric = current_metric
+            best_pseudo_coverage = pseudo_coverage
+            best_epoch = epoch + 1
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            checkpoint_obj = build_checkpoint_payload(
+                best_state,
+                metadata={
+                    "format_version": 1,
+                    "model_name": "rumordiffusion",
+                    "stage": "target_adapt",
+                    "source_checkpoint_path": source_checkpoint_path,
+                    "adapt_epoch": int(best_epoch),
+                },
+            )
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            torch.save(checkpoint_obj, save_path)
+    model.load_state_dict(best_state)
+    return {
+        "best_val_macro_f1": float(best_val_metric),
+        "best_val_metric": float(best_val_metric),
+        "adapt_epochs": int(best_epoch),
+        "pseudo_label_coverage": float(best_pseudo_coverage),
+        "adapt_ckpt_path": save_path,
+    }
+
+
+def derive_ctdm_checkpoint_from_arbiter_checkpoint(arbiter_ckpt_path: str) -> Optional[str]:
+    """Derives a sibling CTDM checkpoint path from a RumorDiffusion arbiter checkpoint."""
+    normalized = os.path.normpath(str(arbiter_ckpt_path))
+    parts = normalized.split(os.sep)
+    if "rumordiffusion" not in parts:
+        return None
+    idx = parts.index("rumordiffusion")
+    parts[idx] = "rumordiffusion_ctdm"
+    return os.sep.join(parts)
 
 
 def percentile(sorted_values: Sequence[float], q: float) -> float:
@@ -424,7 +1122,7 @@ def collect_eval_outputs(
 
             assert logits is not None
             loss = criterion(logits, batch.y.view(-1))
-            logits_list.append(logits.detach().cpu())
+            logits_list.append(logits.detach().to(torch.float32).cpu())
             target_list.append(batch.y.view(-1).cpu())
             bsz = int(batch.y.view(-1).size(0))
             total_loss += float(loss.item()) * float(bsz)
@@ -468,6 +1166,8 @@ def collect_eval_outputs(
 def export_prediction_rows(
     csv_path: str,
     dataset_name: str,
+    source_dataset_name: str,
+    run_kind: str,
     model_name: str,
     seed: int,
     tag: str,
@@ -478,6 +1178,8 @@ def export_prediction_rows(
     """Exports per-sample predictions for later significance testing and case analysis."""
     headers = [
         "dataset",
+        "source_dataset",
+        "run_kind",
         "model",
         "seed",
         "tag",
@@ -498,6 +1200,8 @@ def export_prediction_rows(
         rows.append(
             {
                 "dataset": dataset_name,
+                "source_dataset": source_dataset_name,
+                "run_kind": run_kind,
                 "model": model_name,
                 "seed": str(seed),
                 "tag": tag,
@@ -514,6 +1218,8 @@ def export_prediction_rows(
 def load_prediction_rows(
     csv_path: str,
     dataset_name: str,
+    source_dataset_name: str,
+    run_kind: str,
     model_name: str,
     seed: int,
     tag: str,
@@ -526,6 +1232,10 @@ def load_prediction_rows(
         reader = csv.DictReader(f)
         for row in reader:
             if row.get("dataset", "") != dataset_name:
+                continue
+            if row.get("source_dataset", "") != source_dataset_name:
+                continue
+            if row.get("run_kind", "") != run_kind:
                 continue
             if row.get("model", "") != model_name:
                 continue
@@ -601,6 +1311,8 @@ def bootstrap_compare_predictions(
 def build_revision_row(
     timestamp: str,
     dataset_name: str,
+    source_dataset_name: str,
+    run_kind: str,
     model_name: str,
     seed: int,
     artifact_type: str,
@@ -611,6 +1323,8 @@ def build_revision_row(
     row = {
         "timestamp": timestamp,
         "dataset": dataset_name,
+        "source_dataset": source_dataset_name,
+        "run_kind": run_kind,
         "model": model_name,
         "seed": str(seed),
         "artifact_type": artifact_type,
@@ -670,7 +1384,30 @@ def run_multi_seed_jobs(args: argparse.Namespace, seeds: Sequence[int]) -> None:
             cmd.extend(["--source_dataset_override", args.source_dataset_override])
         if args.lp_edges_policy:
             cmd.extend(["--lp_edges_policy", args.lp_edges_policy])
+        if getattr(args, "transfer_adapt", False):
+            cmd.append("--transfer_adapt")
         subprocess.run(cmd, check=True)
+    exp_cfg = read_yaml_like(args.exp)
+    outputs_cfg = exp_cfg.get("outputs", {})
+    results_dir = outputs_cfg.get("results_dir", os.path.join("Output", "results"))
+    dataset_cfg = exp_cfg.get("dataset", {})
+    config_dataset_name = str(dataset_cfg.get("name", ""))
+    dataset_name = str(args.dataset_override or config_dataset_name)
+    source_dataset_name = str(args.source_dataset_override or dataset_name)
+    model_paths = [p.strip() for p in args.model.split(",") if p.strip()]
+    csv_path = os.path.join(results_dir, f"{dataset_name}.csv")
+    for model_path in model_paths:
+        model_cfg = read_yaml_like(model_path)
+        refresh_result_aggregate_row(
+            csv_path=csv_path,
+            dataset_name=dataset_name,
+            source_dataset_name=source_dataset_name,
+            transfer_mode=("source_only" if dataset_name != source_dataset_name else "main"),
+            model_name=str(model_cfg["name"]).lower(),
+            model_cfg_path=model_path,
+            exp_cfg_path=args.exp,
+            seeds=seeds,
+        )
 
 
 def run_transfer_eval(exp_cfg: Dict[str, Any], args: argparse.Namespace) -> None:
@@ -681,6 +1418,9 @@ def run_transfer_eval(exp_cfg: Dict[str, Any], args: argparse.Namespace) -> None
 
     outputs_cfg = exp_cfg.get("outputs", {})
     base_ckpt_dir = outputs_cfg.get("ckpt_dir", os.path.join("Output", "ckpts"))
+    results_dir = outputs_cfg.get("results_dir", os.path.join("Output", "results"))
+    transfer_csv_default = os.path.join(results_dir, "transfer.csv")
+    transfer_csv = exp_cfg.get("transfer", {}).get("results_path", transfer_csv_default)
     ckpt_name = str(transfer_cfg.get("ckpt_name", "best.pt"))
     lp_policy = str(transfer_cfg.get("lp_edges_policy", args.lp_edges_policy))
     seeds = parse_seeds(args.seeds, exp_cfg)
@@ -725,6 +1465,109 @@ def run_transfer_eval(exp_cfg: Dict[str, Any], args: argparse.Namespace) -> None
                 ]
                 print(f"[transfer] {source}->{target} model={model_name} seed={seed} ckpt={ckpt_path}")
                 subprocess.run(cmd, check=True)
+            refresh_transfer_aggregate_row(
+                csv_path=transfer_csv,
+                train_dataset=source,
+                test_dataset=target,
+                transfer_mode="source_only",
+                model_name=model_name,
+                seeds=seeds,
+            )
+            refresh_result_aggregate_row(
+                csv_path=os.path.join(results_dir, f"{target}.csv"),
+                dataset_name=target,
+                source_dataset_name=source,
+                transfer_mode="source_only",
+                model_name=model_name,
+                model_cfg_path=model_path,
+                exp_cfg_path=args.exp,
+                seeds=seeds,
+            )
+
+
+def run_transfer_adaptation(exp_cfg: Dict[str, Any], args: argparse.Namespace) -> None:
+    """Orchestrates target adaptation runs across configured transfer pairs."""
+    transfer_cfg = exp_cfg.get("transfer", {})
+    if not isinstance(transfer_cfg, dict) or len(transfer_cfg.get("pairs", [])) == 0:
+        raise ValueError("Transfer config is missing pairs.")
+    outputs_cfg = exp_cfg.get("outputs", {})
+    base_ckpt_dir = outputs_cfg.get("ckpt_dir", os.path.join("Output", "ckpts"))
+    results_dir = outputs_cfg.get("results_dir", os.path.join("Output", "results"))
+    transfer_csv_default = os.path.join(results_dir, "transfer.csv")
+    transfer_csv = exp_cfg.get("transfer", {}).get("results_path", transfer_csv_default)
+    ckpt_name = str(transfer_cfg.get("ckpt_name", "best.pt"))
+    lp_policy = str(transfer_cfg.get("lp_edges_policy", args.lp_edges_policy))
+    seeds = parse_seeds(args.seeds, exp_cfg)
+    transfer_models = transfer_cfg.get("models")
+    if not transfer_models:
+        transfer_models = [p.strip() for p in args.model.split(",") if p.strip()]
+    model_cfgs = [read_yaml_like(p) for p in transfer_models]
+    for pair in transfer_cfg.get("pairs", []):
+        source = str(pair["source"])
+        target = str(pair["target"])
+        for model_path, model_cfg in zip(transfer_models, model_cfgs):
+            model_name = str(model_cfg["name"]).lower()
+            for seed in seeds:
+                ckpt_path = os.path.join(
+                    base_ckpt_dir,
+                    source,
+                    model_name,
+                    f"seed{seed}",
+                    ckpt_name,
+                )
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "Libs.exp.run",
+                    "--exp",
+                    args.exp,
+                    "--model",
+                    model_path,
+                    "--seeds",
+                    str(seed),
+                    "--transfer_adapt",
+                    "--ckpt",
+                    ckpt_path,
+                    "--dataset_override",
+                    target,
+                    "--source_dataset_override",
+                    source,
+                    "--lp_edges_policy",
+                    lp_policy,
+                ]
+                print(f"[transfer_adapt] {source}->{target} model={model_name} seed={seed} ckpt={ckpt_path}")
+                subprocess.run(cmd, check=True)
+                transfer_adapt_cfg = transfer_cfg.get("adaptation", {}) if isinstance(transfer_cfg.get("adaptation", {}), dict) else {}
+                adapt_ckpt_name = str(transfer_adapt_cfg.get("adapt_ckpt_name", "best_target_adapt.pt"))
+                adapt_ckpt_path = os.path.join(
+                    base_ckpt_dir,
+                    source,
+                    model_name,
+                    f"seed{seed}",
+                    adapt_ckpt_name,
+                )
+                if not os.path.isfile(adapt_ckpt_path):
+                    raise RuntimeError(
+                        f"Target adaptation child run did not create checkpoint: {adapt_ckpt_path}"
+                    )
+            refresh_transfer_aggregate_row(
+                csv_path=transfer_csv,
+                train_dataset=source,
+                test_dataset=target,
+                transfer_mode="target_adapt",
+                model_name=model_name,
+                seeds=seeds,
+            )
+            refresh_result_aggregate_row(
+                csv_path=os.path.join(results_dir, f"{target}.csv"),
+                dataset_name=target,
+                source_dataset_name=source,
+                transfer_mode="target_adapt",
+                model_name=model_name,
+                model_cfg_path=model_path,
+                exp_cfg_path=args.exp,
+                seeds=seeds,
+            )
 
 
 def build_model(name: str, cfg: Dict[str, Any], num_features: int, num_classes: int):
@@ -923,6 +1766,8 @@ def main() -> None:
                         help="Override dataset.name for transfer source dataset")
     parser.add_argument("--transfer_eval", action="store_true",
                         help="Run transfer evaluation across dataset pairs defined in exp transfer config")
+    parser.add_argument("--transfer_adapt", action="store_true",
+                        help="Run target adaptation transfer evaluation across dataset pairs or for a single child run")
     parser.add_argument("--lp_edges_policy", type=str, default="auto",
                         choices=["auto", "require_existing"],
                         help="LP edges handling: auto-generate when missing, or require existing edges")
@@ -937,16 +1782,24 @@ def main() -> None:
     if args.transfer_eval:
         run_transfer_eval(exp_cfg, args)
         return
+    if args.transfer_adapt and not args.ckpt:
+        run_transfer_adaptation(exp_cfg, args)
+        return
     if len(seeds) > 1:
         run_multi_seed_jobs(args, seeds)
         return
 
     dataset_cfg = exp_cfg["dataset"]
-    if args.source_dataset_override:
-        dataset_cfg = {**dataset_cfg, "name": args.source_dataset_override}
-    source_dataset_name = dataset_cfg["name"]
-    dataset_name = args.dataset_override if args.dataset_override else source_dataset_name
+    config_dataset_name = str(dataset_cfg["name"])
+    dataset_name = str(args.dataset_override if args.dataset_override else config_dataset_name)
+    source_dataset_name = str(args.source_dataset_override if args.source_dataset_override else dataset_name)
     dataset_root = os.path.join(dataset_cfg["root"], dataset_name)
+    source_dataset_root = os.path.join(dataset_cfg["root"], source_dataset_name)
+    transfer_run = bool(dataset_name != source_dataset_name)
+    text_runtime_cfg = resolve_dataset_text_runtime_cfg(exp_cfg)
+    ensure_text_embedding_cache(dataset_name, text_runtime_cfg)
+    if source_dataset_name != dataset_name:
+        ensure_text_embedding_cache(source_dataset_name, text_runtime_cfg)
     use_lp_edges = bool(dataset_cfg.get("use_lp_edges", False))
     lp_edges_policy = str(args.lp_edges_policy)
     prefix_cfg = dataset_cfg.get("prefix", {})
@@ -969,6 +1822,8 @@ def main() -> None:
     revision_headers = [
         "timestamp",
         "dataset",
+        "source_dataset",
+        "run_kind",
         "model",
         "seed",
         "artifact_type",
@@ -1014,26 +1869,29 @@ def main() -> None:
     else:
         logging.info(f"Using device: {device}")
 
-    ds_train = GraphDataset(
+    ds_train = make_graph_dataset(
         root=dataset_root,
         split="train",
         use_lp_edges=use_lp_edges,
         prefix_cfg=prefix_cfg,
         observability_cfg=observability_cfg,
+        text_runtime_cfg=text_runtime_cfg,
     )
-    ds_val = GraphDataset(
+    ds_val = make_graph_dataset(
         root=dataset_root,
         split="val",
         use_lp_edges=use_lp_edges,
         prefix_cfg=prefix_cfg,
         observability_cfg=observability_cfg,
+        text_runtime_cfg=text_runtime_cfg,
     )
-    ds_test = GraphDataset(
+    ds_test = make_graph_dataset(
         root=dataset_root,
         split="test",
         use_lp_edges=use_lp_edges,
         prefix_cfg=prefix_cfg,
         observability_cfg=observability_cfg,
+        text_runtime_cfg=text_runtime_cfg,
     )
 
     num_features = ds_train.num_features
@@ -1075,26 +1933,29 @@ def main() -> None:
         for seed in seeds:
             set_global_seed(int(seed))
 
-        ds_train = GraphDataset(
+        ds_train = make_graph_dataset(
             root=dataset_root,
             split="train",
             use_lp_edges=use_lp,
             prefix_cfg=prefix_cfg,
             observability_cfg=observability_cfg,
+            text_runtime_cfg=text_runtime_cfg,
         )
-        ds_val = GraphDataset(
+        ds_val = make_graph_dataset(
             root=dataset_root,
             split="val",
             use_lp_edges=use_lp,
             prefix_cfg=prefix_cfg,
             observability_cfg=observability_cfg,
+            text_runtime_cfg=text_runtime_cfg,
         )
-        ds_test = GraphDataset(
+        ds_test = make_graph_dataset(
             root=dataset_root,
             split="test",
             use_lp_edges=use_lp,
             prefix_cfg=prefix_cfg,
             observability_cfg=observability_cfg,
+            text_runtime_cfg=text_runtime_cfg,
         )
 
         num_features = ds_train.num_features
@@ -1103,7 +1964,7 @@ def main() -> None:
         log_path = setup_logging(
             log_dir=base_log_dir, dataset=dataset_name, model_name=name, seed=int(seed))
         logging.info(
-            f"Dataset: {dataset_name}; Model: {name}; LP: {use_lp}; Seed: {seed}")
+            f"Dataset: {dataset_name}; Source dataset: {source_dataset_name}; Model: {name}; LP: {use_lp}; Seed: {seed}")
 
         lp_require_existing = (lp_edges_policy == "require_existing" and name == "lp_gcn")
         # Optional pre-step: if LP is required but lp_edges are missing, train LP and generate edges
@@ -1181,36 +2042,36 @@ def main() -> None:
                         lp_trainer.model, ds_split, topk_per_node=lp_cfg.topk_per_node, out_dir=lp_dir, device=torch.device(device), num_workers=lp_cfg.num_workers)
 
                 # Reload datasets with new LP edges
-                ds_train = GraphDataset(
+                ds_train = make_graph_dataset(
                     root=dataset_root,
                     split="train",
                     use_lp_edges=use_lp,
                     prefix_cfg=prefix_cfg,
                     observability_cfg=observability_cfg,
+                    text_runtime_cfg=text_runtime_cfg,
                 )
-                ds_val = GraphDataset(
+                ds_val = make_graph_dataset(
                     root=dataset_root,
                     split="val",
                     use_lp_edges=use_lp,
                     prefix_cfg=prefix_cfg,
                     observability_cfg=observability_cfg,
+                    text_runtime_cfg=text_runtime_cfg,
                 )
-                ds_test = GraphDataset(
+                ds_test = make_graph_dataset(
                     root=dataset_root,
                     split="test",
                     use_lp_edges=use_lp,
                     prefix_cfg=prefix_cfg,
                     observability_cfg=observability_cfg,
+                    text_runtime_cfg=text_runtime_cfg,
                 )
                 num_features = ds_train.num_features
                 num_classes = ds_train.num_classes
 
         # If CTDM-syn, scan max nodes from train split and cap at configured max_nodes, then inject into model config
         if name == "ctdm_syn":
-            max_nodes_scan = 0
-            for raw_idx in ds_train.indices():
-                sample = ds_train.get(raw_idx)
-                max_nodes_scan = max(max_nodes_scan, int(sample.num_nodes))
+            max_nodes_scan = scan_max_nodes_across_splits([ds_train, ds_val, ds_test])
             max_nodes_config = int(model_cfg["model"].get("max_nodes", 0) or 0)
             max_nodes_final = resolve_max_nodes_setting(
                 scanned_max_nodes=max_nodes_scan,
@@ -1228,6 +2089,7 @@ def main() -> None:
         model_use_potentials = False
         model_potentials_dir: Optional[str] = None
         model_potentials_pair: List[int] = []
+        rd_ignored_metadata_keys: Optional[List[str]] = None
         if name == "rumordiffusion":
             # Stage 1: train CTDM if needed; then generate potentials
             logging.info("Running RumorDiffusion two-stage training...")
@@ -1236,11 +2098,17 @@ def main() -> None:
             rd_cfg_exp = exp_cfg.get("rumordiffusion", {})
             rd_cfg_model = model_cfg.get("model", {})
             rd_cfg = _deep_merge(rd_cfg_model, rd_cfg_exp)
+            rd_cfg = apply_dataset_overrides(rd_cfg, dataset_name)
+            rd_cfg = validate_rumordiffusion_pair_config(rd_cfg, dataset_name, int(num_classes))
             ctdm_cfg = rd_cfg.get("ctdm", {})
             checkpoint_cfg = rd_cfg.get("checkpoint", {}) if isinstance(rd_cfg.get("checkpoint", {}), dict) else {}
             validate_ckpt_metadata = bool(checkpoint_cfg.get("validate_metadata", False))
             require_config_hash = bool(checkpoint_cfg.get("require_config_hash", True))
             allow_legacy_ckpt = bool(checkpoint_cfg.get("allow_legacy", True))
+            rd_ignored_metadata_keys = rumordiffusion_metadata_ignored_keys(
+                require_config_hash=require_config_hash,
+                transfer_run=transfer_run,
+            )
             ctdm_ckpt_root = str(checkpoint_cfg.get("ctdm_dir", base_ckpt_dir))
             use_potentials = bool(rd_cfg.get("use_potentials", False))
             potentials_pair = [int(v) for v in rd_cfg.get("potentials_pair", [0, 1])]
@@ -1249,10 +2117,7 @@ def main() -> None:
             model_use_potentials = use_potentials
             model_potentials_dir = potentials_dir
             model_potentials_pair = list(potentials_pair)
-            max_nodes_scan = 0
-            for split_idx in range(len(ds_train)):
-                sample = ds_train.get(split_idx)
-                max_nodes_scan = max(max_nodes_scan, int(sample.num_nodes))
+            max_nodes_scan = scan_max_nodes_across_splits([ds_train, ds_val, ds_test])
             max_nodes_config = int(ctdm_cfg.get("max_nodes", 0) or 0)
             max_nodes_final = resolve_max_nodes_setting(
                 scanned_max_nodes=max_nodes_scan,
@@ -1460,12 +2325,17 @@ def main() -> None:
             )
             os.makedirs(ctdm_pretrain_dir, exist_ok=True)
             ctdm_pretrain_path = os.path.join(ctdm_pretrain_dir, ckpt_filename)
+            skip_ctdm_pretraining = bool(args.transfer_adapt)
+            if skip_ctdm_pretraining and (not os.path.isfile(ctdm_pretrain_path)) and args.ckpt:
+                derived_ctdm_path = derive_ctdm_checkpoint_from_arbiter_checkpoint(args.ckpt)
+                if derived_ctdm_path is not None and os.path.isfile(derived_ctdm_path):
+                    ctdm_pretrain_path = derived_ctdm_path
             reuse_ctdm_pretrain = bool(exp_cfg["training"].get("reuse_ctdm_pretrain", False))
             ctdm_checkpoint_metadata = build_checkpoint_metadata(
                 model_name=name,
                 stage="ctdm",
                 dataset_name=source_dataset_name,
-                dataset_root=dataset_root,
+                dataset_root=source_dataset_root,
                 seed=int(seed),
                 label_mapping=dataset_label_mapping,
                 config_payload={
@@ -1492,7 +2362,9 @@ def main() -> None:
                     "observability": observability_cfg,
                 },
             )
-            if (not args.eval_only) and not (reuse_ctdm_pretrain and os.path.isfile(ctdm_pretrain_path)):
+            if skip_ctdm_pretraining:
+                logging.info(f"Target adaptation: reusing source CTDM checkpoint {ctdm_pretrain_path}")
+            elif (not args.eval_only) and not (reuse_ctdm_pretrain and os.path.isfile(ctdm_pretrain_path)):
                 logging.info("CTDM pretraining started")
                 ctdm_trainer = Trainer(model=ctdm, cfg=ctdm_train_cfg)
                 ctdm_fit_out = ctdm_trainer.fit(
@@ -1507,17 +2379,17 @@ def main() -> None:
                 )
             elif (not args.eval_only) and reuse_ctdm_pretrain and os.path.isfile(ctdm_pretrain_path):
                 logging.info(f"Reusing existing CTDM pretraining checkpoint: {ctdm_pretrain_path}")
-            if not args.eval_only and os.path.isfile(ctdm_pretrain_path):
+            if (skip_ctdm_pretraining or not args.eval_only) and os.path.isfile(ctdm_pretrain_path):
                 ctdm_state, _ = load_checkpoint_state(
                     ckpt_path=ctdm_pretrain_path,
                     device=device,
                     expected_metadata=ctdm_checkpoint_metadata,
                     validate_metadata=validate_ckpt_metadata,
                     allow_legacy=allow_legacy_ckpt,
-                    ignored_metadata_keys=["config_hash"] if not require_config_hash else None,
+                    ignored_metadata_keys=rd_ignored_metadata_keys,
                 )
                 ctdm.load_state_dict(ctdm_state)
-            elif not args.eval_only:
+            elif skip_ctdm_pretraining or not args.eval_only:
                 raise FileNotFoundError(
                     f"Missing CTDM pretraining checkpoint at {ctdm_pretrain_path}"
                 )
@@ -1525,7 +2397,7 @@ def main() -> None:
             if use_potentials:
                 if not os.path.isdir(potentials_dir):
                     raise FileNotFoundError(f"Missing RumorDiffusion potentials directory: {potentials_dir}")
-                ds_train = GraphDataset(
+                ds_train = make_graph_dataset(
                     root=dataset_root,
                     split="train",
                     use_lp_edges=use_lp_edges,
@@ -1534,8 +2406,9 @@ def main() -> None:
                     potentials_pair=potentials_pair,
                     prefix_cfg=prefix_cfg,
                     observability_cfg=observability_cfg,
+                    text_runtime_cfg=text_runtime_cfg,
                 )
-                ds_val = GraphDataset(
+                ds_val = make_graph_dataset(
                     root=dataset_root,
                     split="val",
                     use_lp_edges=use_lp_edges,
@@ -1544,8 +2417,9 @@ def main() -> None:
                     potentials_pair=potentials_pair,
                     prefix_cfg=prefix_cfg,
                     observability_cfg=observability_cfg,
+                    text_runtime_cfg=text_runtime_cfg,
                 )
-                ds_test = GraphDataset(
+                ds_test = make_graph_dataset(
                     root=dataset_root,
                     split="test",
                     use_lp_edges=use_lp_edges,
@@ -1554,6 +2428,7 @@ def main() -> None:
                     potentials_pair=potentials_pair,
                     prefix_cfg=prefix_cfg,
                     observability_cfg=observability_cfg,
+                    text_runtime_cfg=text_runtime_cfg,
                 )
 
             # RumorDiffusion arbiter and loss config overrides
@@ -1783,6 +2658,9 @@ def main() -> None:
                 lp_dir=aug_edge_dir,
                 prefix_cfg=prefix_cfg,
                 observability_cfg=observability_cfg,
+                text_cache_name=str(text_runtime_cfg.get("cache_name", "text_embs.pt")),
+                force_text_cache=bool(text_runtime_cfg.get("force_text_cache", False)),
+                text_normalize=bool(text_runtime_cfg.get("normalize_embeddings", False)),
             )
             ds_val = GraphDataset(
                 root=dataset_root,
@@ -1791,6 +2669,9 @@ def main() -> None:
                 lp_dir=aug_edge_dir,
                 prefix_cfg=prefix_cfg,
                 observability_cfg=observability_cfg,
+                text_cache_name=str(text_runtime_cfg.get("cache_name", "text_embs.pt")),
+                force_text_cache=bool(text_runtime_cfg.get("force_text_cache", False)),
+                text_normalize=bool(text_runtime_cfg.get("normalize_embeddings", False)),
             )
             ds_test = GraphDataset(
                 root=dataset_root,
@@ -1799,6 +2680,9 @@ def main() -> None:
                 lp_dir=aug_edge_dir,
                 prefix_cfg=prefix_cfg,
                 observability_cfg=observability_cfg,
+                text_cache_name=str(text_runtime_cfg.get("cache_name", "text_embs.pt")),
+                force_text_cache=bool(text_runtime_cfg.get("force_text_cache", False)),
+                text_normalize=bool(text_runtime_cfg.get("normalize_embeddings", False)),
             )
 
             # Build GCN model for stage 2
@@ -1897,13 +2781,18 @@ def main() -> None:
         trainer = Trainer(model=m, cfg=trainer_cfg)
         fit_out = {"best_val_macro_f1": 0.0, "best_val_metric": 0.0}
         train_seconds = 0.0
+        transfer_mode = "source_only" if transfer_run else "main"
+        source_checkpoint_path = actual_ckpt_path if transfer_run else ""
+        adapt_ckpt_path = ""
+        adapt_epochs = 0
+        pseudo_label_coverage = 0.0
         checkpoint_metadata: Optional[Dict[str, Any]] = None
         if name == "rumordiffusion":
             checkpoint_metadata = build_checkpoint_metadata(
                 model_name=name,
                 stage="arbiter",
                 dataset_name=source_dataset_name,
-                dataset_root=dataset_root,
+                dataset_root=source_dataset_root,
                 seed=int(seed),
                 label_mapping=dataset_label_mapping,
                 config_payload={
@@ -1920,7 +2809,109 @@ def main() -> None:
                     "observability": observability_cfg,
                 },
             )
-        if not args.eval_only:
+        eval_cfg = exp_cfg.get("evaluation", {})
+        class_names = eval_cfg.get(
+            "class_names", {0: "non-rumor", 1: "true", 2: "false", 3: "unverified"})
+        class_names_overrides = eval_cfg.get("class_names_overrides", {})
+        if isinstance(class_names_overrides, dict) and dataset_name in class_names_overrides:
+            class_names = class_names_overrides[dataset_name]
+        detailed_eval = True
+        rd_eval_cfg = rd_cfg.get("evaluation", model_cfg.get(
+            "evaluation", {})) if name == "rumordiffusion" else {}
+        export_pred_cfg = eval_cfg.get("export_predictions", {}) if isinstance(
+            eval_cfg, dict) else {}
+        latency_cfg = eval_cfg.get("latency", {}) if isinstance(
+            eval_cfg, dict) else {}
+        significance_cfg = eval_cfg.get("significance", {}) if isinstance(
+            eval_cfg, dict) else {}
+        if args.transfer_adapt:
+            if name != "rumordiffusion":
+                raise ValueError("Target adaptation is only implemented for RumorDiffusion.")
+            logging.info("Target-adaptation run: loading source checkpoint before unsupervised adaptation")
+            state, _ = load_checkpoint_state(
+                ckpt_path=actual_ckpt_path,
+                device=device,
+                expected_metadata=checkpoint_metadata,
+                validate_metadata=bool(checkpoint_metadata is not None and validate_ckpt_metadata),
+                allow_legacy=bool(allow_legacy_ckpt),
+                ignored_metadata_keys=rd_ignored_metadata_keys,
+            )
+            trainer.model.load_state_dict(state)
+            transfer_mode = "target_adapt"
+            transfer_adapt_cfg = exp_cfg.get("transfer", {}).get("adaptation", {}) if isinstance(exp_cfg.get("transfer", {}).get("adaptation", {}), dict) else {}
+            rd_adapt_cfg = rd_cfg.get("adaptation", {}) if isinstance(rd_cfg.get("adaptation", {}), dict) else {}
+            adapt_cfg = _deep_merge(transfer_adapt_cfg, rd_adapt_cfg)
+            if len(adapt_cfg) == 0:
+                raise ValueError("Missing rumordiffusion.adaptation config for --transfer_adapt.")
+            target_split = str(adapt_cfg.get("target_split", "train"))
+            selection_split = str(adapt_cfg.get("selection_split", "val"))
+            if target_split != "train":
+                raise ValueError(f"Unsupported target adaptation split: {target_split}")
+            if selection_split != "val":
+                raise ValueError(f"Unsupported target selection split: {selection_split}")
+            target_obs_cfg = adapt_cfg.get("target_observability", {}) if isinstance(adapt_cfg.get("target_observability", {}), dict) else {}
+            target_prefix_cfg = prefix_cfg if not isinstance(adapt_cfg.get("target_prefix", {}), dict) else {**prefix_cfg, **adapt_cfg.get("target_prefix", {})}
+            target_train_ds = make_graph_dataset(
+                root=dataset_root,
+                split=target_split,
+                use_lp_edges=use_lp,
+                prefix_cfg=target_prefix_cfg,
+                observability_cfg={**observability_cfg, **target_obs_cfg},
+                text_runtime_cfg=text_runtime_cfg,
+                use_potentials=model_use_potentials,
+                potentials_dir=model_potentials_dir,
+                potentials_pair=model_potentials_pair,
+            )
+            target_val_ds = make_graph_dataset(
+                root=dataset_root,
+                split=selection_split,
+                use_lp_edges=use_lp,
+                prefix_cfg=prefix_cfg,
+                observability_cfg=observability_cfg,
+                text_runtime_cfg=text_runtime_cfg,
+                use_potentials=model_use_potentials,
+                potentials_dir=model_potentials_dir,
+                potentials_pair=model_potentials_pair,
+            )
+            target_train_max_samples = int(adapt_cfg.get("target_max_samples", train_max_samples))
+            target_selection_max_samples = int(adapt_cfg.get("selection_max_samples", max_eval_samples))
+            target_train_eff = target_train_ds if target_train_max_samples <= 0 else Subset(
+                target_train_ds,
+                list(range(min(len(target_train_ds), target_train_max_samples))),
+            )
+            target_val_eff = target_val_ds if target_selection_max_samples <= 0 else Subset(
+                target_val_ds,
+                list(range(min(len(target_val_ds), target_selection_max_samples))),
+            )
+            logging.info(
+                f"Target-adapt data sizes -> train={len(target_train_eff)}, val={len(target_val_eff)}, "
+                f"batch_size={int(adapt_cfg.get('batch_size', trainer_cfg.batch_size))}"
+            )
+            target_train_loader = make_loader(target_train_eff, shuffle=True, batch_size=int(adapt_cfg.get("batch_size", trainer_cfg.batch_size)))
+            target_val_loader = make_loader(target_val_eff, shuffle=False, batch_size=eval_batch_size)
+            adapt_ckpt_dir = os.path.join(base_ckpt_dir, source_dataset_name, name, f"seed{seed}")
+            adapt_ckpt_name = str(adapt_cfg.get("adapt_ckpt_name", "best_target_adapt.pt"))
+            adapt_ckpt_path = os.path.join(adapt_ckpt_dir, adapt_ckpt_name)
+            train_start = time.time()
+            fit_out = adapt_rumordiffusion_to_target(
+                model=trainer.model,
+                trainer=trainer,
+                source_checkpoint_path=actual_ckpt_path,
+                target_train_loader=target_train_loader,
+                target_val_loader=target_val_loader,
+                adaptation_cfg=adapt_cfg,
+                class_names=class_names,
+                device=device,
+                save_path=adapt_ckpt_path,
+            )
+            train_seconds = time.time() - train_start
+            adapt_epochs = int(fit_out.get("adapt_epochs", 0))
+            pseudo_label_coverage = float(fit_out.get("pseudo_label_coverage", 0.0))
+            logging.info(
+                f"Best target-val macro F1 after adaptation: {fit_out.get('best_val_macro_f1', 0.0):.4f}; "
+                f"pseudo_label_coverage={pseudo_label_coverage:.4f}"
+            )
+        elif not args.eval_only:
             logging.info("Training started")
             train_start = time.time()
             fit_out = trainer.fit(train_loader=train_loader,
@@ -1939,25 +2930,10 @@ def main() -> None:
                 expected_metadata=checkpoint_metadata,
                 validate_metadata=bool(name == "rumordiffusion" and checkpoint_metadata is not None and validate_ckpt_metadata),
                 allow_legacy=bool(name != "rumordiffusion" or allow_legacy_ckpt),
-                ignored_metadata_keys=["config_hash"] if (name == "rumordiffusion" and not require_config_hash) else None,
+                ignored_metadata_keys=rd_ignored_metadata_keys,
             )
             trainer.model.load_state_dict(state)
             logging.info(f"Checkpoint loaded from {actual_ckpt_path}")
-        eval_cfg = exp_cfg.get("evaluation", {})
-        class_names = eval_cfg.get(
-            "class_names", {0: "non-rumor", 1: "true", 2: "false", 3: "unverified"})
-        class_names_overrides = eval_cfg.get("class_names_overrides", {})
-        if isinstance(class_names_overrides, dict) and dataset_name in class_names_overrides:
-            class_names = class_names_overrides[dataset_name]
-        detailed_eval = True
-        rd_eval_cfg = rd_cfg.get("evaluation", model_cfg.get(
-            "evaluation", {})) if name == "rumordiffusion" else {}
-        export_pred_cfg = eval_cfg.get("export_predictions", {}) if isinstance(
-            eval_cfg, dict) else {}
-        latency_cfg = eval_cfg.get("latency", {}) if isinstance(
-            eval_cfg, dict) else {}
-        significance_cfg = eval_cfg.get("significance", {}) if isinstance(
-            eval_cfg, dict) else {}
         def persist_revision_row(row: Dict[str, str]) -> None:
             append_dict_rows_csv(revision_artifacts_csv, revision_headers, [row])
 
@@ -1989,12 +2965,56 @@ def main() -> None:
         if "report" in test_metrics_base:
             logging.info("\n=== Test Set Evaluation Report ===")
             logging.info(f"\n{test_metrics_base['report']}")
+        if "per_class" in test_metrics_base:
+            per_class_metrics = test_metrics_base["per_class"]
+            if isinstance(per_class_metrics, dict):
+                for class_idx, class_metrics in per_class_metrics.items():
+                    class_name = class_names.get(int(class_idx), str(class_idx)) if isinstance(class_names, dict) else str(class_idx)
+                    if isinstance(class_metrics, dict):
+                        persist_revision_row(
+                            build_revision_row(
+                                timestamp=run_ts,
+                                dataset_name=dataset_name,
+                                source_dataset_name=source_dataset_name,
+                                run_kind="transfer" if dataset_name != source_dataset_name else "main",
+                                model_name=name,
+                                seed=int(seed),
+                                artifact_type="per_class_metric",
+                                tag=f"class_{int(class_idx)}_{class_name}",
+                                values={
+                                    "metric": "precision",
+                                    "delta": float(class_metrics.get("precision", 0.0)),
+                                    "p_value": float(class_metrics.get("recall", 0.0)),
+                                    "ci_low": float(class_metrics.get("f1", 0.0)),
+                                    "ci_high": float(class_metrics.get("support", 0.0)),
+                                    "notes": f"class_name={class_name}",
+                                },
+                            )
+                        )
+        if "confusion_matrix" in test_metrics_base and isinstance(test_metrics_base["confusion_matrix"], torch.Tensor):
+            persist_revision_row(
+                build_revision_row(
+                    timestamp=run_ts,
+                    dataset_name=dataset_name,
+                    source_dataset_name=source_dataset_name,
+                    run_kind="transfer" if dataset_name != source_dataset_name else "main",
+                    model_name=name,
+                    seed=int(seed),
+                    artifact_type="confusion_matrix",
+                    tag="main",
+                    values={
+                        "notes": json.dumps(test_metrics_base["confusion_matrix"].tolist()),
+                    },
+                )
+            )
         if len(test_outputs_base["latency_ms"]) > 0:
             latency_stats = summarize_latency_ms(test_outputs_base["latency_ms"])
             persist_revision_row(
                 build_revision_row(
                     timestamp=run_ts,
                     dataset_name=dataset_name,
+                    source_dataset_name=source_dataset_name,
+                    run_kind="transfer" if dataset_name != source_dataset_name else "main",
                     model_name=name,
                     seed=int(seed),
                     artifact_type="latency_profile",
@@ -2145,13 +3165,13 @@ def main() -> None:
             )
             test_logits = test_outputs_base["logits"]
             test_targets = test_outputs_base["targets"]
-            logits_scaled = (test_logits.to(device) / float(temp_opt)).cpu()
-            if not torch.equal(
-                torch.argmax(test_logits, dim=1),
-                torch.argmax(logits_scaled, dim=1),
+            logits_scaled = (test_logits.to(device=device, dtype=torch.float32) / float(temp_opt)).cpu()
+            if not calibration_preserves_non_tied_argmax(
+                original_logits=test_logits,
+                scaled_logits=logits_scaled,
             ):
                 raise RuntimeError(
-                    "Temperature scaling changed predicted labels on the stored test logits."
+                    "Temperature scaling changed predicted labels on non-tied stored test logits."
                 )
             test_metrics_cal = metrics_from_logits(
                 logits_scaled,
@@ -2178,6 +3198,8 @@ def main() -> None:
             export_prediction_rows(
                 csv_path=prediction_csv,
                 dataset_name=dataset_name,
+                source_dataset_name=source_dataset_name,
+                run_kind="transfer" if dataset_name != source_dataset_name else "main",
                 model_name=name,
                 seed=int(seed),
                 tag="main",
@@ -2192,6 +3214,8 @@ def main() -> None:
             current_rows = load_prediction_rows(
                 csv_path=prediction_csv,
                 dataset_name=dataset_name,
+                source_dataset_name=source_dataset_name,
+                run_kind="transfer" if dataset_name != source_dataset_name else "main",
                 model_name=name,
                 seed=int(seed),
                 tag="main",
@@ -2200,6 +3224,8 @@ def main() -> None:
                 baseline_rows = load_prediction_rows(
                     csv_path=prediction_csv,
                     dataset_name=dataset_name,
+                    source_dataset_name=source_dataset_name,
+                    run_kind="transfer" if dataset_name != source_dataset_name else "main",
                     model_name=str(compare_model),
                     seed=int(seed),
                     tag="main",
@@ -2218,6 +3244,8 @@ def main() -> None:
                         build_revision_row(
                             timestamp=run_ts,
                             dataset_name=dataset_name,
+                            source_dataset_name=source_dataset_name,
+                            run_kind="transfer" if dataset_name != source_dataset_name else "main",
                             model_name=name,
                             seed=int(seed),
                             artifact_type="significance",
@@ -2237,12 +3265,19 @@ def main() -> None:
         result_headers = [
             "timestamp",
             "dataset",
+            "source_dataset",
+            "run_kind",
+            "transfer_mode",
             "model",
             "model_cfg",
             "exp_cfg",
             "ckpt_path",
+            "source_ckpt_path",
+            "adapt_ckpt_path",
             "log_path",
             "seed",
+            "adapt_epochs",
+            "pseudo_label_coverage",
             "best_val_macro_f1",
             "test_loss",
             "test_nll",
@@ -2257,62 +3292,85 @@ def main() -> None:
             "calibration_temp",
         ]
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        append_results_csv(
+        resolved_ckpt_path = adapt_ckpt_path if transfer_mode == "target_adapt" and len(adapt_ckpt_path) > 0 else actual_ckpt_path
+        if transfer_mode == "target_adapt":
+            if len(adapt_ckpt_path) == 0 or not os.path.isfile(adapt_ckpt_path):
+                raise RuntimeError(
+                    f"Target adaptation completed without producing checkpoint: {adapt_ckpt_path}"
+                )
+        append_dict_rows_csv(
             csv_path=csv_path,
             headers=result_headers,
-            row=[
-                ts,
-                dataset_name,
-                name,
-                model_path,
-                args.exp,
-                actual_ckpt_path,
-                log_path,
-                str(seed),
-                f"{fit_out.get('best_val_macro_f1', fit_out.get('best_val_metric', 0.0)):.6f}",
-                f"{test_metrics.get('loss', 0.0):.6f}",
-                f"{test_metrics.get('nll', 0.0):.6f}",
-                f"{test_metrics.get('acc', 0.0):.6f}",
-                f"{test_metrics.get('macro_f1', 0.0):.6f}",
-                f"{test_metrics.get('macro_precision', 0.0):.6f}",
-                f"{test_metrics.get('macro_recall', 0.0):.6f}",
-                f"{test_metrics.get('weighted_f1', 0.0):.6f}",
-                f"{test_metrics.get('weighted_precision', 0.0):.6f}",
-                f"{test_metrics.get('weighted_recall', 0.0):.6f}",
-                f"{test_metrics.get('ece', 0.0):.6f}",
-                "" if calibration_temp is None else f"{calibration_temp:.6f}",
-            ],
+            rows=[{
+                "timestamp": ts,
+                "dataset": dataset_name,
+                "source_dataset": source_dataset_name,
+                "run_kind": "transfer" if dataset_name != source_dataset_name else "main",
+                "transfer_mode": transfer_mode,
+                "model": name,
+                "model_cfg": model_path,
+                "exp_cfg": args.exp,
+                "ckpt_path": resolved_ckpt_path,
+                "source_ckpt_path": source_checkpoint_path,
+                "adapt_ckpt_path": adapt_ckpt_path,
+                "log_path": log_path,
+                "seed": str(seed),
+                "adapt_epochs": "" if int(adapt_epochs) <= 0 else str(int(adapt_epochs)),
+                "pseudo_label_coverage": "" if float(pseudo_label_coverage) <= 0.0 else f"{float(pseudo_label_coverage):.6f}",
+                "best_val_macro_f1": f"{fit_out.get('best_val_macro_f1', fit_out.get('best_val_metric', 0.0)):.6f}",
+                "test_loss": f"{test_metrics.get('loss', 0.0):.6f}",
+                "test_nll": f"{test_metrics.get('nll', 0.0):.6f}",
+                "test_acc": f"{test_metrics.get('acc', 0.0):.6f}",
+                "test_macro_f1": f"{test_metrics.get('macro_f1', 0.0):.6f}",
+                "test_macro_precision": f"{test_metrics.get('macro_precision', 0.0):.6f}",
+                "test_macro_recall": f"{test_metrics.get('macro_recall', 0.0):.6f}",
+                "test_weighted_f1": f"{test_metrics.get('weighted_f1', 0.0):.6f}",
+                "test_weighted_precision": f"{test_metrics.get('weighted_precision', 0.0):.6f}",
+                "test_weighted_recall": f"{test_metrics.get('weighted_recall', 0.0):.6f}",
+                "ece": f"{test_metrics.get('ece', 0.0):.6f}",
+                "calibration_temp": "" if calibration_temp is None else f"{calibration_temp:.6f}",
+            }],
         )
         if dataset_name != source_dataset_name:
             transfer_headers = [
                 "timestamp",
                 "train_dataset",
                 "test_dataset",
+                "transfer_mode",
                 "model",
                 "seed",
                 "ckpt_path",
+                "source_ckpt_path",
+                "adapt_ckpt_path",
+                "adapt_epochs",
+                "pseudo_label_coverage",
                 "acc",
                 "macro_f1",
                 "nll",
                 "ece",
                 "calibration_temp",
             ]
-            append_results_csv(
+            append_dict_rows_csv(
                 csv_path=transfer_csv,
                 headers=transfer_headers,
-                row=[
-                    ts,
-                    source_dataset_name,
-                    dataset_name,
-                    name,
-                    str(seed),
-                    actual_ckpt_path,
-                    f"{test_metrics.get('acc', 0.0):.6f}",
-                    f"{test_metrics.get('macro_f1', 0.0):.6f}",
-                    f"{test_metrics.get('nll', 0.0):.6f}",
-                    f"{test_metrics.get('ece', 0.0):.6f}",
-                    "" if calibration_temp is None else f"{calibration_temp:.6f}",
-                ],
+                rows=[{
+                    "timestamp": ts,
+                    "train_dataset": source_dataset_name,
+                    "test_dataset": dataset_name,
+                    "transfer_mode": transfer_mode,
+                    "model": name,
+                    "seed": str(seed),
+                    "ckpt_path": resolved_ckpt_path,
+                    "source_ckpt_path": source_checkpoint_path,
+                    "adapt_ckpt_path": adapt_ckpt_path,
+                    "adapt_epochs": "" if int(adapt_epochs) <= 0 else str(int(adapt_epochs)),
+                    "pseudo_label_coverage": "" if float(pseudo_label_coverage) <= 0.0 else f"{float(pseudo_label_coverage):.6f}",
+                    "acc": f"{test_metrics.get('acc', 0.0):.6f}",
+                    "macro_f1": f"{test_metrics.get('macro_f1', 0.0):.6f}",
+                    "nll": f"{test_metrics.get('nll', 0.0):.6f}",
+                    "ece": f"{test_metrics.get('ece', 0.0):.6f}",
+                    "calibration_temp": "" if calibration_temp is None else f"{calibration_temp:.6f}",
+                }],
             )
         if wb_enabled:
             import wandb
@@ -2384,6 +3442,8 @@ def main() -> None:
                         build_revision_row(
                             timestamp=run_ts,
                             dataset_name=dataset_name,
+                            source_dataset_name=source_dataset_name,
+                            run_kind="transfer" if dataset_name != source_dataset_name else "main",
                             model_name=name,
                             seed=int(seed),
                             artifact_type="early_stop",
@@ -2413,6 +3473,8 @@ def main() -> None:
                                 build_revision_row(
                                     timestamp=run_ts,
                                     dataset_name=dataset_name,
+                                    source_dataset_name=source_dataset_name,
+                                    run_kind="transfer" if dataset_name != source_dataset_name else "main",
                                     model_name=name,
                                     seed=int(seed),
                                     artifact_type="sampling_sweep",
@@ -2449,6 +3511,8 @@ def main() -> None:
                                         build_revision_row(
                                             timestamp=run_ts,
                                             dataset_name=dataset_name,
+                                            source_dataset_name=source_dataset_name,
+                                            run_kind="transfer" if dataset_name != source_dataset_name else "main",
                                             model_name=name,
                                             seed=int(seed),
                                             artifact_type="threshold_sweep",
@@ -2511,7 +3575,7 @@ def main() -> None:
                 observability_cfg.get("drop_edge", 0.0)]
             for dn in dn_candidates:
                 for de in de_candidates:
-                    ds_test_obs = GraphDataset(
+                    ds_test_obs = make_graph_dataset(
                         root=dataset_root,
                         split="test",
                         use_lp_edges=use_lp,
@@ -2521,6 +3585,7 @@ def main() -> None:
                         prefix_cfg=prefix_cfg,
                         observability_cfg={"drop_node": float(dn), "drop_edge": float(
                             de), "seed": observability_cfg.get("seed", 0)},
+                        text_runtime_cfg=text_runtime_cfg,
                     )
                     test_loader_obs = make_loader(ds_test_obs, shuffle=False)
                     metrics_obs = trainer.evaluate(
@@ -2535,43 +3600,6 @@ def main() -> None:
                 "test_nll": float(test_metrics.get("nll", 0.0)),
             }
         )
-
-        if len(seeds) > 1 and len(seed_results) == len(seeds):
-            agg_headers = result_headers
-            mean_val, std_val = aggregate_numeric(
-                [r["val_macro_f1"] for r in seed_results])
-            mean_f1, std_f1 = aggregate_numeric(
-                [r["test_macro_f1"] for r in seed_results])
-            mean_acc, std_acc = aggregate_numeric(
-                [r["test_acc"] for r in seed_results])
-            mean_nll, std_nll = aggregate_numeric(
-                [r["test_nll"] for r in seed_results])
-            append_results_csv(
-                csv_path=csv_path,
-                headers=agg_headers,
-                row=[
-                    ts,
-                    dataset_name,
-                    f"{name}_agg",
-                    model_path,
-                    args.exp,
-                    "",
-                    "",
-                    "agg",
-                    f"{mean_val:.6f}±{std_val:.6f}",
-                    "",
-                    f"{mean_nll:.6f}±{std_nll:.6f}",
-                    f"{mean_acc:.6f}±{std_acc:.6f}",
-                    f"{mean_f1:.6f}±{std_f1:.6f}",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                ],
-            )
 
 
 if __name__ == "__main__":

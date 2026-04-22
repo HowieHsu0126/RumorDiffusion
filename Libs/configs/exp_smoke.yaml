@@ -5,6 +5,21 @@ dataset:
   name: twitter15
   root: /share/home/hwxu/Researches/D2Plus/Input/processed
   use_lp_edges: false
+  text_normalization:
+    lowercase: true
+    replace_url: true
+    replace_mention: true
+    replace_number: true
+    compress_repeated_chars: true
+    keep_hashtag_text: true
+  text_encoder:
+    model_name_or_path: /share/home/hwxu/Researches/D2Plus/Input/sentence_transformers_all_MiniLM_L6v2
+    batch_size: 4
+    cache_tag: minilm_smoke
+    cache_name: text_embs.pt
+    force_text_cache: false
+    normalize_embeddings: false
+    rebuild_cache: false
   observability_sweep:
     drop_node: []
     drop_edge: []
@@ -72,7 +87,48 @@ outputs:
   prediction_csv: /share/home/hwxu/Researches/D2Plus/Output/results/smoke/predictions.csv
   revision_artifacts_csv: /share/home/hwxu/Researches/D2Plus/Output/results/smoke/revision_artifacts.csv
 
+sbatch:
+  job_prefix: DPlus
+  conda_env: hw
+  profiles:
+    benchmark:
+      partition: gpu
+      nodelist: cpu03
+      gres: ""
+      cpus_per_task: 4
+      mem: 16G
+      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs
+    rumordiffusion_train:
+      partition: gpu
+      nodelist: cpu03
+      gres: ""
+      cpus_per_task: 4
+      mem: 16G
+      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs
+    transfer:
+      partition: gpu
+      nodelist: cpu03
+      gres: ""
+      cpus_per_task: 4
+      mem: 16G
+      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs
+    ablation:
+      partition: gpu
+      nodelist: cpu03
+      gres: ""
+      cpus_per_task: 4
+      mem: 16G
+      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs
+    hparam:
+      partition: gpu
+      nodelist: cpu03
+      gres: ""
+      cpus_per_task: 4
+      mem: 16G
+      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs
+
 transfer:
+  mode: source_only
   pairs:
     - source: twitter15
       target: twitter16
@@ -81,6 +137,10 @@ transfer:
   ckpt_name: best.pt
   lp_edges_policy: require_existing
   results_path: /share/home/hwxu/Researches/D2Plus/Output/results/smoke/transfer.csv
+  adaptation:
+    target_split: train
+    selection_split: val
+    adapt_ckpt_name: best_target_adapt.pt
 
 rumordiffusion:
   checkpoint:
@@ -189,6 +249,50 @@ rumordiffusion:
     source_ids: ""
     case_selection:
       enabled: true
+  dataset_overrides:
+    weibo:
+      arbiter:
+        pair_ids: [0, 1]
+      ctdm:
+        regularizers:
+          pair_ids: [0, 1]
+    pheme:
+      arbiter:
+        pair_ids: [0, 1]
+      ctdm:
+        regularizers:
+          pair_ids: [0, 1]
+  adaptation:
+    epochs: 1
+    batch_size: 1
+    target_max_samples: 1
+    selection_max_samples: 1
+    lr: 0.0001
+    arbiter_lr: 0.0001
+    ctdm_lr: 0.00003
+    weight_decay: 0.0001
+    ema_decay: 0.99
+    confidence_threshold: 0.0
+    min_samples_per_class: 1
+    pseudo_label_weight: 1.0
+    consistency_weight: 0.10
+    prototype_align_weight: 0.05
+    use_class_reweighting: true
+    logit_adjustment_strength: 0.10
+    ctdm_unfreeze_last_layers: 1
+    consistency_text_dropout: 0.05
+    consistency_text_noise_std: 0.0
+    consistency_edge_drop_rate: 0.05
+    consistency_obs_min: 10
+    consistency_obs_max: 30
+    target_prefix:
+      strategy: minutes
+      minutes: 30
+      include_root: true
+    target_observability:
+      drop_node: 0.0
+      drop_edge: 0.0
+      seed: 1024
   loss:
     la_gamma: 2.2
     la_smooth: 0.05

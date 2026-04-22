@@ -29,6 +29,15 @@ dataset:
   text:
     encoder_path: "/share/home/hwxu/Researches/D2Plus/Input/sentence_transformers_all_MiniLM_L6v2"
     normalize: false
+    cache_name: "text_embs.pt"
+    batch_size: 64
+    normalization:
+      lowercase: true
+      replace_url: true
+      replace_mention: true
+      replace_number: true
+      compress_repeated_chars: true
+      keep_hashtag_text: true
   augment:
     enabled: false
     method: none
@@ -41,5 +50,4 @@ dataset:
     overrides:
       weibo: "hop"
       pheme: "hop"
-
 
