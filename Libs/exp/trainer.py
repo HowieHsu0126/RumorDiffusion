@@ -66,6 +66,8 @@ class TrainerConfig:
     class_weights: Optional[List[float]] = None
     max_batches_per_epoch: Optional[int] = None
     min_epochs: int = 30
+    selection_metric: str = "macro_f1"
+    selection_mode: str = "classification"
 
 
 class Trainer:
@@ -173,6 +175,30 @@ class Trainer:
                 out["macro_f1"] = m["macro_f1"]
         return out
 
+    def _run_objective_eval_epoch(self, loader: DataLoader, desc: str = "") -> Dict[str, float]:
+        total_loss = 0.0
+        total = 0
+        iterator = loader
+        if self.cfg.use_tqdm:
+            iterator = tqdm(loader, desc=desc, leave=False)
+        max_steps = self.cfg.max_batches_per_epoch
+        self.model.eval()
+        with torch.no_grad():
+            for step_idx, batch in enumerate(iterator):
+                batch = batch.to(self.device)
+                if hasattr(self.model, "validation_step"):
+                    loss = self.model.validation_step(batch)
+                elif hasattr(self.model, "training_step"):
+                    loss, _ = self.model.training_step(batch)
+                else:
+                    raise AttributeError("Objective validation requires `validation_step` or `training_step`.")
+                bsz = batch.y.size(0)
+                total_loss += float(loss.item()) * bsz
+                total += bsz
+                if max_steps is not None and step_idx + 1 >= int(max_steps):
+                    break
+        return {"objective_loss": total_loss / max(1, total)}
+
     def fit(
         self,
         train_loader: DataLoader,
@@ -180,7 +206,10 @@ class Trainer:
         save_path: Optional[str] = None,
         checkpoint_metadata: Optional[Dict[str, Union[str, int, float, bool, Dict[str, int]]]] = None,
     ) -> Dict[str, float]:
-        best_val_metric = -1.0
+        selection_mode = str(self.cfg.selection_mode).lower()
+        selection_metric = str(self.cfg.selection_metric).lower()
+        maximize_metric = selection_mode != "objective"
+        best_val_metric = -1.0 if maximize_metric else float("inf")
         best_state = None
         patience = 0
         min_epochs = max(1, int(self.cfg.min_epochs))
@@ -189,13 +218,21 @@ class Trainer:
         if self.cfg.use_tqdm:
             epoch_iter = tqdm(epoch_iter, desc="epochs")
         for epoch in epoch_iter:
+            if hasattr(self.model, "set_training_progress"):
+                self.model.set_training_progress(epoch, self.cfg.epochs)
             self._run_epoch(train_loader, train=True, desc=f"train {epoch}")
             self.scheduler.step()
-            val_metrics = self._run_epoch(val_loader, train=False, desc=f"val {epoch}")
+            if selection_mode == "objective":
+                val_metrics = self._run_objective_eval_epoch(val_loader, desc=f"val objective {epoch}")
+                current_metric = float(val_metrics.get(selection_metric, val_metrics.get("objective_loss", float("inf"))))
+                improved = current_metric < best_val_metric
+            else:
+                val_metrics = self._run_epoch(val_loader, train=False, desc=f"val {epoch}")
+                current_metric = float(val_metrics.get(selection_metric, val_metrics.get("macro_f1", -1.0)))
+                improved = current_metric > best_val_metric
 
-            # Monitor Macro F1 instead of accuracy for better class balance awareness
-            if val_metrics["macro_f1"] > best_val_metric:
-                best_val_metric = val_metrics["macro_f1"]
+            if improved:
+                best_val_metric = current_metric
                 best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
                 patience = 0
                 if save_path is not None:
@@ -215,7 +252,12 @@ class Trainer:
 
         if best_state is not None:
             self.model.load_state_dict(best_state)
-        return {"best_val_metric": best_val_metric, "best_val_macro_f1": best_val_metric}
+        result = {"best_val_metric": best_val_metric}
+        if selection_mode == "objective":
+            result["best_val_objective_loss"] = best_val_metric
+        else:
+            result["best_val_macro_f1"] = best_val_metric
+        return result
 
     def evaluate(self, loader: DataLoader, detailed: bool = False, class_names: Optional[Dict[int, str]] = None) -> Dict[str, Union[float, str, Dict]]:
         """Evaluates the model on the given data loader.
@@ -324,7 +366,7 @@ class LinkPredTrainer:
     def _step(self, data: Batch) -> float:
         data = data.to(self.device)
         if self.cfg.amp and self.cfg.device == 'cuda':
-            with autocast(device_type='cuda', enabled=True):
+            with autocast():
                 z = self.model(data)
                 pos = data.edge_index
                 num_pos = pos.size(1)

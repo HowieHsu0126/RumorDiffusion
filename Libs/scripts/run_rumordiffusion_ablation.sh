@@ -18,7 +18,7 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   GRES=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "gres" "gpu:1")
   CPUS_PER_TASK=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "cpus_per_task" "8")
   MEM=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "mem" "32G")
-  LOG_DIR=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "log_dir" "Output/logs/paper_ready")
+  LOG_DIR=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "log_dir" "Output/logs/paper_aligned")
   CONDA_ENV=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "conda_env" "hw")
   SEEDS_DEFAULT=$(python3 - "${EXP_CFG_DEFAULT}" <<'PY'
 import sys
@@ -37,6 +37,10 @@ PY
   JOB_NAME="${JOB_PREFIX}_ablation_${DATASET_VALUE}"
   mkdir -p "${LOG_DIR}"
   sinfo
+  export MODEL_CFGS_OVERRIDE="${MODEL_CFGS}"
+  export SEEDS_OVERRIDE="${SEEDS}"
+  export DATASET_OVERRIDE="${DATASET_OVERRIDE:-}"
+  export SOURCE_DATASET_OVERRIDE="${SOURCE_DATASET_OVERRIDE:-}"
   SBATCH_ARGS=(
     --job-name="${JOB_NAME}"
     --partition="${PARTITION}"
@@ -45,7 +49,7 @@ PY
     --mem="${MEM}"
     --output="${LOG_DIR}/${JOB_NAME}_%j.log"
     --error="${LOG_DIR}/${JOB_NAME}_%j.err"
-    --export=ALL,EXP_CFG="${EXP_CFG_DEFAULT}",MODEL_CFGS_OVERRIDE="${MODEL_CFGS}",SEEDS_OVERRIDE="${SEEDS}",DATASET_OVERRIDE="${DATASET_OVERRIDE:-}",SOURCE_DATASET_OVERRIDE="${SOURCE_DATASET_OVERRIDE:-}",CONDA_ENV_OVERRIDE="${CONDA_ENV}"
+    --export=ALL,EXP_CFG="${EXP_CFG_DEFAULT}",CONDA_ENV_OVERRIDE="${CONDA_ENV}"
   )
   if [ -n "${NODELIST}" ]; then
     SBATCH_ARGS+=(--nodelist="${NODELIST}")
@@ -61,7 +65,7 @@ PY
 fi
 
 CONDA_ENV="${CONDA_ENV_OVERRIDE:-$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "conda_env" "hw")}"
-LOG_DIR=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "log_dir" "Output/logs/paper_ready")
+LOG_DIR=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "log_dir" "Output/logs/paper_aligned")
 activate_conda_env "${CONDA_ENV}"
 cd /share/home/hwxu/Researches/D2Plus
 mkdir -p "${LOG_DIR}"

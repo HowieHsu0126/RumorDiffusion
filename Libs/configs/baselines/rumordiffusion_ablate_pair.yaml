@@ -1,4 +1,25 @@
-name: rumordiffusion
+name: rumordiffusion_without_pair_awareness
+rumordiffusion_overrides:
+  checkpoint:
+    ctdm_subdir: rumordiffusion_without_pair_awareness_ctdm_mpnet_observed_prefix
+  arbiter:
+    use_pair_token: false
+    tf_head:
+      enabled: false
+      infer_adjust_alpha: 0.0
+    tf_head_enabled: false
+    tf_infer_adjust_alpha: 0.0
+  loss:
+    enable_pair_margin_loss: false
+    enable_multi_pair_margin: false
+    enable_tf_head_loss: false
+    pair_margin_enabled: false
+    lambda_pair_margin: 0.0
+    multi_pair_margin_enabled: false
+    multi_pair_margin_list: []
+    multi_pair_margin_values: []
+    lambda_multi_pair_margin: 0.0
+    lambda_tf_bce: 0.0
 model:
   ctdm:
     hidden: 256
@@ -24,7 +45,7 @@ model:
       lambda_deg_kl: 0.07
     text:
       enabled: true
-      text_dim: 384
+      text_dim: 768
       fuse_mode: concat
     multiwindow:
       enabled: true
@@ -82,7 +103,15 @@ model:
     lr_d: 0.0001
     lambda_r1: 10.0
 evaluation:
-  early_obs_minutes: [10, 20, 30]
+  early_observation:
+    default_windows: [10, 20, 30]
+    default_unit: minutes
+    windows_overrides:
+      weibo: [1, 2, 3]
+      pheme: [1, 2, 3]
+    unit_overrides:
+      weibo: hop
+      pheme: hop
   calibration:
     enabled: true
     type: temperature

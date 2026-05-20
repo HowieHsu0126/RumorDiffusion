@@ -64,9 +64,15 @@ resolve_project_prefix() {
 
 activate_conda_env() {
   local conda_env="$1"
+  export USE_TF=0
+  export USE_TORCH=1
+  export TRANSFORMERS_NO_TF=1
   set +u
   source /share/home/hwxu/miniconda3/bin/activate "${conda_env}"
   set -u
+  export USE_TF=0
+  export USE_TORCH=1
+  export TRANSFORMERS_NO_TF=1
 }
 
 record_env_snapshot() {

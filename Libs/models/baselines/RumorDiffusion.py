@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.cuda.amp import autocast
 
+from Libs.models.baselines.ContrastiveObjectives import supervised_contrastive_loss
+
 
 class ArbiterMLP(nn.Module):
     """Two-branch arbiter MLP operating on concatenated potentials.
@@ -100,8 +102,13 @@ class RumorDiffusion(nn.Module):
         cache_potentials: bool = False,
         infer_amp: bool = False,
         uncertainty_force_ctdm: bool = False,
+        uncertainty_sampling: str = "deterministic",
+        uncertainty_readout: str = "observed_prefix",
         # Diagnostics
         loss_logging: bool = False,
+        # Representation objectives
+        lambda_supcon: float = 0.0,
+        supcon_temperature: float = 0.07,
     ) -> None:
         super().__init__()
         self.ctdm = ctdm
@@ -117,6 +124,16 @@ class RumorDiffusion(nn.Module):
         self.cache_potentials = bool(cache_potentials)
         self.infer_amp = bool(infer_amp)
         self.uncertainty_force_ctdm = bool(uncertainty_force_ctdm)
+        self.uncertainty_sampling = str(uncertainty_sampling).lower()
+        self.uncertainty_readout = str(uncertainty_readout).lower()
+        if self.uncertainty_sampling not in {"deterministic", "stochastic_reverse"}:
+            raise ValueError(
+                "uncertainty_sampling must be 'deterministic' or 'stochastic_reverse'."
+            )
+        if self.uncertainty_readout not in {"observed", "observed_prefix", "sampled_full_graph"}:
+            raise ValueError(
+                "uncertainty_readout must be 'observed_prefix' or 'sampled_full_graph'."
+            )
         self.loss_logging = bool(loss_logging)
         norm_choices = {
             "layernorm": nn.LayerNorm(self.hidden_channels),
@@ -136,6 +153,8 @@ class RumorDiffusion(nn.Module):
         self.lambda_tf_bce = float(lambda_tf_bce)
         self.tf_infer_adjust_alpha = float(tf_infer_adjust_alpha)
         self.enable_tf_head_loss = bool(enable_tf_head_loss)
+        self.lambda_supcon = float(lambda_supcon)
+        self.supcon_temperature = float(supcon_temperature)
         # Multi-pair margin loss configuration (for handling multiple confusable class pairs)
         self.multi_pair_margin_list = []
         self.multi_pair_margin_values = []
@@ -321,18 +340,25 @@ class RumorDiffusion(nn.Module):
         x = self.input_drop(self.input_norm(x))
         return self.arbiter(x)
 
-    def _forward_from_ctdm(self, batch) -> Tensor:
+    def _forward_from_ctdm(self, batch, stochastic: bool = False) -> Tensor:
         """Forces on-the-fly CTDM potential inference regardless of cached fields."""
         assert self.ctdm is not None, "CTDM is required for sampled uncertainty inference"
-        Hc = self._compute_ctdm_potentials(batch)
+        Hc = self._compute_ctdm_potentials(batch, stochastic=stochastic)
         self._last_potentials = Hc
         return self._logits_from_tokens(Hc)
 
-    def _compute_ctdm_potentials(self, batch) -> Tensor:
+    def _compute_ctdm_potentials(self, batch, stochastic: bool = False) -> Tensor:
         assert self.ctdm is not None, "CTDM is required when potentials are not present in the batch"
         ctdm_trainable = self.training and any(p.requires_grad for p in self.ctdm.parameters())
+        if bool(stochastic) and ctdm_trainable:
+            raise ValueError("Stochastic CTDM uncertainty sampling is inference-only.")
         if ctdm_trainable:
             return self.ctdm.potentials_all_grad(batch)
+        if bool(stochastic):
+            return self.ctdm.sample_potentials_all(
+                batch,
+                readout_source=self.uncertainty_readout,
+            )
         return self.ctdm.infer_potentials_all(batch)
 
     def forward(self, batch) -> Tensor:
@@ -377,13 +403,16 @@ class RumorDiffusion(nn.Module):
         batch = batch.to(device)
         samples = max(1, int(num_samples))
         probs = []
+        stochastic = self.uncertainty_sampling == "stochastic_reverse"
+        force_ctdm = self.uncertainty_force_ctdm or stochastic
         for _ in range(samples):
-            if self.uncertainty_force_ctdm and self.ctdm is not None:
+            if force_ctdm:
+                assert self.ctdm is not None, "CTDM is required for stochastic uncertainty sampling"
                 if (not self.training) and self.infer_amp:
                     with autocast():
-                        logits = self._forward_from_ctdm(batch)
+                        logits = self._forward_from_ctdm(batch, stochastic=stochastic)
                 else:
-                    logits = self._forward_from_ctdm(batch)
+                    logits = self._forward_from_ctdm(batch, stochastic=stochastic)
             else:
                 if (not self.training) and self.infer_amp:
                     with autocast():
@@ -559,6 +588,11 @@ class RumorDiffusion(nn.Module):
             loss = loss_focal
             loss_dict["la_focal"] = float(loss_focal.detach().item())
 
+            if float(self.lambda_supcon) > 0.0 and cls_out is not None:
+                loss_supcon = supervised_contrastive_loss(cls_out, targets, self.supcon_temperature)
+                loss = loss + float(self.lambda_supcon) * loss_supcon
+                loss_dict["supcon"] = float(loss_supcon.detach().item())
+
             pair_ids_eff = self._effective_pair_ids(self.pair_ids, int(self.num_classes))
             if self.enable_pair_margin_loss and self.pair_margin_enabled and float(self.lambda_pair_margin) > 0.0:
                 if len(pair_ids_eff) == 2:
@@ -649,10 +683,20 @@ class RumorDiffusion(nn.Module):
                 self._last_loss_breakdown = loss_dict
             return loss, 0.0
 
-        logits = self(batch)
+        cls_out = None
+        if self.arbiter_type == "transformer":
+            tokens = self._build_tokens_from_batch(batch)
+            logits, cls_out = self._encode_from_tokens(tokens)
+        else:
+            logits = self(batch)
         loss_focal = self._la_focal_loss(logits, targets)
         loss = loss_focal
         loss_dict["la_focal"] = float(loss_focal.detach().item())
+
+        if float(self.lambda_supcon) > 0.0 and cls_out is not None:
+            loss_supcon = supervised_contrastive_loss(cls_out, targets, self.supcon_temperature)
+            loss = loss + float(self.lambda_supcon) * loss_supcon
+            loss_dict["supcon"] = float(loss_supcon.detach().item())
 
         pair_ids_eff = self._effective_pair_ids(self.pair_ids, int(self.num_classes))
         if self.enable_pair_margin_loss and self.pair_margin_enabled and float(self.lambda_pair_margin) > 0.0:
@@ -673,9 +717,7 @@ class RumorDiffusion(nn.Module):
                 loss = loss + float(self.lambda_multi_pair_margin) * loss_multi_margin
                 loss_dict["multi_pair_margin"] = float(loss_multi_margin.detach().item())
 
-        if self.enable_tf_head_loss and self.tf_head_enabled and float(self.lambda_tf_bce) > 0.0 and self.arbiter_type == "transformer":
-            tokens = self._build_tokens_from_batch(batch)
-            _logits_tmp, cls_out = self._encode_from_tokens(tokens)
+        if self.enable_tf_head_loss and self.tf_head_enabled and float(self.lambda_tf_bce) > 0.0 and cls_out is not None:
             p0, p1 = self.pair_ids
             mask = (targets == p0) | (targets == p1)
             if mask.any() and len(self._effective_pair_ids(self.pair_ids, int(self.num_classes))) == 2:

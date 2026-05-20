@@ -36,6 +36,7 @@ device:
   gpu_id: 0
   type: cuda
 evaluation:
+  ece_bins: 15
   class_names:
     0: non-rumor
     1: 'true'
@@ -257,6 +258,7 @@ rumordiffusion:
     w_brier: 0.01
     w_cons: 0.05
   potentials_dir: rd_potentials
+  seed_scoped_potentials: true
   potentials_pair:
     - 0
     - 1

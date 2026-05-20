@@ -7,6 +7,8 @@ import torch
 from torch import Tensor
 from torch_geometric.data import Data, InMemoryDataset
 
+from Libs.data.processor import compute_structural_features
+
 
 def _assert_tensor_2_by_n(edge_index: Tensor) -> None:
     """Asserts that an edge index tensor has shape (2, E) and dtype long.
@@ -91,7 +93,7 @@ def _prefix_mask_from_strategy(times: Tensor, strategy: str, minutes: Optional[i
     """Computes prefix node mask according to strategy."""
     times_long = times.to(torch.long)
     n = times_long.numel()
-    if strategy == "minutes":
+    if strategy in {"minutes", "hop", "window"}:
         cutoff = int(minutes if minutes is not None else times_long.max().item() if n > 0 else 0)
         mask = times_long <= cutoff
     elif strategy == "count":
@@ -127,6 +129,85 @@ def _apply_missingness(mask: Tensor, edge_index: Tensor, drop_node: float, drop_
         edge_mask = edge_mask & (torch.rand(edge_mask.shape, generator=gen_edge, device=edge_mask.device) >= float(drop_edge))
     edge_filtered = edge_index[:, edge_mask]
     return keep_nodes, edge_filtered
+
+
+def _reindex_edge_index(edge_index: Tensor, keep_mask: Tensor) -> Tuple[Tensor, Tensor]:
+    """Reindexes an edge list into the compact index space defined by `keep_mask`."""
+    kept_indices = torch.nonzero(keep_mask, as_tuple=False).view(-1)
+    old_to_new = torch.full(
+        (int(keep_mask.numel()),),
+        -1,
+        dtype=torch.long,
+        device=keep_mask.device,
+    )
+    old_to_new[kept_indices] = torch.arange(kept_indices.numel(), dtype=torch.long, device=keep_mask.device)
+    if edge_index.numel() == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=edge_index.device), kept_indices
+    src = old_to_new[edge_index[0].to(torch.long)]
+    dst = old_to_new[edge_index[1].to(torch.long)]
+    valid = (src >= 0) & (dst >= 0)
+    if not bool(valid.any()):
+        return torch.empty((2, 0), dtype=torch.long, device=edge_index.device), kept_indices
+    return torch.stack([src[valid], dst[valid]], dim=0).contiguous(), kept_indices
+
+
+def _materialize_prefix_view(data: Data, keep_mask: Tensor, edge_index: Tensor) -> Data:
+    """Materializes a prefix-only graph view while preserving the original full graph."""
+    keep_mask = keep_mask.to(torch.bool)
+    full_edge_index = data.edge_index.to(torch.long)
+    full_x = data.x.to(torch.float32)
+    full_root_index = data.root_index.view(-1).to(torch.long)
+    full_shifted_times = data.node_time_minutes_shifted.to(torch.long)
+    full_times = data.node_time_minutes.to(torch.long)
+    full_node_uid = list(data.node_uid)
+    full_node_tweet_id = list(data.node_tweet_id)
+
+    prefix_edge_index, kept_indices = _reindex_edge_index(edge_index.to(torch.long), keep_mask)
+    keep_nodes = [int(index) for index in kept_indices.tolist()]
+    root_old = int(full_root_index[0].item())
+    if root_old not in keep_nodes:
+        raise ValueError("Prefix materialization dropped the root node.")
+    root_index_new = int(keep_nodes.index(root_old))
+    shifted_times_list = [int(full_shifted_times[index].item()) for index in keep_nodes]
+    full_nodes = [
+        (str(full_node_uid[index]), str(full_node_tweet_id[index]), int(full_times[index].item()))
+        for index in range(len(full_node_uid))
+    ]
+    full_edges = [(int(src), int(dst)) for src, dst in full_edge_index.t().tolist()]
+    reindexed_edges = [(int(src), int(dst)) for src, dst in prefix_edge_index.t().tolist()]
+
+    data.full_x = full_x
+    data.full_edge_index = full_edge_index
+    data.full_root_index = full_root_index
+    data.full_node_time_minutes = full_times
+    data.full_node_time_minutes_shifted = full_shifted_times
+    data.full_node_uid = full_node_uid
+    data.full_node_tweet_id = full_node_tweet_id
+
+    data.x = compute_structural_features(
+        nodes=full_nodes,
+        edges=full_edges,
+        keep_nodes=keep_nodes,
+        reindexed_edges=reindexed_edges,
+        root_index_new=root_index_new,
+        feature_time_scale=max(shifted_times_list) if len(shifted_times_list) > 0 else 1,
+        shifted_times_list=shifted_times_list,
+    )
+    data.edge_index = prefix_edge_index
+    data.root_index = torch.tensor([root_index_new], dtype=torch.long)
+    data.node_uid = [full_node_uid[index] for index in keep_nodes]
+    data.node_tweet_id = [full_node_tweet_id[index] for index in keep_nodes]
+    data.node_time_minutes = full_times[kept_indices].clone()
+    data.node_time_minutes_shifted = full_shifted_times[kept_indices].clone()
+    data.prefix_node_mask = torch.ones(int(len(keep_nodes)), dtype=torch.bool)
+    data.prefix_edge_index = data.edge_index.clone()
+    data.prefix_observed_ratio = float(keep_mask.float().mean().item())
+    if hasattr(data, "t"):
+        data.t = data.node_time_minutes_shifted.to(torch.float32)
+    for stale_attr in ("h0", "h1", "h_cat"):
+        if hasattr(data, stale_attr):
+            delattr(data, stale_attr)
+    return data
 
 
 class GraphDataset(InMemoryDataset):
@@ -196,7 +277,7 @@ class GraphDataset(InMemoryDataset):
         # Prefix and observability configuration
         prefix_cfg = prefix_cfg if prefix_cfg is not None else {}
         self._prefix_strategy = str(prefix_cfg.get("strategy", "none")).lower()
-        self._prefix_minutes = prefix_cfg.get("minutes", None)
+        self._prefix_minutes = prefix_cfg.get("window", prefix_cfg.get("minutes", None))
         self._prefix_k = prefix_cfg.get("k", None)
         self._prefix_include_root = bool(prefix_cfg.get("include_root", True))
 
@@ -374,9 +455,7 @@ class GraphDataset(InMemoryDataset):
                 root_index=root_idx,
                 include_root=self._prefix_include_root,
             )
-            data.prefix_node_mask = obs_mask
-            data.prefix_edge_index = edge_prefix
-            data.prefix_observed_ratio = float(obs_mask.float().mean().item())
+            data = _materialize_prefix_view(data, obs_mask, edge_prefix)
 
         return data
 
@@ -406,4 +485,3 @@ class GraphDataset(InMemoryDataset):
             labels: List[int] = [int(self._data.y[i].view(-1)[0].item()) for i in unique_indices]
             self._num_classes = int(max(labels) + 1)
         return self._num_classes
-

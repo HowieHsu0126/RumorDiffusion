@@ -1,7 +1,7 @@
 dataset:
   datasets: ["twitter15", "twitter16", "weibo", "pheme"]
   raw_root: "/share/home/hwxu/Researches/D2Plus/Input/raw"
-  processed_root: "/share/home/hwxu/Researches/D2Plus/Input/processed"
+  processed_root: "/share/home/hwxu/Researches/D2Plus/Input/processed_paper_aligned"
   split:
     type: stratified
     ratios: {"train": 0.8, "val": 0.1, "test": 0.1}
@@ -22,6 +22,10 @@ dataset:
         skip_unknown: true
         numeric: true
   early:
+    truncation:
+      mode: none
+      window:
+      unit: auto
     cutoff_minutes: 60
     enforce_root_component: true
   features:
@@ -50,4 +54,3 @@ dataset:
     overrides:
       weibo: "hop"
       pheme: "hop"
-

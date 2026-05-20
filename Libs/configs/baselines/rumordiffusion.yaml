@@ -31,7 +31,7 @@ model:
     weight: 0.05
     text:
       enabled: true
-      text_dim: 384
+      text_dim: 768
       fuse_mode: concat
       robust_text:
         noise_std: [0.0, 0.05, 0.1]
@@ -68,13 +68,13 @@ model:
       nlayers: 2
       dim_feedforward: 512
       dropout: 0.3
-  potentials_pair: [0, 1]
+  potentials_pair: [0, 1, 2, 3]
   loss:
     enable_pair_margin_loss: true
     enable_multi_pair_margin: true
     enable_tf_head_loss: true
     loss_logging: false
-    lambda_diffusion: 0.5
+    lambda_diffusion: 0.0
     # Original pair margin loss for true/false discrimination
     pair_margin_enabled: true
     pair_margin_m: 0.7
@@ -99,10 +99,18 @@ model:
     lr_d: 1.0e-4
     lambda_r1: 10.0
 evaluation:
-  early_obs_minutes: [10, 20, 30]
-  early_obs_minutes_overrides:
-    weibo: [1, 2, 3]
-    pheme: [1, 2, 3]
+  uncertainty:
+    sampling: stochastic_reverse
+    potential_readout: sampled_full_graph
+  early_observation:
+    default_windows: [10, 20, 30]
+    default_unit: minutes
+    windows_overrides:
+      weibo: [1, 2, 3]
+      pheme: [1, 2, 3]
+    unit_overrides:
+      weibo: hop
+      pheme: hop
   early_stop_overrides:
     weibo:
       rumor_classes: [1]
@@ -132,6 +140,7 @@ evaluation:
     rumor_classes: [1, 2, 3]
   sampling_sweep:
     enabled: true
+    windows: [10]
     samples: [1, 2, 4, 8]
     max_batches: 0
   threshold_sweep:
@@ -140,6 +149,16 @@ evaluation:
     tau_low: [0.2, 0.3, 0.4]
     tau_high: [0.6, 0.7, 0.8]
     gamma: [0.01, 0.02, 0.05]
+    display:
+      - tau_low: 0.2
+        tau_high: 0.6
+        gamma: 0.02
+      - tau_low: 0.3
+        tau_high: 0.7
+        gamma: 0.02
+      - tau_low: 0.4
+        tau_high: 0.8
+        gamma: 0.02
     max_batches: 0
   robustness:
     edge_dropout: [0.0, 0.1]

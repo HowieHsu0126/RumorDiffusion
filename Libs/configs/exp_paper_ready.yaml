@@ -2,7 +2,7 @@ experiment:
   seeds: [42, 3407, 126, 218, 91]
 dataset:
   name: twitter15
-  root: Input/processed
+  root: Input/processed_paper_aligned
   use_lp_edges: false
   text_normalization:
     lowercase: true
@@ -12,21 +12,29 @@ dataset:
     compress_repeated_chars: true
     keep_hashtag_text: true
   text_encoder:
-    model_name_or_path: /share/home/hwxu/Researches/D2Plus/Input/sentence_transformers_all_MiniLM_L6v2
+    model_name_or_path: /share/home/hwxu/Researches/D2Plus/Input/sentence_transformers_all_mpnet_base_v2
     batch_size: 32
-    cache_tag: minilm_transfer
-    cache_name: text_embs.pt
-    force_text_cache: false
-    normalize_embeddings: false
+    cache_tag: mpnet_paper_ready
+    cache_name: text_embs_mpnet_paper_ready.pt
+    force_text_cache: true
+    normalize_embeddings: true
     rebuild_cache: false
   observability_sweep:
     drop_node: [0.0, 0.1, 0.2]
     drop_edge: [0.0, 0.1, 0.2]
   prefix:
-    strategy: none
+    strategy: minutes
+    unit: minutes
+    window: 60
     minutes: 60
     k:
     include_root: true
+    window_overrides:
+      weibo: 3
+      pheme: 3
+    unit_overrides:
+      weibo: hop
+      pheme: hop
   observability:
     drop_edge: 0.0
     drop_node: 0.0
@@ -36,6 +44,7 @@ device:
   gpu_id: 0
   type: cuda
 evaluation:
+  ece_bins: 15
   class_names:
     0: non-rumor
     1: "true"
@@ -59,9 +68,19 @@ evaluation:
     max_batches: 0
   significance:
     enabled: true
-    baseline_models: [bigcn, tgat, lp_gcn, dga_fake]
+    reference_model: rumordiffusion
+    baseline_models: [bigcn, tgat, lp_gcn, dga_fake, agad, hpcl_cascade, tpso]
     metrics: [macro_f1, acc]
     n_bootstrap: 2000
+  early_observation:
+    default_windows: [10, 20, 30]
+    default_unit: minutes
+    windows_overrides:
+      weibo: [1, 2, 3]
+      pheme: [1, 2, 3]
+    unit_overrides:
+      weibo: hop
+      pheme: hop
 link_prediction:
   dropout: 0.3
   early_stopping_patience: 10
@@ -75,12 +94,12 @@ link_prediction:
   topk_per_node: 2
   weight_decay: 0.0
 outputs:
-  ckpt_dir: Output/ckpts/paper_ready
-  dir: Output/paper_ready/twitter15
-  log_dir: Output/logs/paper_ready
-  results_dir: Output/results/paper_ready
-  prediction_csv: Output/results/paper_ready/predictions.csv
-  revision_artifacts_csv: Output/results/paper_ready/revision_artifacts.csv
+  ckpt_dir: Output/ckpts/paper_aligned
+  dir: Output/paper_aligned/twitter15
+  log_dir: Output/logs/paper_aligned
+  results_dir: Output/results/paper_aligned
+  prediction_csv: Output/results/paper_aligned/predictions.csv
+  revision_artifacts_csv: Output/results/paper_aligned/revision_artifacts.csv
 sbatch:
   job_prefix: DPlus
   conda_env: hw
@@ -91,7 +110,7 @@ sbatch:
       gres: gpu:1
       cpus_per_task: 8
       mem: 32G
-      log_dir: Output/logs/paper_ready
+      log_dir: Output/logs/paper_aligned
       cuda_devices: [0]
     rumordiffusion_train:
       partition: gpu1
@@ -99,7 +118,7 @@ sbatch:
       gres: gpu:1
       cpus_per_task: 8
       mem: 48G
-      log_dir: Output/logs/paper_ready
+      log_dir: Output/logs/paper_aligned
       cuda_devices: [0]
     transfer:
       partition: gpu1
@@ -107,7 +126,7 @@ sbatch:
       gres: gpu:1
       cpus_per_task: 8
       mem: 32G
-      log_dir: Output/logs/paper_ready
+      log_dir: Output/logs/paper_aligned
       cuda_devices: [0]
     ablation:
       partition: gpu1
@@ -115,7 +134,7 @@ sbatch:
       gres: gpu:1
       cpus_per_task: 8
       mem: 32G
-      log_dir: Output/logs/paper_ready
+      log_dir: Output/logs/paper_aligned
       cuda_devices: [0]
     hparam:
       partition: gpu1
@@ -123,7 +142,7 @@ sbatch:
       gres: gpu:1
       cpus_per_task: 8
       mem: 32G
-      log_dir: Output/logs/paper_ready
+      log_dir: Output/logs/paper_aligned
       cuda_devices: [0]
     explain:
       partition: gpu1
@@ -131,7 +150,7 @@ sbatch:
       gres: gpu:1
       cpus_per_task: 8
       mem: 16G
-      log_dir: Output/logs/paper_ready
+      log_dir: Output/logs/paper_aligned
       cuda_devices: [0]
     explain_summary:
       partition: cpu
@@ -139,20 +158,20 @@ sbatch:
       gres: ""
       cpus_per_task: 2
       mem: 4G
-      log_dir: Output/logs/paper_ready
+      log_dir: Output/logs/paper_aligned
     motivation:
       partition: cpu
       nodelist: cpu04
       gres: ""
       cpus_per_task: 4
       mem: 16G
-      log_dir: Output/logs/paper_ready
+      log_dir: Output/logs/paper_aligned
 bench_models:
-  default: [textonly, bigcn, tgat, lp_gcn, dga_fake, rumordiffusion]
-  twitter15: [textonly, bigcn, tgat, lp_gcn, dga_fake, rumordiffusion]
-  twitter16: [textonly, bigcn, tgat, lp_gcn, dga_fake, rumordiffusion]
-  weibo: [textonly, bigcn, tgat, lp_gcn, dga_fake, rumordiffusion]
-  pheme: [textonly, bigcn, tgat, lp_gcn, dga_fake, rumordiffusion]
+  default: [textonly, bigcn, tgat, lp_gcn, dga_fake, agad, hpcl_cascade, tpso, rumordiffusion]
+  twitter15: [textonly, bigcn, tgat, lp_gcn, dga_fake, agad, hpcl_cascade, tpso, rumordiffusion]
+  twitter16: [textonly, bigcn, tgat, lp_gcn, dga_fake, agad, hpcl_cascade, tpso, rumordiffusion]
+  weibo: [textonly, bigcn, tgat, lp_gcn, dga_fake, agad, hpcl_cascade, tpso, rumordiffusion]
+  pheme: [textonly, bigcn, tgat, lp_gcn, dga_fake, agad, hpcl_cascade, tpso, rumordiffusion]
 multi_run:
   datasets: [twitter15, twitter16, weibo, pheme]
 transfer:
@@ -166,7 +185,7 @@ transfer:
     - Libs/configs/baselines/rumordiffusion.yaml
   ckpt_name: best.pt
   lp_edges_policy: require_existing
-  results_path: Output/results/paper_ready/transfer.csv
+  results_path: Output/results/paper_aligned/transfer.csv
   adaptation:
     target_split: train
     selection_split: val
@@ -176,7 +195,9 @@ rumordiffusion:
     validate_metadata: true
     require_config_hash: true
     allow_legacy: false
-    ctdm_dir: Output/ckpts/paper_ready
+    ctdm_dir: Output/ckpts/paper_aligned
+    ctdm_subdir: rumordiffusion_ctdm_mpnet_observed_prefix
+  cache_potentials_after_ctdm: true
   arbiter:
     dropout: 0.3
     freeze_ctdm: true
@@ -266,36 +287,50 @@ rumordiffusion:
       enabled: true
   dataset_overrides:
     weibo:
+      potentials_pair: [0, 1]
       arbiter:
         pair_ids: [0, 1]
       ctdm:
+        obs_minutes: 3
+        multiwindow:
+          enabled: true
+          min: 1
+          max: 3
         regularizers:
           pair_ids: [0, 1]
     pheme:
+      potentials_pair: [0, 1]
       arbiter:
         pair_ids: [0, 1]
       ctdm:
+        obs_minutes: 3
+        multiwindow:
+          enabled: true
+          min: 1
+          max: 3
         regularizers:
           pair_ids: [0, 1]
   adaptation:
     epochs: 6
-    batch_size: 4
+    batch_size: 1
+    eval_batch_size: 1
+    gradient_accumulation_steps: 4
     lr: 0.0001
     arbiter_lr: 0.0001
-    ctdm_lr: 0.00003
+    ctdm_lr: 0.00001
     weight_decay: 0.0001
     ema_decay: 0.995
-    confidence_threshold: 0.80
+    confidence_threshold: 0.95
     min_samples_per_class: 2
     pseudo_label_weight: 1.0
-    consistency_weight: 0.15
-    prototype_align_weight: 0.10
+    consistency_weight: 0.05
+    prototype_align_weight: 0.05
     use_class_reweighting: true
     logit_adjustment_strength: 0.15
-    ctdm_unfreeze_last_layers: 1
-    consistency_text_dropout: 0.10
+    ctdm_unfreeze_last_layers: 0
+    consistency_text_dropout: 0.05
     consistency_text_noise_std: 0.01
-    consistency_edge_drop_rate: 0.10
+    consistency_edge_drop_rate: 0.05
     consistency_obs_min: 10
     consistency_obs_max: 30
     target_prefix:
@@ -321,18 +356,22 @@ rumordiffusion:
       weight: 0.2
     pair_margin_enabled: true
     pair_margin_m: 0.7
+    lambda_diffusion: 0.0
     w_brier: 0.01
     w_cons: 0.05
-  potentials_dir: rd_potentials
+  potentials_dir: rd_potentials_observed_prefix
+  seed_scoped_potentials: true
   potentials_pair:
     - 0
     - 1
+    - 2
+    - 3
   text:
     backend: sentence-transformers
     enabled: true
     fuse_mode: concat
-    model: all-MiniLM-L6-v2
-    text_dim: 384
+    model: all-mpnet-base-v2
+    text_dim: 768
     robust_text:
       noise_std: [0.0, 0.05, 0.1]
       dropout_p: [0.0, 0.1, 0.2]
@@ -340,10 +379,10 @@ training:
   amp: true
   batch_size: 4
   batch_size_ctdm: 1
-  early_stopping_patience: 5
-  early_stopping_patience_ctdm: 4
-  epochs: 20
-  epochs_ctdm: 12
+  early_stopping_patience: 20
+  early_stopping_patience_ctdm: 20
+  epochs: 80
+  epochs_ctdm: 80
   grad_clip: 1.0
   lr: 0.0003
   lr_ctdm: 0.0003
@@ -352,7 +391,29 @@ training:
   weight_decay: 0.0001
   weight_decay_ctdm: 0.0001
   reuse_ctdm_pretrain: true
+  potentials_batch_size: 1
+  potentials_num_workers: 0
+  reuse_cached_potentials: true
+  joint_finetuning:
+    enabled: false
+    arbiter_lr: 0.0002
+    ctdm_lr: 0.00003
+    weight_decay: 0.0001
+    ctdm_unfreeze_last_layers: 1
+    trainable_heads:
+      - film
+      - readout
+      - full_to_latent
+      - eps_x
+      - eps_a
+      - time_embed
+      - class_embed
+      - text_proj
+      - text_fusion_layer
+      - gated_text_fusion
+      - multiscale_proj
+      - forecast_head
   max_batches_per_epoch:
-  min_epochs: 3
-  min_epochs_ctdm: 3
+  min_epochs: 20
+  min_epochs_ctdm: 20
   max_samples: 0

@@ -30,7 +30,10 @@ class DatasetConfig:
         label_allowed: Labels allowed to include.
         label_map: Mapping from string label to integer class id.
         label_skip_unknown: If true, skip samples with unknown labels.
-        cutoff_minutes: Early truncation time window in minutes.
+        truncation_mode: Processing-time truncation policy.
+        truncation_window: Optional processing-time observation window.
+        truncation_unit: Semantic unit for the processing-time window.
+        cutoff_minutes: Legacy processing cutoff retained for backward compatibility.
         enforce_root_component: Keep only the connected component containing the root.
         features_structural: List of structural feature names in order.
         augment_enabled: Whether to enable augmentation.
@@ -52,6 +55,9 @@ class DatasetConfig:
     label_map: Dict[str, int]
     label_skip_unknown: bool
     label_overrides: Dict[str, Dict[str, object]]
+    truncation_mode: str
+    truncation_window: Optional[int]
+    truncation_unit: str
     cutoff_minutes: int
     enforce_root_component: bool
     features_structural: List[str]
@@ -101,6 +107,16 @@ def load_config(config_path: str) -> DatasetConfig:
     saving = cfg["saving"]
     text_cfg = cfg.get("text", {})
     time_cfg = cfg.get("time_source", {})
+    truncation_cfg = early.get("truncation", {})
+    if len(truncation_cfg) == 0:
+        truncation_mode = "window"
+        truncation_window = int(early["cutoff_minutes"])
+        truncation_unit = "minutes"
+    else:
+        truncation_mode = str(truncation_cfg.get("mode", "window")).lower()
+        truncation_window_raw = truncation_cfg.get("window", None)
+        truncation_window = None if truncation_window_raw in (None, "") else int(truncation_window_raw)
+        truncation_unit = str(truncation_cfg.get("unit", "auto")).lower()
 
     return DatasetConfig(
         datasets=list(cfg["datasets"]),
@@ -117,6 +133,9 @@ def load_config(config_path: str) -> DatasetConfig:
         label_map={str(k): int(v) for k, v in labels["map"].items()},
         label_skip_unknown=bool(labels["skip_unknown"]),
         label_overrides={str(k): dict(v) for k, v in labels.get("overrides", {}).items()},
+        truncation_mode=truncation_mode,
+        truncation_window=truncation_window,
+        truncation_unit=truncation_unit,
         cutoff_minutes=int(early["cutoff_minutes"]),
         enforce_root_component=bool(early["enforce_root_component"]),
         features_structural=list(features["structural"]),
@@ -240,6 +259,28 @@ def collect_json_source_texts(raw_dir: str) -> Dict[str, str]:
     return mapping
 
 
+def try_reuse_text_embedding_cache(out_path: str, processed_root: str, dataset: str, cache_name: str, expected_ids: List[str]) -> bool:
+    """Copies an identical existing text cache from a sibling processed root when available."""
+    root_dir = os.path.abspath(os.path.dirname(processed_root))
+    candidate_roots = [
+        os.path.join(root_dir, "processed"),
+        os.path.join(root_dir, "processed_paper_aligned"),
+    ]
+    normalized_out = os.path.abspath(out_path)
+    for candidate_root in candidate_roots:
+        candidate_path = os.path.join(candidate_root, dataset, str(cache_name))
+        if os.path.abspath(candidate_path) == normalized_out or not os.path.isfile(candidate_path):
+            continue
+        obj = torch.load(candidate_path, weights_only=False)
+        candidate_ids = list(obj.get("ids", []))
+        if candidate_ids != expected_ids:
+            continue
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        torch.save(obj, out_path)
+        return True
+    return False
+
+
 def build_text_embedding_cache(dataset: str,
                                raw_root: str,
                                processed_root: str,
@@ -261,47 +302,11 @@ def build_text_embedding_cache(dataset: str,
     sid_to_text = parse_source_texts(raw_dir)
     ids = sorted(sid_to_text.keys())
     texts = [normalize_tweet_text(sid_to_text[sid], normalization_cfg) for sid in ids]
+    if try_reuse_text_embedding_cache(out_path, processed_root, dataset, cache_name, ids):
+        return out_path
 
-    # Encode texts using sentence-transformers
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     model_path = resolve_text_model_path(model_name, raw_root)
-    print(f"Loading model from: {model_path}")
-    
-    # Try to load with transformers directly first
-    try:
-        from transformers import AutoModel, AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        model = AutoModel.from_pretrained(model_path)
-        model.to(device)
-        
-        # Create a simple encoder function
-        def encode_texts(texts, batch_size=64):
-            embeddings = []
-            for i in range(0, len(texts), batch_size):
-                batch_texts = texts[i:i+batch_size]
-                inputs = tokenizer(batch_texts, padding=True, truncation=True, return_tensors="pt")
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-                with torch.no_grad():
-                    outputs = model(**inputs)
-                    # Use mean pooling
-                    embeddings_batch = outputs.last_hidden_state.mean(dim=1)
-                    embeddings.append(embeddings_batch.cpu())
-            return torch.cat(embeddings, dim=0)
-        
-        # Use the custom encoder
-        emb = encode_texts(texts, batch_size=int(batch_size))
-        
-    except Exception as e:
-        print(f"Failed to load with transformers: {e}")
-        # Fallback to sentence-transformers
-        from sentence_transformers import SentenceTransformer
-
-        encoder = SentenceTransformer(model_path, device=device)
-        emb = encoder.encode(texts, batch_size=int(batch_size), convert_to_tensor=True, normalize_embeddings=False)
-        emb = emb.to(torch.float32).cpu()
-    
-    # Ensure float32
-    emb = emb.to(torch.float32)
+    emb = _encode_texts_transformer_mean_pool(texts, model_path=model_path, batch_size=batch_size)
 
     obj = {
         "model": str(model_name),
@@ -336,13 +341,10 @@ def _encode_texts_sentence_transformer(texts: List[str],
 def _encode_texts_transformer_mean_pool(texts: List[str],
                                         model_path: str,
                                         batch_size: int = 64) -> Tensor:
-    """Encodes texts using a local sentence-transformer, with HF mean-pool fallback."""
+    """Encodes texts with a PyTorch HuggingFace encoder and mean pooling."""
     os.environ["USE_TF"] = "0"
     os.environ["USE_TORCH"] = "1"
     os.environ["TRANSFORMERS_NO_TF"] = "1"
-    if os.path.isfile(os.path.join(model_path, "modules.json")):
-        return _encode_texts_sentence_transformer(texts, model_path=model_path, batch_size=batch_size)
-
     from transformers import AutoModel, AutoTokenizer
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -391,6 +393,8 @@ def build_text_embedding_cache_from_mapping(dataset: str,
     out_path = os.path.join(out_dir, str(cache_name))
     ids = sorted(mapping.keys())
     texts = [normalize_tweet_text(mapping[i], normalization_cfg) for i in ids]
+    if try_reuse_text_embedding_cache(out_path, processed_root, dataset, cache_name, ids):
+        return out_path
     emb = _encode_texts_transformer_mean_pool(texts, model_path=model_path, batch_size=batch_size)
     obj = {
         "model": str(model_path),
@@ -474,14 +478,15 @@ def parse_tree_file(path: str) -> Tuple[List[Tuple[str, str, int]], List[Tuple[i
     return nodes, edges
 
 
-def truncate_early(nodes: List[Tuple[str, str, int]],
-                   edges: List[Tuple[int, int]],
-                   cutoff_minutes: int,
-                   enforce_root_component: bool) -> Tuple[List[int], List[Tuple[int, int]], int, List[int]]:
-    """Applies time-based truncation and optional root-component filtering.
+def select_observation_view(nodes: List[Tuple[str, str, int]],
+                            edges: List[Tuple[int, int]],
+                            truncation_mode: str,
+                            truncation_window: Optional[int],
+                            enforce_root_component: bool) -> Tuple[List[int], List[Tuple[int, int]], int, List[int]]:
+    """Applies an explicit processing-time observation policy.
 
     Returns:
-        keep_nodes: indices of nodes kept after truncation and filtering
+        keep_nodes: indices of nodes kept after filtering
         keep_edges: edges reindexed within kept nodes
         root_index_new: index of root node in the reindexed space
     """
@@ -489,10 +494,20 @@ def truncate_early(nodes: List[Tuple[str, str, int]],
     original_times = torch.tensor([t for (_, _, t) in nodes], dtype=torch.long)
     min_time = int(original_times.min().item())
     shifted_times = original_times - min_time
-    keep_mask = shifted_times <= cutoff_minutes
+    mode = str(truncation_mode).lower()
+    if mode == "none":
+        keep_mask = torch.ones_like(shifted_times, dtype=torch.bool)
+    elif mode in {"window", "minutes", "hop"}:
+        if truncation_window is None or int(truncation_window) <= 0:
+            raise ValueError(
+                f"Processing truncation mode '{mode}' requires a positive window, got {truncation_window}."
+            )
+        keep_mask = shifted_times <= int(truncation_window)
+    else:
+        raise ValueError(f"Unsupported processing truncation mode: {truncation_mode}")
     keep_nodes = [i for i, k in enumerate(keep_mask.tolist()) if k]
     if not keep_nodes:
-        raise ValueError("No nodes kept after truncation")
+        raise ValueError("No nodes kept after applying the observation policy")
 
     # Identify root as node with minimal time (prefer time==0)
     min_kept_time = int(shifted_times[keep_mask].min().item())
@@ -538,12 +553,21 @@ def truncate_early(nodes: List[Tuple[str, str, int]],
     return keep_nodes, reindexed_edges, root_index_new, shifted_times_list
 
 
+def resolve_feature_time_scale(shifted_times_list: List[int], explicit_window: Optional[int] = None) -> int:
+    """Resolves the normalization scale used by time-derived structural features."""
+    if explicit_window is not None and int(explicit_window) > 0:
+        return int(explicit_window)
+    if len(shifted_times_list) == 0:
+        return 1
+    return max(1, max(int(value) for value in shifted_times_list))
+
+
 def compute_structural_features(nodes: List[Tuple[str, str, int]],
                                 edges: List[Tuple[int, int]],
                                 keep_nodes: List[int],
                                 reindexed_edges: List[Tuple[int, int]],
                                 root_index_new: int,
-                                cutoff_minutes: int,
+                                feature_time_scale: Optional[int],
                                 shifted_times_list: List[int]) -> Tensor:
     """Computes structural node features.
 
@@ -553,7 +577,8 @@ def compute_structural_features(nodes: List[Tuple[str, str, int]],
     """
     num_nodes = len(keep_nodes)
     times = torch.tensor(shifted_times_list, dtype=torch.float32)
-    norm_time = times / float(max(1, cutoff_minutes))
+    time_scale = float(resolve_feature_time_scale(shifted_times_list, feature_time_scale))
+    norm_time = times / time_scale
     norm_time = torch.clamp(norm_time, 0.0, 1.0)
 
     # Build undirected adjacency for BFS depth
@@ -582,7 +607,7 @@ def compute_structural_features(nodes: List[Tuple[str, str, int]],
         out_degree[u] += 1.0
         in_degree[v] += 1.0
 
-    # Parent-child time delta (minutes), normalized by cutoff_minutes.
+    # Parent-child time delta, normalized by the feature time scale.
     # For nodes without an incoming edge, the delta is 0.
     parents: Dict[int, List[int]] = {i: [] for i in range(num_nodes)}
     for u, v in reindexed_edges:
@@ -597,7 +622,7 @@ def compute_structural_features(nodes: List[Tuple[str, str, int]],
             parent_delta[v] = torch.clamp(delta, min=0.0)
         else:
             parent_delta[v] = 0.0
-    parent_delta_norm = torch.clamp(parent_delta / float(max(1, cutoff_minutes)), 0.0, 1.0)
+    parent_delta_norm = torch.clamp(parent_delta / time_scale, 0.0, 1.0)
 
     # Time speed: arrival time relative to depth (captures propagation velocity)
     # Nodes with high time but low depth have fast propagation
@@ -606,7 +631,7 @@ def compute_structural_features(nodes: List[Tuple[str, str, int]],
         times / (depth + 1.0),
         times
     )
-    time_speed_norm = torch.clamp(time_speed / float(max(1, cutoff_minutes)), 0.0, 1.0)
+    time_speed_norm = torch.clamp(time_speed / time_scale, 0.0, 1.0)
 
     # Time gradient: average time difference with neighbors
     time_gradient = torch.zeros(num_nodes, dtype=torch.float32)
@@ -617,12 +642,12 @@ def compute_structural_features(nodes: List[Tuple[str, str, int]],
             time_gradient[i] = torch.abs(times[i] - torch.mean(neighbor_times))
         else:
             time_gradient[i] = 0.0
-    time_gradient_norm = torch.clamp(time_gradient / float(max(1, cutoff_minutes)), 0.0, 1.0)
+    time_gradient_norm = torch.clamp(time_gradient / time_scale, 0.0, 1.0)
 
     # Root time delta: direct time difference with root node
     root_time = times[root_index_new]
     root_time_delta = torch.abs(times - root_time)
-    root_time_delta_norm = torch.clamp(root_time_delta / float(max(1, cutoff_minutes)), 0.0, 1.0)
+    root_time_delta_norm = torch.clamp(root_time_delta / time_scale, 0.0, 1.0)
 
     x = torch.stack([
         norm_time, depth, in_degree, out_degree, parent_delta_norm,
@@ -678,10 +703,11 @@ def build_pyg_data(nodes: List[Tuple[str, str, int]],
                    keep_nodes: List[int],
                    reindexed_edges: List[Tuple[int, int]],
                    root_index_new: int,
-                   cutoff_minutes: int,
+                   feature_time_scale: Optional[int],
                    shifted_times_list: List[int],
                    label_id: int,
-                   source_id: str) -> Data:
+                   source_id: str,
+                   time_unit: str) -> Data:
     num_nodes = len(keep_nodes)
     if num_nodes == 0:
         raise ValueError("No nodes after filtering")
@@ -692,7 +718,7 @@ def build_pyg_data(nodes: List[Tuple[str, str, int]],
         keep_nodes,
         reindexed_edges,
         root_index_new,
-        cutoff_minutes,
+        feature_time_scale,
         shifted_times_list,
     )
     edge_index = torch.tensor(
@@ -717,6 +743,7 @@ def build_pyg_data(nodes: List[Tuple[str, str, int]],
     data.node_tweet_id = node_tid
     data.node_time_minutes = node_time
     data.node_time_minutes_shifted = node_time_shifted
+    data.time_unit = str(time_unit)
     return data
 
 
@@ -915,10 +942,11 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
             label_id = label_cfg.mapping[label_name]
 
             nodes, edges = parse_json_tree(obj, time_source=time_source)
-            keep_nodes, re_e, root_new, shifted_times = truncate_early(
+            keep_nodes, re_e, root_new, shifted_times = select_observation_view(
                 nodes,
                 edges,
-                cfg.cutoff_minutes,
+                cfg.truncation_mode,
+                cfg.truncation_window,
                 cfg.enforce_root_component,
             )
 
@@ -928,10 +956,11 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
                 keep_nodes,
                 re_e,
                 root_new,
-                cfg.cutoff_minutes,
+                resolve_feature_time_scale(shifted_times, cfg.truncation_window),
                 shifted_times,
                 label_id,
                 str(source_id),
+                time_source,
             )
             assert str(source_id) in id_to_idx, f"Text embedding missing for source {source_id}"
             row = int(id_to_idx[str(source_id)])
@@ -1005,10 +1034,11 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
         assert source_id in sid_to_text, f"Missing text for source {source_id}"
 
         nodes, edges = parse_tree_file(fpath)
-        keep_nodes, re_e, root_new, shifted_times = truncate_early(
+        keep_nodes, re_e, root_new, shifted_times = select_observation_view(
             nodes,
             edges,
-            cfg.cutoff_minutes,
+            cfg.truncation_mode,
+            cfg.truncation_window,
             cfg.enforce_root_component,
         )
 
@@ -1018,10 +1048,11 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
             keep_nodes,
             re_e,
             root_new,
-            cfg.cutoff_minutes,
+            resolve_feature_time_scale(shifted_times, cfg.truncation_window),
             shifted_times,
             label_id,
             source_id,
+            time_source,
         )
         assert source_id in id_to_idx, f"Text embedding missing for source {source_id}"
         row = int(id_to_idx[source_id])

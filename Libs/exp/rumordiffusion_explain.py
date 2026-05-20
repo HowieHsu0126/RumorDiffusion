@@ -25,8 +25,10 @@ from Libs.data.dataset import GraphDataset
 from Libs.exp.run import (apply_dataset_overrides, _deep_merge,
                           ensure_text_embedding_cache, load_checkpoint_state,
                           make_graph_dataset, read_yaml_like,
+                          resolve_early_observation_spec,
                           resolve_dataset_text_runtime_cfg,
                           resolve_max_nodes_setting,
+                          scan_max_nodes_across_splits,
                           validate_rumordiffusion_pair_config)
 from Libs.models.baselines.CTDM_syn import CTDMSyn
 from Libs.models.baselines.RumorDiffusion import RumorDiffusion
@@ -59,10 +61,7 @@ def resolve_rd_cfg(exp_cfg: Dict, model_cfg: Dict, dataset_name: str, num_classe
 
 def resolve_ctdm_max_nodes(ds: GraphDataset, ctdm_cfg: Dict) -> int:
     """Resolves CTDM max-nodes budget from the dataset split and YAML config."""
-    scanned_max_nodes = 0
-    for idx in range(len(ds)):
-        sample = ds.get(idx)
-        scanned_max_nodes = max(scanned_max_nodes, int(sample.num_nodes))
+    scanned_max_nodes = scan_max_nodes_across_splits([ds])
     configured_max_nodes = int(ctdm_cfg.get("max_nodes", 0) or 0)
     return resolve_max_nodes_setting(
         scanned_max_nodes=scanned_max_nodes,
@@ -267,13 +266,11 @@ def parse_source_ids(raw_value: str) -> List[str]:
 def resolve_case_trace_cfg(dataset_name: str, rd_cfg: Dict, rd_eval_cfg: Dict, cli_source_ids: List[str]) -> Dict:
     """Builds the case-study trace configuration from YAML and CLI overrides."""
     explain_cfg = rd_cfg.get("explain", {}) if isinstance(rd_cfg.get("explain", {}), dict) else {}
-
-    obs_minutes = explain_cfg.get("obs_minutes", rd_eval_cfg.get("early_obs_minutes", []))
-    early_overrides = rd_eval_cfg.get("early_obs_minutes_overrides", {}) if isinstance(
-        rd_eval_cfg.get("early_obs_minutes_overrides", {}), dict
-    ) else {}
-    if dataset_name in early_overrides and "obs_minutes" not in explain_cfg:
-        obs_minutes = early_overrides[dataset_name]
+    obs_minutes, observation_unit = resolve_early_observation_spec(
+        eval_cfg={},
+        model_eval_cfg=rd_eval_cfg,
+        dataset_name=dataset_name,
+    )
     if not obs_minutes:
         obs_minutes = [int(rd_cfg.get("ctdm", {}).get("obs_minutes", 30))]
     obs_minutes = [int(v) for v in obs_minutes]
@@ -293,6 +290,7 @@ def resolve_case_trace_cfg(dataset_name: str, rd_cfg: Dict, rd_eval_cfg: Dict, c
     return {
         "enabled": bool(explain_cfg.get("enabled", True)),
         "obs_minutes": obs_minutes,
+        "observation_unit": str(explain_cfg.get("observation_unit", observation_unit)),
         "samples": int(explain_cfg.get("samples", early_stop_cfg.get("samples", 2))),
         "tau_low": float(explain_cfg.get("tau_low", early_stop_cfg.get("tau_low", 0.3))),
         "tau_high": float(explain_cfg.get("tau_high", early_stop_cfg.get("tau_high", 0.7))),

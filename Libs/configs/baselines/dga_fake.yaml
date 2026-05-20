@@ -2,7 +2,7 @@ name: dga_fake
 model:
   # Core dimensions
   hidden: 128           # d in the spec
-  text_dim: 384         # sentence-transformer output dim
+  text_dim: 768         # sentence-transformer output dim
   content_dropout: 0.1
 
   # Sequence encoder (history)

@@ -19,7 +19,7 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   GRES=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "gres" "")
   CPUS_PER_TASK=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "cpus_per_task" "4")
   MEM=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "mem" "16G")
-  LOG_DIR=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "log_dir" "Output/logs/paper_ready")
+  LOG_DIR=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "log_dir" "Output/logs/paper_aligned")
   CONDA_ENV=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "conda_env" "hw")
   DEPENDENCY_VALUE="${SBATCH_DEPENDENCY:-}"
   JOB_NAME="${JOB_PREFIX}_motivation"
@@ -49,7 +49,7 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
 fi
 
 CONDA_ENV="${CONDA_ENV_OVERRIDE:-$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "conda_env" "hw")}"
-LOG_DIR=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "log_dir" "Output/logs/paper_ready")
+LOG_DIR=$(profile_get "${EXP_CFG_DEFAULT}" "${PROFILE}" "log_dir" "Output/logs/paper_aligned")
 activate_conda_env "${CONDA_ENV}"
 cd /share/home/hwxu/Researches/D2Plus
 mkdir -p "${LOG_DIR}"

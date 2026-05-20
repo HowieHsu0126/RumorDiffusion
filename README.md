@@ -5,7 +5,8 @@ To address the difficulty of early rumor detection under sparse and incomplete s
 ## Repository Layout
 
 - `Input/raw/` — raw datasets (Twitter-style: `tree/*.txt`, `label.txt`, `source_tweets.txt`; JSON-style: `.json` with `source` + `comment`).
-- `Input/processed/<dataset>/` — processed PyG data (`pyg/data.pt`, `pyg/slices.pt`, `splits.json`, optional `text_embs.pt`).
+- `Input/processed_paper_aligned/<dataset>/` — canonical paper-aligned PyG data (`pyg/data.pt`, `pyg/slices.pt`, `splits.json`, optional `text_embs.pt`); experiments materialize the observed-prefix view from YAML at load time.
+- `Input/processed/<dataset>/` — legacy processed data retained for traceability.
 - `Input/sentence_transformers_all_MiniLM_L6v2/` — local text encoder checkpoint used by preprocessing (adjust path in YAML if different).
 - `Libs/configs/` — experiment configs (`exp.yaml`, `exp_smoke.yaml`), dataset config, and model/baseline configs in `baselines/`.
 - `Libs/exp/` — training/eval runner (`run.py`) and analysis tools.
@@ -32,12 +33,13 @@ Download all data (raw data, processed data, and sentence transformer weights) f
 The extracted structure should include:
 
 - `Input/raw/` — raw datasets (Twitter-style: `tree/*.txt`, `label.txt`, `source_tweets.txt`; JSON-style: `.json` with `source` + `comment`).
-- `Input/processed/<dataset>/` — processed PyG data (`pyg/data.pt`, `pyg/slices.pt`, `splits.json`, optional `text_embs.pt`).
+- `Input/processed_paper_aligned/<dataset>/` — canonical paper-aligned PyG data (`pyg/data.pt`, `pyg/slices.pt`, `splits.json`, optional `text_embs.pt`); prefix truncation and feature recomputation are controlled by the experiment YAML.
+- `Input/processed/<dataset>/` — legacy processed data retained for traceability.
 - `Input/sentence_transformers_all_MiniLM_L6v2/` — text encoder checkpoint used by preprocessing (adjust path in YAML if different).
 
 ## Preprocessing
 
-Generate processed PyG data from raw:
+Generate canonical paper-aligned PyG data from raw:
 
 ```
 python -m Libs.data.processor \
@@ -56,6 +58,8 @@ python -m Libs.data.processor \
 
 Adjust `--dataset` to one of `twitter15`, `twitter16`, `weibo`, `pheme`. Update paths in YAML if your `Input/` location differs.
 
+`Libs/configs/dataset.yaml` now writes to `Input/processed_paper_aligned` by default so that paper-aligned rebuilds do not overwrite the legacy truncated data tree.
+
 Quickstart (smoke test)
 ---
 
@@ -67,7 +71,7 @@ python -m Libs.exp.run \
   --model Libs/configs/baselines/rumordiffusion.yaml
 ```
 
-Edit the YAML paths (`dataset.root`, `outputs.*`) if your data/output directories differ.
+`exp_smoke.yaml` and `exp_paper_ready.yaml` target the paper-aligned roots by default.
 
 ## Training & Evaluation
 
@@ -117,7 +121,7 @@ Outputs:
 
 ## Benchmark scripts (SLURM, optional)
 
-Helper scripts read `Libs/configs/exp.yaml` and submit jobs. Example (Twitter15):
+Helper scripts for the paper-aligned pipeline read `Libs/configs/exp_paper_ready.yaml` and submit jobs. Example (Twitter15):
 
 ```
 sbatch Libs/scripts/run_bench_twitter15.sh

@@ -843,14 +843,16 @@ class CTDMSyn(nn.Module):
         Returns:
             (A_full [N,N], X_full [N,D])
         """
-        n = int(data.num_nodes)
+        full_edge_index = data.full_edge_index.to(torch.long) if hasattr(data, "full_edge_index") else data.edge_index.to(torch.long)
+        full_x = data.full_x.to(torch.float32) if hasattr(data, "full_x") else data.x.to(torch.float32)
+        n = int(full_x.size(0))
         if n > self.max_nodes:
             raise ValueError(
                 f"Full graph has {n} nodes, which exceeds configured max_nodes={self.max_nodes}. "
-                "Increase max_nodes or resolve it automatically from the training split."
+                "Increase max_nodes or resolve it automatically from active dataset splits."
             )
-        A = _build_adj_from_edge_index(data.edge_index.to(torch.long), n)
-        X = data.x.to(torch.float32)
+        A = _build_adj_from_edge_index(full_edge_index, n)
+        X = full_x
         A = _pad_adj(A, self.max_nodes)
         X = _pad_x(X, self.max_nodes)
         return A, X
@@ -874,7 +876,7 @@ class CTDMSyn(nn.Module):
         if n_obs > self.max_nodes:
             raise ValueError(
                 f"Observed prefix has {n_obs} nodes, which exceeds configured max_nodes={self.max_nodes}. "
-                "Increase max_nodes or resolve it automatically from the training split."
+                "Increase max_nodes or resolve it automatically from active dataset splits."
             )
         A_obs = _build_adj_from_edge_index(edge_obs, n_obs)
         X_obs = data.x[mask].to(torch.float32)
@@ -1137,6 +1139,43 @@ class CTDMSyn(nn.Module):
             return self.readout(H, node_mask)
         return H.mean(dim=1)
 
+    def _unflatten_batch_AX(self, G: Tensor) -> Tuple[Tensor, Tensor]:
+        N = int(self.max_nodes)
+        D = int(self.in_channels)
+        adj_list: List[Tensor] = []
+        x_list: List[Tensor] = []
+        for b in range(int(G.size(0))):
+            A_b, X_b = _unflatten_AX(G[b], N, D)
+            adj_list.append(A_b)
+            x_list.append(X_b)
+        return torch.stack(adj_list, dim=0), torch.stack(x_list, dim=0)
+
+    def _potential_readout_mask(self, G0: Tensor, X_obs_last: Tensor, readout_source: str) -> Tensor:
+        source = str(readout_source).lower()
+        if source in {"observed", "observed_prefix"}:
+            return X_obs_last
+        if source != "sampled_full_graph":
+            raise ValueError(
+                "CTDM potential readout_source must be one of "
+                "'observed_prefix' or 'sampled_full_graph'."
+            )
+        _A_full, X_full = self._unflatten_batch_AX(G0)
+        return X_full.to(device=X_obs_last.device, dtype=X_obs_last.dtype)
+
+    def _potential_readout(
+        self,
+        H: Tensor,
+        G_state: Tensor,
+        G0: Tensor,
+        X_obs_last: Tensor,
+        readout_source: str,
+    ) -> Tensor:
+        source = str(readout_source).lower()
+        readout_mask = self._potential_readout_mask(G0, X_obs_last, source)
+        if source in {"observed", "observed_prefix"}:
+            return self._graph_readout(H, readout_mask)
+        return self._graph_readout(H, readout_mask)
+
     def _fuse_text_embedding(self, h_graph: Tensor, batch) -> Tensor:
         """Fuse text embeddings into graph-level representation.
         
@@ -1176,7 +1215,13 @@ class CTDMSyn(nn.Module):
             return h_graph
 
     @torch.no_grad()
-    def infer_potential_single(self, batch, class_id: int, stride: Optional[int] = None) -> Tensor:
+    def infer_potential_single(
+        self,
+        batch,
+        class_id: int,
+        stride: Optional[int] = None,
+        readout_source: str = "observed_prefix",
+    ) -> Tensor:
         """Runs a reverse denoising trajectory under a class hypothesis and
         returns graph-level potential embeddings from the final hidden states.
 
@@ -1184,12 +1229,14 @@ class CTDMSyn(nn.Module):
             batch: PyG Batch for a mini-batch of graphs.
             class_id: Integer class hypothesis in [0, C).
             stride: Optional step stride for faster inference.
+            readout_source: Node mask source for the final potential readout.
 
         Returns:
             Tensor [B, hidden_channels] potential vectors.
         """
         device = next(self.parameters()).device
         G0, Gobs, Mobs, _ = self._pack_batch_G(batch)
+        G0 = G0.to(device)
         Gobs = Gobs.to(device)
         Mobs = Mobs.to(device)
         B, L = int(Gobs.size(0)), int(Gobs.size(1))
@@ -1200,28 +1247,35 @@ class CTDMSyn(nn.Module):
         step_stride = max(1, step_stride)
         for step in range(self.T, 0, -step_stride):
             t = torch.full((B,), int(step), dtype=torch.long, device=device)
+            prev_t = torch.full((B,), max(0, int(step) - step_stride), dtype=torch.long, device=device)
             # CFG combine conditional/unconditional predictions
             pred_c = self._pred_theta(Gt, t, y_h, Gobs, drop_mask=None)
             pred_u = self._pred_theta(Gt, t, None, Gobs, drop_mask=None)
             pred = pred_u + self.guidance_scale * (pred_c - pred_u)
             eps_pred = self._to_eps(Gt, t, pred)
-            mean, _var = self._posterior_mean_variance(Gt, t, eps_pred)
-            Gt = mean
+            Gt = self._reverse_inference_update(Gt, t, eps_pred, prev_t)
             Gt = self._mask_observed(Gt, Gobs, Mobs)
         assert self._last_hidden is not None
         H = self._last_hidden
         X_obs_last = self._last_xobs
-        h = self._graph_readout(H, X_obs_last)
+        assert X_obs_last is not None
+        h = self._potential_readout(H, Gt, G0, X_obs_last, readout_source)
         h = self._fuse_text_embedding(h, batch)
         return h
 
     @torch.no_grad()
-    def infer_potentials_all(self, batch, stride: Optional[int] = None) -> Tensor:
+    def infer_potentials_all(
+        self,
+        batch,
+        stride: Optional[int] = None,
+        readout_source: str = "observed_prefix",
+    ) -> Tensor:
         """Computes potential embeddings for all classes.
 
         Args:
             batch: PyG Batch.
             stride: Optional step stride.
+            readout_source: Node mask source for the final potential readout.
 
         Returns:
             Tensor [B, C, hidden_channels].
@@ -1229,12 +1283,30 @@ class CTDMSyn(nn.Module):
         B = int(batch.y.size(0)) if hasattr(batch, "y") else None
         outs: List[Tensor] = []
         for cls in range(self.num_classes):
-            h = self.infer_potential_single(batch, class_id=int(cls), stride=stride)
+            h = self.infer_potential_single(
+                batch,
+                class_id=int(cls),
+                stride=stride,
+                readout_source=readout_source,
+            )
             outs.append(h)
         Hc = torch.stack(outs, dim=1)
         if B is not None:
             assert int(Hc.size(0)) == B
         return Hc
+
+    @torch.no_grad()
+    def sample_potentials_all(
+        self,
+        batch,
+        stride: Optional[int] = None,
+        readout_source: str = "sampled_full_graph",
+    ) -> Tensor:
+        return self.infer_potentials_all(
+            batch,
+            stride=stride,
+            readout_source=readout_source,
+        )
 
     def potentials_all_grad(self, batch, stride: Optional[int] = None) -> Tensor:
         """Gradient-enabled version of infer_potentials_all.
@@ -1255,12 +1327,12 @@ class CTDMSyn(nn.Module):
             Gt = torch.randn((B, L), device=device)
             for step in range(self.T, 0, -step_stride):
                 t = torch.full((B,), int(step), dtype=torch.long, device=device)
+                prev_t = torch.full((B,), max(0, int(step) - step_stride), dtype=torch.long, device=device)
                 pred_c = self._pred_theta(Gt, t, y_h, Gobs, drop_mask=None)
                 pred_u = self._pred_theta(Gt, t, None, Gobs, drop_mask=None)
                 pred = pred_u + self.guidance_scale * (pred_c - pred_u)
                 eps_pred = self._to_eps(Gt, t, pred)
-                mean, _var = self._posterior_mean_variance(Gt, t, eps_pred)
-                Gt = mean
+                Gt = self._reverse_inference_update(Gt, t, eps_pred, prev_t)
                 Gt = self._mask_observed(Gt, Gobs, Mobs)
             H = self._last_hidden
             X_obs_last = self._last_xobs
@@ -1279,11 +1351,17 @@ class CTDMSyn(nn.Module):
         Gt = (alpha_bar.sqrt() * G0) + ((1.0 - alpha_bar).sqrt() * noise)
         return Gt, noise
 
-    def training_step(self, batch) -> Tuple[Tensor, float]:
-        """Returns (loss, aux_acc) for a training step using diffusion objective."""
+    def _objective_loss(self, batch, update_prototypes: bool) -> Tensor:
+        """Computes the diffusion pretraining objective used by stage one."""
         device = next(self.parameters()).device
         if self.multiwindow_enabled:
-            obs_override = int(torch.randint(low=int(self.cutoff_min), high=int(self.cutoff_max) + 1, size=(1,)).item())
+            obs_override = int(
+                torch.randint(
+                    low=int(self.cutoff_min),
+                    high=int(self.cutoff_max) + 1,
+                    size=(1,),
+                ).item()
+            )
             G0, Gobs, Mobs, y = self._pack_batch_G(batch, obs_minutes_override=obs_override)
         else:
             G0, Gobs, Mobs, y = self._pack_batch_G(batch)
@@ -1293,7 +1371,6 @@ class CTDMSyn(nn.Module):
         B = int(G0.size(0))
         t = torch.randint(low=1, high=self.T + 1, size=(B,), device=device)
         Gt, noise = self._q_sample(G0, t)
-        # Classifier-free guidance dropout during training
         if self.guidance_p > 0.0:
             drop_mask = (torch.rand((B,), device=device) < float(self.guidance_p))
         else:
@@ -1305,7 +1382,6 @@ class CTDMSyn(nn.Module):
         assert int(target.shape[1]) == int(pred.shape[1])
         loss = ((target - pred) ** 2).mean()
 
-        # Auxiliary prototype-contrastive loss
         H = self._last_hidden
         X_obs_last = self._last_xobs
         assert H is not None and X_obs_last is not None
@@ -1314,27 +1390,22 @@ class CTDMSyn(nn.Module):
         proto_loss = self._compute_prototype_contrastive_loss(h_graph, y)
         if float(self.lambda_proto) > 0.0:
             loss = loss + float(self.lambda_proto) * proto_loss
-        # Supervised contrastive loss over the configured class pair
         if float(self.lambda_supcon_pair) > 0.0:
             supcon_loss = self._compute_supcon_pair_loss(h_graph, y)
             loss = loss + float(self.lambda_supcon_pair) * supcon_loss
-        # Prototype orthogonality for the configured class pair
         if float(self.lambda_proto_orth) > 0.0:
             ortho_loss = self._compute_proto_orth_loss()
             loss = loss + float(self.lambda_proto_orth) * ortho_loss
-        # Forecast future structural statistics if enabled
         if self.forecast_enabled and float(self.lambda_forecast) > 0.0 and not isinstance(self.forecast_head, nn.Identity):
             targets_forecast = self._forecast_targets(batch).to(device)
             preds_forecast = self.forecast_head(h_graph)
             loss_forecast = F.mse_loss(preds_forecast, targets_forecast)
             loss = loss + float(self.lambda_forecast) * loss_forecast
-        # Update prototypes with EMA using current batch representations
-        self.update_prototypes(h_graph.detach(), y.detach())
+        if update_prototypes:
+            self.update_prototypes(h_graph.detach(), y.detach())
 
-        # Topology consistency regularizers (masked BCE and degree KL)
         scores = self._last_scores
         assert scores is not None
-        # Reconstruct A_obs from flattened Gobs
         N = self.max_nodes
         D = self.in_channels
         A_obs_list: List[Tensor] = []
@@ -1347,7 +1418,15 @@ class CTDMSyn(nn.Module):
             loss = loss + float(self.lambda_topo_bce) * topo_bce
         if float(self.lambda_deg_kl) > 0.0:
             loss = loss + float(self.lambda_deg_kl) * topo_kl
-        return loss, 0.0
+        return loss
+
+    def training_step(self, batch) -> Tuple[Tensor, float]:
+        """Returns (loss, aux_acc) for a training step using diffusion objective."""
+        return self._objective_loss(batch, update_prototypes=True), 0.0
+
+    def validation_step(self, batch) -> Tensor:
+        """Returns the stage-one validation objective without mutating prototypes."""
+        return self._objective_loss(batch, update_prototypes=False)
 
     def _posterior_mean_variance(self, Gt: Tensor, t: Tensor, eps_pred: Tensor) -> Tuple[Tensor, Tensor]:
         beta_t = self.betas[(t - 1).to(torch.long)].view(-1, 1)
@@ -1388,6 +1467,12 @@ class CTDMSyn(nn.Module):
             nonzero_mask = (prev_t > 0).to(Gt.dtype).view(-1, 1)
             G_prev = G_prev + nonzero_mask * sigma * noise
         return G_prev
+
+    def _reverse_inference_update(self, Gt: Tensor, t: Tensor, eps_pred: Tensor, prev_t: Tensor) -> Tensor:
+        if float(self.sampling_eta) > 0.0:
+            return self._reverse_step(Gt, t, eps_pred, prev_t)
+        mean, _var = self._posterior_mean_variance(Gt, t, eps_pred)
+        return mean
 
     def _get_c1_c2(self, t: Tensor) -> Tuple[Tensor, Tensor]:
         """Returns (c1, c2) where x_t = c1*x0 + c2*eps and v = c1*eps - c2*x0."""

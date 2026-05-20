@@ -3,7 +3,7 @@ experiment:
 
 dataset:
   name: twitter15
-  root: /share/home/hwxu/Researches/D2Plus/Input/processed
+  root: /share/home/hwxu/Researches/D2Plus/Input/processed_paper_aligned
   use_lp_edges: false
   text_normalization:
     lowercase: true
@@ -24,21 +24,30 @@ dataset:
     drop_node: []
     drop_edge: []
   prefix:
-    strategy: none
+    strategy: minutes
+    unit: minutes
+    window: 60
     minutes: 60
     k:
     include_root: true
+    window_overrides:
+      weibo: 3
+      pheme: 3
+    unit_overrides:
+      weibo: hop
+      pheme: hop
   observability:
     drop_edge: 0.0
     drop_node: 0.0
     seed: 1024
 
 device:
-  force_cpu: true
+  force_cpu: false
   gpu_id: 0
-  type: cpu
+  type: cuda
 
 evaluation:
+  ece_bins: 15
   class_names:
     0: non-rumor
     1: 'true'
@@ -65,6 +74,15 @@ evaluation:
     baseline_models: []
     metrics: [macro_f1, acc]
     n_bootstrap: 100
+  early_observation:
+    default_windows: [10]
+    default_unit: minutes
+    windows_overrides:
+      weibo: [1]
+      pheme: [1]
+    unit_overrides:
+      weibo: hop
+      pheme: hop
 
 link_prediction:
   dropout: 0.3
@@ -80,52 +98,52 @@ link_prediction:
   weight_decay: 0.0
 
 outputs:
-  ckpt_dir: /share/home/hwxu/Researches/D2Plus/Output/ckpts/smoke
-  dir: /share/home/hwxu/Researches/D2Plus/Output/smoke/twitter15
-  log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs
-  results_dir: /share/home/hwxu/Researches/D2Plus/Output/results/smoke
-  prediction_csv: /share/home/hwxu/Researches/D2Plus/Output/results/smoke/predictions.csv
-  revision_artifacts_csv: /share/home/hwxu/Researches/D2Plus/Output/results/smoke/revision_artifacts.csv
+  ckpt_dir: /share/home/hwxu/Researches/D2Plus/Output/ckpts/smoke_paper_aligned
+  dir: /share/home/hwxu/Researches/D2Plus/Output/smoke_paper_aligned/twitter15
+  log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs/smoke_paper_aligned
+  results_dir: /share/home/hwxu/Researches/D2Plus/Output/results/smoke_paper_aligned
+  prediction_csv: /share/home/hwxu/Researches/D2Plus/Output/results/smoke_paper_aligned/predictions.csv
+  revision_artifacts_csv: /share/home/hwxu/Researches/D2Plus/Output/results/smoke_paper_aligned/revision_artifacts.csv
 
 sbatch:
   job_prefix: DPlus
   conda_env: hw
   profiles:
     benchmark:
-      partition: gpu
-      nodelist: cpu03
-      gres: ""
+      partition: gpu1
+      nodelist: gpu03
+      gres: "gpu:1"
       cpus_per_task: 4
       mem: 16G
-      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs
+      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs/smoke_paper_aligned
     rumordiffusion_train:
-      partition: gpu
-      nodelist: cpu03
-      gres: ""
+      partition: gpu1
+      nodelist: gpu03
+      gres: "gpu:1"
       cpus_per_task: 4
       mem: 16G
-      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs
+      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs/smoke_paper_aligned
     transfer:
-      partition: gpu
-      nodelist: cpu03
-      gres: ""
+      partition: gpu1
+      nodelist: gpu03
+      gres: "gpu:1"
       cpus_per_task: 4
       mem: 16G
-      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs
+      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs/smoke_paper_aligned
     ablation:
-      partition: gpu
-      nodelist: cpu03
-      gres: ""
+      partition: gpu1
+      nodelist: gpu03
+      gres: "gpu:1"
       cpus_per_task: 4
       mem: 16G
-      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs
+      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs/smoke_paper_aligned
     hparam:
-      partition: gpu
-      nodelist: cpu03
-      gres: ""
+      partition: gpu1
+      nodelist: gpu03
+      gres: "gpu:1"
       cpus_per_task: 4
       mem: 16G
-      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs
+      log_dir: /share/home/hwxu/Researches/D2Plus/Output/logs/smoke_paper_aligned
 
 transfer:
   mode: source_only
@@ -136,7 +154,7 @@ transfer:
     - Libs/configs/baselines/rumordiffusion.yaml
   ckpt_name: best.pt
   lp_edges_policy: require_existing
-  results_path: /share/home/hwxu/Researches/D2Plus/Output/results/smoke/transfer.csv
+  results_path: /share/home/hwxu/Researches/D2Plus/Output/results/smoke_paper_aligned/transfer.csv
   adaptation:
     target_split: train
     selection_split: val
@@ -147,7 +165,18 @@ rumordiffusion:
     validate_metadata: true
     allow_legacy: false
   evaluation:
-    early_obs_minutes: [10]
+    uncertainty:
+      sampling: stochastic_reverse
+      potential_readout: sampled_full_graph
+    early_observation:
+      default_windows: [10]
+      default_unit: minutes
+      windows_overrides:
+        weibo: [1]
+        pheme: [1]
+      unit_overrides:
+        weibo: hop
+        pheme: hop
     early_stop:
       enabled: true
       samples: 1
@@ -157,8 +186,8 @@ rumordiffusion:
       gamma: 0.02
       rumor_classes: [1, 2, 3]
     sampling_sweep:
-      enabled: false
-      samples: []
+      enabled: true
+      samples: [1, 2, 4]
       max_batches: 1
     threshold_sweep:
       enabled: false
@@ -251,12 +280,14 @@ rumordiffusion:
       enabled: true
   dataset_overrides:
     weibo:
+      potentials_pair: [0, 1]
       arbiter:
         pair_ids: [0, 1]
       ctdm:
         regularizers:
           pair_ids: [0, 1]
     pheme:
+      potentials_pair: [0, 1]
       arbiter:
         pair_ids: [0, 1]
       ctdm:
@@ -304,7 +335,8 @@ rumordiffusion:
     w_brier: 0.01
     w_cons: 0.05
   potentials_dir: rd_potentials
-  potentials_pair: [0, 1]
+  seed_scoped_potentials: true
+  potentials_pair: [0, 1, 2, 3]
   text:
     backend: sentence-transformers
     enabled: true

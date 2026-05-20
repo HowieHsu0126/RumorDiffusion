@@ -1,4 +1,16 @@
-name: rumordiffusion
+name: rumordiffusion_without_text_fusion
+rumordiffusion_overrides:
+  checkpoint:
+    ctdm_subdir: rumordiffusion_without_text_fusion_ctdm_mpnet_observed_prefix
+  text:
+    enabled: false
+    text_dim: 0
+    fuse_mode: none
+  ctdm:
+    text:
+      enabled: false
+      text_dim: 0
+      fuse_mode: none
 model:
   ctdm:
     hidden: 256
@@ -82,7 +94,15 @@ model:
     lr_d: 0.0001
     lambda_r1: 10.0
 evaluation:
-  early_obs_minutes: [10, 20, 30]
+  early_observation:
+    default_windows: [10, 20, 30]
+    default_unit: minutes
+    windows_overrides:
+      weibo: [1, 2, 3]
+      pheme: [1, 2, 3]
+    unit_overrides:
+      weibo: hop
+      pheme: hop
   calibration:
     enabled: true
     type: temperature
