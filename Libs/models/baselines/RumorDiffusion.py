@@ -1,4 +1,5 @@
-from typing import List, Optional, Tuple
+import math
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -49,6 +50,176 @@ class PotentialDiscriminator(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.net(x)
+
+
+class PrototypeResidualBranch(nn.Module):
+    """Class-prototype residual logits over arbiter representations."""
+
+    def __init__(
+        self,
+        hidden_channels: int,
+        num_classes: int,
+        temperature: float,
+        momentum: float,
+        logit_weight: float,
+        min_count: int,
+    ) -> None:
+        super().__init__()
+        self.hidden_channels = int(hidden_channels)
+        self.num_classes = int(num_classes)
+        self.temperature = float(temperature)
+        self.momentum = float(momentum)
+        self.logit_weight = float(logit_weight)
+        self.min_count = int(min_count)
+        self.register_buffer(
+            "prototypes",
+            torch.zeros((self.num_classes, self.hidden_channels), dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "prototype_counts",
+            torch.zeros((self.num_classes,), dtype=torch.float32),
+            persistent=True,
+        )
+
+    @torch.no_grad()
+    def update(self, features: Tensor, targets: Tensor) -> None:
+        assert features.dim() == 2 and int(features.size(1)) == self.hidden_channels
+        assert targets.dim() == 1 and int(targets.size(0)) == int(features.size(0))
+        for class_id in range(self.num_classes):
+            mask = targets == int(class_id)
+            if mask.any():
+                class_feature = features[mask].mean(dim=0)
+                previous_count = float(self.prototype_counts[class_id].item())
+                if previous_count <= 0.0:
+                    self.prototypes[class_id].copy_(class_feature)
+                else:
+                    self.prototypes[class_id].mul_(self.momentum).add_((1.0 - self.momentum) * class_feature)
+                self.prototype_counts[class_id].add_(float(mask.sum().item()))
+
+    def forward(self, features: Tensor) -> Tensor:
+        assert features.dim() == 2 and int(features.size(1)) == self.hidden_channels
+        feature_norm = F.normalize(features, dim=-1)
+        proto_norm = F.normalize(self.prototypes.to(device=features.device, dtype=features.dtype), dim=-1)
+        logits = torch.matmul(feature_norm, proto_norm.t())
+        valid = (self.prototype_counts.to(device=features.device) >= float(self.min_count)).to(features.dtype)
+        logits = logits * valid.view(1, -1)
+        return float(self.logit_weight) * logits / max(float(self.temperature), 1e-6)
+
+
+class SemanticResidualBranch(nn.Module):
+    """Root/text semantic residual logits for observed-prefix classification."""
+
+    def __init__(
+        self,
+        root_dim: int,
+        text_dim: int,
+        hidden_channels: int,
+        num_classes: int,
+        dropout: float,
+        logit_weight: float,
+        use_root: bool,
+        use_text: bool,
+    ) -> None:
+        super().__init__()
+        self.root_dim = int(root_dim)
+        self.text_dim = int(text_dim)
+        self.hidden_channels = int(hidden_channels)
+        self.num_classes = int(num_classes)
+        self.logit_weight = float(logit_weight)
+        self.use_root = bool(use_root)
+        self.use_text = bool(use_text)
+        if not self.use_root and not self.use_text:
+            raise ValueError("Semantic residual branch requires root, text, or both inputs.")
+        if self.use_root and self.root_dim <= 0:
+            raise ValueError("Semantic residual root input is enabled but root_dim is not positive.")
+        if self.use_text and self.text_dim <= 0:
+            raise ValueError("Semantic residual text input is enabled but text_dim is not positive.")
+        if self.use_root:
+            self.root_proj = nn.Sequential(
+                nn.Linear(self.root_dim, self.hidden_channels),
+                nn.LayerNorm(self.hidden_channels),
+                nn.GELU(),
+            )
+        if self.use_text:
+            self.text_proj = nn.Sequential(
+                nn.Linear(self.text_dim, self.hidden_channels),
+                nn.LayerNorm(self.hidden_channels),
+                nn.GELU(),
+            )
+        fusion_inputs = int(self.use_root) + int(self.use_text)
+        self.fusion = nn.Sequential(
+            nn.Linear(self.hidden_channels * fusion_inputs, self.hidden_channels),
+            nn.LayerNorm(self.hidden_channels),
+            nn.GELU(),
+            nn.Dropout(p=float(dropout)),
+        )
+        self.classifier = nn.Linear(self.hidden_channels, self.num_classes)
+
+    @staticmethod
+    def _extract_text_embedding(batch, expected_batch_size: int) -> Tensor:
+        if not hasattr(batch, "text_emb"):
+            raise ValueError("Semantic residual branch requires batch.text_emb.")
+        text_emb = batch.text_emb
+        if text_emb.dim() == 3 and int(text_emb.size(1)) == 1:
+            text_emb = text_emb.squeeze(1)
+        elif text_emb.dim() == 1 and int(expected_batch_size) == 1:
+            text_emb = text_emb.view(1, -1)
+        if text_emb.dim() != 2 or int(text_emb.size(0)) != int(expected_batch_size):
+            raise ValueError(
+                f"Semantic residual text_emb must be [B, D], got {tuple(text_emb.shape)} for B={expected_batch_size}."
+            )
+        return text_emb
+
+    @staticmethod
+    def _extract_root_features(batch) -> Tensor:
+        if not hasattr(batch, "x") or not hasattr(batch, "root_index"):
+            raise ValueError("Semantic residual branch requires batch.x and batch.root_index.")
+        root_index = batch.root_index.view(-1).to(device=batch.x.device, dtype=torch.long)
+        if hasattr(batch, "ptr"):
+            ptr = batch.ptr.to(device=batch.x.device, dtype=torch.long)
+            graph_count = int(ptr.numel()) - 1
+            if int(root_index.numel()) != graph_count:
+                raise ValueError(
+                    f"root_index length {int(root_index.numel())} does not match graph count {graph_count}."
+                )
+            global_valid = bool(((root_index >= ptr[:-1]) & (root_index < ptr[1:])).all().item())
+            local_index = root_index + ptr[:-1]
+            local_valid = bool(((local_index >= ptr[:-1]) & (local_index < ptr[1:])).all().item())
+            if global_valid:
+                root_global = root_index
+            elif local_valid:
+                root_global = local_index
+            else:
+                raise ValueError("root_index is neither a valid global nor local batch index.")
+        else:
+            root_global = root_index
+        if int(root_global.numel()) == 0:
+            raise ValueError("Semantic residual branch received an empty root_index tensor.")
+        if int(root_global.min().item()) < 0 or int(root_global.max().item()) >= int(batch.x.size(0)):
+            raise ValueError("Semantic residual root indices are outside the node-feature tensor.")
+        return batch.x[root_global].to(torch.float32)
+
+    def forward(self, batch, expected_batch_size: int) -> Tuple[Tensor, Tensor]:
+        parts: List[Tensor] = []
+        if self.use_root:
+            root_features = self._extract_root_features(batch).to(
+                device=next(self.parameters()).device,
+                dtype=next(self.parameters()).dtype,
+            )
+            if int(root_features.size(0)) != int(expected_batch_size):
+                raise ValueError(
+                    f"Semantic residual root features must have B={expected_batch_size}, got {int(root_features.size(0))}."
+                )
+            parts.append(self.root_proj(root_features))
+        if self.use_text:
+            text_emb = self._extract_text_embedding(batch, expected_batch_size).to(
+                device=next(self.parameters()).device,
+                dtype=next(self.parameters()).dtype,
+            )
+            parts.append(self.text_proj(text_emb))
+        semantic_feature = self.fusion(torch.cat(parts, dim=-1))
+        return float(self.logit_weight) * self.classifier(semantic_feature), semantic_feature
 
 
 class RumorDiffusion(nn.Module):
@@ -109,6 +280,11 @@ class RumorDiffusion(nn.Module):
         # Representation objectives
         lambda_supcon: float = 0.0,
         supcon_temperature: float = 0.07,
+        prototype_residual_cfg: Optional[Dict[str, object]] = None,
+        semantic_residual_cfg: Optional[Dict[str, object]] = None,
+        posterior_aggregation_cfg: Optional[Dict[str, object]] = None,
+        root_feature_dim: int = 0,
+        text_feature_dim: int = 0,
     ) -> None:
         super().__init__()
         self.ctdm = ctdm
@@ -155,6 +331,41 @@ class RumorDiffusion(nn.Module):
         self.enable_tf_head_loss = bool(enable_tf_head_loss)
         self.lambda_supcon = float(lambda_supcon)
         self.supcon_temperature = float(supcon_temperature)
+        prototype_residual_cfg = prototype_residual_cfg if isinstance(prototype_residual_cfg, dict) else {}
+        semantic_residual_cfg = semantic_residual_cfg if isinstance(semantic_residual_cfg, dict) else {}
+        posterior_aggregation_cfg = posterior_aggregation_cfg if isinstance(posterior_aggregation_cfg, dict) else {}
+        self.prototype_residual_enabled = bool(prototype_residual_cfg.get("enabled", False))
+        self.semantic_residual_enabled = bool(semantic_residual_cfg.get("enabled", False))
+        self.posterior_aggregation_enabled = bool(posterior_aggregation_cfg.get("enabled", False))
+        if self.prototype_residual_enabled:
+            self.prototype_residual = PrototypeResidualBranch(
+                hidden_channels=self.hidden_channels,
+                num_classes=self.num_classes,
+                temperature=float(prototype_residual_cfg["temperature"]),
+                momentum=float(prototype_residual_cfg["momentum"]),
+                logit_weight=float(prototype_residual_cfg["logit_weight"]),
+                min_count=int(prototype_residual_cfg["min_count"]),
+            )
+        if self.semantic_residual_enabled:
+            self.semantic_residual = SemanticResidualBranch(
+                root_dim=int(root_feature_dim),
+                text_dim=int(text_feature_dim),
+                hidden_channels=self.hidden_channels,
+                num_classes=self.num_classes,
+                dropout=float(semantic_residual_cfg["dropout"]),
+                logit_weight=float(semantic_residual_cfg["logit_weight"]),
+                use_root=bool(semantic_residual_cfg["use_root"]),
+                use_text=bool(semantic_residual_cfg["use_text"]),
+            )
+        if self.posterior_aggregation_enabled:
+            self.posterior_aggregation_samples = int(posterior_aggregation_cfg["samples"])
+            self.posterior_aggregation_mode = str(posterior_aggregation_cfg["mode"]).lower()
+            self.posterior_aggregation_force_ctdm = bool(posterior_aggregation_cfg["force_ctdm"])
+            self.posterior_aggregation_stochastic = bool(posterior_aggregation_cfg["stochastic"])
+            if self.posterior_aggregation_samples < 1:
+                raise ValueError("posterior_aggregation.samples must be positive.")
+            if self.posterior_aggregation_mode not in {"mean_logits", "logmeanexp", "mean_prob"}:
+                raise ValueError("posterior_aggregation.mode must be mean_logits, logmeanexp, or mean_prob.")
         # Multi-pair margin loss configuration (for handling multiple confusable class pairs)
         self.multi_pair_margin_list = []
         self.multi_pair_margin_values = []
@@ -340,12 +551,60 @@ class RumorDiffusion(nn.Module):
         x = self.input_drop(self.input_norm(x))
         return self.arbiter(x)
 
+    def _apply_residual_branches(
+        self,
+        logits: Tensor,
+        representation: Optional[Tensor],
+        batch,
+        targets: Optional[Tensor] = None,
+        update_prototypes: bool = False,
+    ) -> Tensor:
+        out = logits
+        residual_features = representation
+        if self.semantic_residual_enabled:
+            semantic_logits, semantic_feature = self.semantic_residual(batch, expected_batch_size=int(logits.size(0)))
+            out = out + semantic_logits
+            if residual_features is None:
+                residual_features = semantic_feature
+        if self.prototype_residual_enabled and residual_features is not None:
+            out = out + self.prototype_residual(residual_features)
+            if bool(update_prototypes):
+                if targets is None:
+                    raise ValueError("Prototype residual update requires training targets.")
+                self.prototype_residual.update(residual_features.detach(), targets.detach())
+        return out
+
+    def _logits_from_tokens_with_residuals(
+        self,
+        tokens: Tensor,
+        batch,
+        targets: Optional[Tensor] = None,
+        update_prototypes: bool = False,
+    ) -> Tensor:
+        if self.arbiter_type == "transformer":
+            logits, cls_out = self._encode_from_tokens(tokens)
+            return self._apply_residual_branches(
+                logits,
+                cls_out,
+                batch,
+                targets=targets,
+                update_prototypes=update_prototypes,
+            )
+        logits = self._logits_from_tokens(tokens)
+        return self._apply_residual_branches(
+            logits,
+            None,
+            batch,
+            targets=targets,
+            update_prototypes=update_prototypes,
+        )
+
     def _forward_from_ctdm(self, batch, stochastic: bool = False) -> Tensor:
         """Forces on-the-fly CTDM potential inference regardless of cached fields."""
         assert self.ctdm is not None, "CTDM is required for sampled uncertainty inference"
         Hc = self._compute_ctdm_potentials(batch, stochastic=stochastic)
         self._last_potentials = Hc
-        return self._logits_from_tokens(Hc)
+        return self._logits_from_tokens_with_residuals(Hc, batch)
 
     def _compute_ctdm_potentials(self, batch, stochastic: bool = False) -> Tensor:
         assert self.ctdm is not None, "CTDM is required when potentials are not present in the batch"
@@ -361,26 +620,49 @@ class RumorDiffusion(nn.Module):
             )
         return self.ctdm.infer_potentials_all(batch)
 
+    def _forward_once(self, batch, force_ctdm: bool = False, stochastic: bool = False) -> Tensor:
+        if force_ctdm:
+            return self._forward_from_ctdm(batch, stochastic=stochastic)
+        if self.arbiter_type == "transformer":
+            tokens = self._build_tokens_from_batch(batch)
+            return self._logits_from_tokens_with_residuals(tokens, batch)
+        if hasattr(batch, "h_cat"):
+            x = batch.h_cat
+            H = self.hidden_channels
+            x = x[:, : 2 * H]
+            x = self.input_drop(self.input_norm(x))
+            return self._apply_residual_branches(self.arbiter(x), None, batch)
+        if hasattr(batch, "h0") and hasattr(batch, "h1"):
+            x = torch.cat([batch.h0, batch.h1], dim=-1)
+            x = self.input_drop(self.input_norm(x))
+            return self._apply_residual_branches(self.arbiter(x), None, batch)
+        assert self.ctdm is not None, "CTDM is required when potentials are not present in the batch"
+        return self._forward_from_ctdm(batch)
+
+    def _posterior_aggregated_logits(self, batch) -> Tensor:
+        logits_samples: List[Tensor] = []
+        for _ in range(int(self.posterior_aggregation_samples)):
+            with autocast(enabled=False):
+                sample_logits = self._forward_once(
+                    batch,
+                    force_ctdm=bool(self.posterior_aggregation_force_ctdm),
+                    stochastic=bool(self.posterior_aggregation_stochastic),
+                )
+            logits_samples.append(sample_logits.to(torch.float32))
+        stacked = torch.stack(logits_samples, dim=0)
+        if self.posterior_aggregation_mode == "mean_logits":
+            return stacked.mean(dim=0)
+        if self.posterior_aggregation_mode == "logmeanexp":
+            return torch.logsumexp(stacked, dim=0) - math.log(float(stacked.size(0)))
+        probs = F.softmax(stacked, dim=-1).mean(dim=0).clamp_min(1e-8)
+        return probs.log()
+
     def forward(self, batch) -> Tensor:
         """Build token sequence and arbitrate via Transformer [CLS] output by default."""
         def _compute():
-            if self.arbiter_type == "transformer":
-                tokens = self._build_tokens_from_batch(batch)
-                return self._logits_from_tokens(tokens)
-            # Fallback MLP over two potentials if explicitly requested
-            if hasattr(batch, "h_cat"):
-                x = batch.h_cat  # [B, K*H]
-                B = int(x.size(0))
-                H = self.hidden_channels
-                x = x[:, : 2 * H]
-                x = self.input_drop(self.input_norm(x))
-                return self.arbiter(x)
-            if hasattr(batch, "h0") and hasattr(batch, "h1"):
-                x = torch.cat([batch.h0, batch.h1], dim=-1)
-                x = self.input_drop(self.input_norm(x))
-                return self.arbiter(x)
-            assert self.ctdm is not None, "CTDM is required when potentials are not present in the batch"
-            return self._forward_from_ctdm(batch)
+            if (not self.training) and self.posterior_aggregation_enabled:
+                return self._posterior_aggregated_logits(batch)
+            return self._forward_once(batch)
 
         if (not self.training) and self.infer_amp:
             with autocast():
@@ -578,11 +860,25 @@ class RumorDiffusion(nn.Module):
 
             if self.arbiter_type == "transformer":
                 logits_main, cls_out = self._encode_from_tokens(Hc)
+                logits_main = self._apply_residual_branches(
+                    logits_main,
+                    cls_out,
+                    batch,
+                    targets=targets,
+                    update_prototypes=True,
+                )
             else:
                 x = torch.cat([Hc[:, 0, :], Hc[:, 1, :]], dim=-1)
                 x = self.input_drop(self.input_norm(x))
                 logits_main = self.arbiter(x)
                 cls_out = None
+                logits_main = self._apply_residual_branches(
+                    logits_main,
+                    None,
+                    batch,
+                    targets=targets,
+                    update_prototypes=True,
+                )
 
             loss_focal = self._la_focal_loss(logits_main, targets)
             loss = loss_focal
@@ -687,6 +983,13 @@ class RumorDiffusion(nn.Module):
         if self.arbiter_type == "transformer":
             tokens = self._build_tokens_from_batch(batch)
             logits, cls_out = self._encode_from_tokens(tokens)
+            logits = self._apply_residual_branches(
+                logits,
+                cls_out,
+                batch,
+                targets=targets,
+                update_prototypes=True,
+            )
         else:
             logits = self(batch)
         loss_focal = self._la_focal_loss(logits, targets)

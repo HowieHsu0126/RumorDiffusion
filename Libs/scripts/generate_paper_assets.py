@@ -83,6 +83,12 @@ PALETTE = {
     "edge": "#B7C3CC",
 }
 
+TABLE_HIGHLIGHT_COLOR = "gray!20"
+
+
+def highlight_best_cell(cell: str) -> str:
+    return rf"\textbf{{\cellcolor{{{TABLE_HIGHLIGHT_COLOR}}}{{{cell}}}}}"
+
 
 def read_rows(csv_path: Path) -> List[Dict[str, str]]:
     if not csv_path.is_file():
@@ -136,6 +142,60 @@ def mean_confidence(values: Sequence[float]) -> Tuple[float, float]:
     return float(mean_value), float(ci95)
 
 
+def bounded_confidence_interval(
+    mean_value: float,
+    ci95: float,
+    lower_bound: Optional[float] = None,
+    upper_bound: Optional[float] = None,
+) -> Tuple[float, float]:
+    lower_value = float(mean_value) - float(ci95)
+    upper_value = float(mean_value) + float(ci95)
+    if lower_bound is not None:
+        lower_value = max(float(lower_bound), lower_value)
+    if upper_bound is not None:
+        upper_value = min(float(upper_bound), upper_value)
+    return lower_value, upper_value
+
+
+def bounded_confidence_errors(
+    means: Sequence[float],
+    cis: Sequence[float],
+    lower_bound: Optional[float] = None,
+    upper_bound: Optional[float] = None,
+) -> List[List[float]]:
+    lower_errors: List[float] = []
+    upper_errors: List[float] = []
+    for mean_value, ci95 in zip(means, cis):
+        lower_value, upper_value = bounded_confidence_interval(mean_value, ci95, lower_bound, upper_bound)
+        lower_errors.append(max(float(mean_value) - lower_value, 0.0))
+        upper_errors.append(max(upper_value - float(mean_value), 0.0))
+    return [lower_errors, upper_errors]
+
+
+def bounded_axis_limits(
+    means: Sequence[float],
+    cis: Sequence[float],
+    lower_bound: Optional[float] = None,
+    upper_bound: Optional[float] = None,
+    padding_fraction: float = 0.08,
+    minimum_span: float = 0.01,
+) -> Tuple[float, float]:
+    intervals = [
+        bounded_confidence_interval(mean_value, ci95, lower_bound, upper_bound)
+        for mean_value, ci95 in zip(means, cis)
+    ]
+    lower_value = min(interval[0] for interval in intervals)
+    upper_value = max(interval[1] for interval in intervals)
+    span = max(upper_value - lower_value, minimum_span)
+    padded_lower = lower_value - span * padding_fraction
+    padded_upper = upper_value + span * padding_fraction
+    if lower_bound is not None:
+        padded_lower = max(float(lower_bound), padded_lower)
+    if upper_bound is not None:
+        padded_upper = min(float(upper_bound), padded_upper)
+    return padded_lower, padded_upper
+
+
 def format_stat(values: Sequence[float]) -> str:
     mean_value, ci95 = mean_confidence(values)
     return f"{mean_value:.3f}$\\pm${ci95:.3f}"
@@ -183,6 +243,29 @@ def resolve_generation_contract(exp_cfg_path: Path, model_cfg_path: Path) -> Dic
     display_thresholds = threshold_cfg.get("display", []) if isinstance(threshold_cfg, dict) else []
     if not isinstance(display_thresholds, list) or len(display_thresholds) == 0:
         raise ValueError(f"evaluation.threshold_sweep.display must be declared in {model_cfg_path}")
+    transfer_cfg = exp_cfg.get("transfer", {}) if isinstance(exp_cfg.get("transfer", {}), dict) else {}
+    transfer_model_paths = transfer_cfg.get("models", [])
+    if not isinstance(transfer_model_paths, list) or len(transfer_model_paths) == 0:
+        raise ValueError(f"transfer.models must be declared in {exp_cfg_path}")
+    transfer_models: List[str] = []
+    for transfer_model_path in transfer_model_paths:
+        transfer_model_cfg = read_yaml_config(Path(str(transfer_model_path)))
+        transfer_model_name = str(transfer_model_cfg.get("name", "")).lower()
+        if len(transfer_model_name) == 0:
+            raise ValueError(f"Transfer model config lacks a name: {transfer_model_path}")
+        transfer_models.append(transfer_model_name)
+    transfer_pairs_cfg = transfer_cfg.get("pairs", [])
+    if not isinstance(transfer_pairs_cfg, list) or len(transfer_pairs_cfg) == 0:
+        raise ValueError(f"transfer.pairs must be declared in {exp_cfg_path}")
+    transfer_pairs: List[Tuple[str, str]] = []
+    for pair in transfer_pairs_cfg:
+        if not isinstance(pair, dict):
+            raise ValueError(f"Transfer pair must be a mapping in {exp_cfg_path}")
+        source = str(pair.get("source", ""))
+        target = str(pair.get("target", ""))
+        if len(source) == 0 or len(target) == 0:
+            raise ValueError(f"Transfer pair lacks source/target in {exp_cfg_path}: {pair}")
+        transfer_pairs.append((source, target))
     return {
         "seeds": seed_values,
         "seed_keys": {str(int(seed)) for seed in seed_values},
@@ -190,6 +273,8 @@ def resolve_generation_contract(exp_cfg_path: Path, model_cfg_path: Path) -> Dic
         "ece_bins": ece_bins,
         "early_observation": early_cfg,
         "threshold_display": display_thresholds,
+        "transfer_models": transfer_models,
+        "transfer_pairs": transfer_pairs,
     }
 
 
@@ -404,9 +489,11 @@ def build_main_table(
 ) -> str:
     rows_by_dataset = {dataset: read_rows(results_dir / f"{dataset}.csv") for dataset in datasets}
     prediction_rows = read_rows(results_dir / "predictions.csv")
+    row_entries: List[Dict[str, Any]] = []
     body_lines: List[str] = []
     for model in SELECTED_MODELS:
         values: List[str] = [MODEL_LABELS[model]]
+        metric_means: List[float] = []
         for dataset in datasets:
             require_main_result_provenance(
                 rows_by_dataset[dataset],
@@ -427,8 +514,20 @@ def build_main_table(
                 expected_seed_keys=expected_seed_keys,
                 ece_bins=ece_bins,
             )
+            acc_mean, _ = mean_confidence(metrics["acc"])
+            f1_mean, _ = mean_confidence(metrics["macro_f1"])
             values.append(format_stat(metrics["acc"]))
             values.append(format_stat(metrics["macro_f1"]))
+            metric_means.extend([acc_mean, f1_mean])
+        row_entries.append({"values": values, "metric_means": metric_means})
+    best_values = [max(entry["metric_means"][index] for entry in row_entries) for index in range(len(row_entries[0]["metric_means"]))]
+    for entry in row_entries:
+        values = [entry["values"][0]]
+        for index, cell in enumerate(entry["values"][1:]):
+            if math.isclose(entry["metric_means"][index], best_values[index], rel_tol=1e-12, abs_tol=1e-12):
+                values.append(highlight_best_cell(cell))
+            else:
+                values.append(cell)
         body_lines.append(" & ".join(values) + r" \\")
     header = [
         r"\begin{table*}[!h]",
@@ -457,8 +556,15 @@ def build_main_table(
     return "\n".join(header + body_lines + footer) + "\n"
 
 
-def build_transfer_table(results_dir: Path, expected_seed_keys: Set[str]) -> str:
+def build_transfer_table(
+    results_dir: Path,
+    expected_seed_keys: Set[str],
+    ece_bins: int,
+    transfer_pairs: Sequence[Tuple[str, str]],
+    transfer_models: Sequence[str],
+) -> str:
     rows = read_rows(results_dir / "transfer.csv")
+    prediction_rows = read_rows(results_dir / "predictions.csv")
     grouped: Dict[Tuple[str, str, str], List[Dict[str, str]]] = defaultdict(list)
     for row in rows:
         if row.get("seed", "") == "agg":
@@ -466,45 +572,107 @@ def build_transfer_table(results_dir: Path, expected_seed_keys: Set[str]) -> str
         key = (row.get("train_dataset", ""), row.get("test_dataset", ""), row.get("model", ""))
         grouped[key].append(row)
     body_lines: List[str] = []
-    for (train_dataset, test_dataset, model_name), model_rows in sorted(grouped.items()):
-        if model_name != "rumordiffusion":
-            continue
-        model_rows = require_seed_set(
-            model_rows,
-            expected_seed_keys,
-            f"Transfer results for {train_dataset}->{test_dataset}/{model_name}",
-        )
-        acc_values = [parse_float(row.get("acc", "")) for row in model_rows]
-        f1_values = [parse_float(row.get("macro_f1", "")) for row in model_rows]
-        ece_values = [parse_float(row.get("ece", "")) for row in model_rows]
-        acc_values = [require_finite(value, f"{train_dataset}->{test_dataset} acc") for value in acc_values]
-        f1_values = [require_finite(value, f"{train_dataset}->{test_dataset} macro_f1") for value in f1_values]
-        ece_values = [require_finite(value, f"{train_dataset}->{test_dataset} ece") for value in ece_values]
-        body_lines.append(
-            " & ".join(
-                [
-                    f"{train_dataset}$\\rightarrow${test_dataset}",
-                    format_stat(acc_values) if acc_values else "---",
-                    format_stat(f1_values) if f1_values else "---",
-                    format_stat(ece_values) if ece_values else "---",
-                ]
+
+    for pair_index, (train_dataset, test_dataset) in enumerate(transfer_pairs):
+        entries: List[Dict[str, Any]] = []
+        for model_name in transfer_models:
+            model_rows = grouped.get((train_dataset, test_dataset, model_name), [])
+            model_rows = require_seed_set(
+                model_rows,
+                expected_seed_keys,
+                f"Transfer results for {train_dataset}->{test_dataset}/{model_name}",
             )
-            + r" \\"
-        )
+            model_rows_by_seed = {row.get("seed", ""): row for row in model_rows}
+            source_metrics = collect_prediction_metric_values(
+                prediction_rows,
+                dataset=train_dataset,
+                source_dataset=train_dataset,
+                run_kind="main",
+                model=model_name,
+                tag="main",
+                expected_seed_keys=expected_seed_keys,
+                ece_bins=ece_bins,
+            )
+            ordered_seeds = sorted(expected_seed_keys, key=int)
+            ordered_transfer_rows = [model_rows_by_seed[seed] for seed in ordered_seeds]
+            f1_values = [
+                require_finite(parse_float(row.get("macro_f1", "")), f"{train_dataset}->{test_dataset}/{model_name} macro_f1")
+                for row in ordered_transfer_rows
+            ]
+            ece_values = [
+                require_finite(parse_float(row.get("ece", "")), f"{train_dataset}->{test_dataset}/{model_name} ece")
+                for row in ordered_transfer_rows
+            ]
+            retention_values = []
+            for transfer_f1, source_f1 in zip(f1_values, source_metrics["macro_f1"]):
+                if source_f1 <= 0.0 or not math.isfinite(source_f1):
+                    raise RuntimeError(f"Invalid source Macro-F1 for {train_dataset}/{model_name}: {source_f1}")
+                retention_values.append(transfer_f1 / source_f1)
+            source_f1_mean, source_f1_ci = mean_confidence(source_metrics["macro_f1"])
+            transfer_f1_mean, transfer_f1_ci = mean_confidence(f1_values)
+            transfer_ece_mean, transfer_ece_ci = mean_confidence(ece_values)
+            retention_mean, retention_ci = mean_confidence(retention_values)
+            entries.append(
+                {
+                    "model": model_name,
+                    "source_f1_mean": source_f1_mean,
+                    "source_f1": f"{source_f1_mean:.3f}$\\pm${source_f1_ci:.3f}",
+                    "transfer_f1_mean": transfer_f1_mean,
+                    "transfer_f1": f"{transfer_f1_mean:.3f}$\\pm${transfer_f1_ci:.3f}",
+                    "retention_mean": retention_mean,
+                    "retention": f"{100.0 * retention_mean:.1f}$\\pm${100.0 * retention_ci:.1f}\\%",
+                    "ece_mean": transfer_ece_mean,
+                    "ece": f"{transfer_ece_mean:.3f}$\\pm${transfer_ece_ci:.3f}",
+                }
+            )
+        best_source_f1 = max(entry["source_f1_mean"] for entry in entries)
+        best_transfer_f1 = max(entry["transfer_f1_mean"] for entry in entries)
+        best_retention = max(entry["retention_mean"] for entry in entries)
+        best_ece = min(entry["ece_mean"] for entry in entries)
+        if pair_index > 0:
+            body_lines.append(r"\midrule")
+        for entry in entries:
+            source_f1_cell = entry["source_f1"]
+            transfer_f1_cell = entry["transfer_f1"]
+            retention_cell = entry["retention"]
+            ece_cell = entry["ece"]
+            if math.isclose(float(entry["source_f1_mean"]), best_source_f1, rel_tol=1e-12, abs_tol=1e-12):
+                source_f1_cell = highlight_best_cell(source_f1_cell)
+            if math.isclose(float(entry["transfer_f1_mean"]), best_transfer_f1, rel_tol=1e-12, abs_tol=1e-12):
+                transfer_f1_cell = highlight_best_cell(transfer_f1_cell)
+            if math.isclose(float(entry["retention_mean"]), best_retention, rel_tol=1e-12, abs_tol=1e-12):
+                retention_cell = highlight_best_cell(retention_cell)
+            if math.isclose(float(entry["ece_mean"]), best_ece, rel_tol=1e-12, abs_tol=1e-12):
+                ece_cell = highlight_best_cell(ece_cell)
+            body_lines.append(
+                " & ".join(
+                    [
+                        f"{train_dataset}$\\rightarrow${test_dataset}",
+                        MODEL_LABELS.get(entry["model"], latex_escape(entry["model"])),
+                        source_f1_cell,
+                        transfer_f1_cell,
+                        retention_cell,
+                        ece_cell,
+                    ]
+                )
+                + r" \\"
+            )
     return "\n".join(
         [
-            r"\begin{table}[!h]",
+            r"\begin{table*}[!h]",
             r"\centering",
-            r"\caption{Zero-shot transfer results under the source-only evaluation protocol.}",
+            r"\caption{Source-only cross-dataset transfer comparison against strong in-scope baselines. Source-domain Macro-F1 is shown for reference, F1 retention is computed seed-wise as transfer/source, and the best value in each metric column within a transfer pair is highlighted.}",
             r"\label{tab:paper_ready_transfer}",
-            r"\begin{tabular}{lccc}",
+            r"\small",
+            r"\setlength{\tabcolsep}{4pt}",
+            r"\begin{tabular}{llcccc}",
             r"\toprule",
-            r"Transfer pair & Acc & Macro-F1 & ECE \\",
+            r"Transfer pair & Method & Source F1 & Transfer F1 & F1 retained & Transfer ECE \\",
             r"\midrule",
             *body_lines,
             r"\bottomrule",
             r"\end{tabular}",
-            r"\end{table}",
+            r"\end{table*}",
             "",
         ]
     )
@@ -564,7 +732,7 @@ def build_rebuttal_tradeoff_figure(
         values = [parse_float(row.get(field, "")) for row in rows_for_sample]
         clean_values = [value for value in values if value is not None]
         if len(clean_values) == 0:
-            return 0.0, 0.0
+            raise RuntimeError(f"Sampling sweep rows do not contain finite {field} values.")
         return mean_confidence(clean_values)
 
     sampling_points = []
@@ -619,10 +787,14 @@ def build_rebuttal_tradeoff_figure(
 
     x_positions = list(range(len(sampling_points)))
     sample_values = [point["samples"] for point in sampling_points]
+    latency_means = [point["latency_mean"] for point in sampling_points]
+    latency_cis = [point["latency_ci"] for point in sampling_points]
+    variance_means = [point["var_mean"] for point in sampling_points]
+    variance_cis = [point["var_ci"] for point in sampling_points]
     axes[0].bar(
         x_positions,
-        [point["latency_mean"] for point in sampling_points],
-        yerr=[point["latency_ci"] for point in sampling_points],
+        latency_means,
+        yerr=bounded_confidence_errors(latency_means, latency_cis, lower_bound=0.0),
         capsize=3,
         width=0.54,
         color="#D8E6F3",
@@ -637,12 +809,13 @@ def build_rebuttal_tradeoff_figure(
     axes[0].grid(axis="y", alpha=0.22)
     axes[0].spines["top"].set_visible(False)
     axes[0].spines["right"].set_visible(False)
-    axes[0].set_title("Sampling Cost")
+    axes[0].set_ylim(*bounded_axis_limits(latency_means, latency_cis, lower_bound=0.0, padding_fraction=0.05))
+    axes[0].set_title("Sampling Cost and Variance")
     variance_axis = axes[0].twinx()
     variance_axis.errorbar(
         x_positions,
-        [point["var_mean"] for point in sampling_points],
-        yerr=[point["var_ci"] for point in sampling_points],
+        variance_means,
+        yerr=bounded_confidence_errors(variance_means, variance_cis, lower_bound=0.0),
         marker="D",
         markersize=4,
         linestyle=":",
@@ -652,46 +825,51 @@ def build_rebuttal_tradeoff_figure(
         label="Mean variance",
     )
     variance_axis.set_ylabel("Mean stochastic variance")
+    variance_axis.set_ylim(*bounded_axis_limits(variance_means, variance_cis, lower_bound=0.0, padding_fraction=0.10))
     variance_axis.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
     variance_axis.spines["top"].set_visible(False)
     handles_left, labels_left = axes[0].get_legend_handles_labels()
     handles_right, labels_right = variance_axis.get_legend_handles_labels()
     axes[0].legend(handles_left + handles_right, labels_left + labels_right, loc="upper left", frameon=False)
 
-    axes[1].errorbar(
-        x_positions,
-        [point["acc_mean"] for point in sampling_points],
-        yerr=[point["acc_ci"] for point in sampling_points],
-        marker="s",
-        color=PALETTE["rose"],
-        linewidth=2.0,
-        capsize=3,
-        label="Resolved accuracy",
+    metric_specs = [
+        ("acc_mean", "acc_ci", "s", PALETTE["rose"], 2.0, "Resolved accuracy"),
+        ("f1_mean", "f1_ci", "^", PALETTE["blue"], 1.8, "Resolved Macro-F1"),
+        ("coverage_mean", "coverage_ci", "o", PALETTE["green"], 1.8, "Coverage"),
+    ]
+    decision_means: List[float] = []
+    decision_cis: List[float] = []
+    for mean_field, ci_field, marker, color, linewidth, label in metric_specs:
+        means = [point[mean_field] for point in sampling_points]
+        cis = [point[ci_field] for point in sampling_points]
+        decision_means.extend(means)
+        decision_cis.extend(cis)
+        axes[1].errorbar(
+            x_positions,
+            means,
+            yerr=bounded_confidence_errors(means, cis, lower_bound=0.0, upper_bound=1.0),
+            marker=marker,
+            color=color,
+            linewidth=linewidth,
+            capsize=3,
+            label=label,
+        )
+    metric_axis_lower, metric_axis_upper = bounded_axis_limits(
+        decision_means,
+        decision_cis,
+        lower_bound=0.0,
+        upper_bound=1.0,
+        padding_fraction=0.04,
     )
-    axes[1].errorbar(
-        x_positions,
-        [point["f1_mean"] for point in sampling_points],
-        yerr=[point["f1_ci"] for point in sampling_points],
-        marker="^",
-        color=PALETTE["blue"],
-        linewidth=1.8,
-        capsize=3,
-        label="Resolved Macro-F1",
-    )
-    axes[1].errorbar(
-        x_positions,
-        [point["coverage_mean"] for point in sampling_points],
-        yerr=[point["coverage_ci"] for point in sampling_points],
-        marker="o",
-        color=PALETTE["green"],
-        linewidth=1.8,
-        capsize=3,
-        label="Coverage",
-    )
+    metric_axis_span = metric_axis_upper - metric_axis_lower
     for x_value, point in zip(x_positions, sampling_points):
+        upper_edges = [
+            bounded_confidence_interval(point[mean_field], point[ci_field], 0.0, 1.0)[1]
+            for mean_field, ci_field, _, _, _, _ in metric_specs
+        ]
         axes[1].text(
             x_value,
-            min(0.985, max(point["acc_mean"], point["f1_mean"], point["coverage_mean"]) + 0.018),
+            min(metric_axis_upper - 0.02 * metric_axis_span, max(upper_edges) + 0.018),
             f"n={point['seed_count']}",
             ha="center",
             fontsize=7,
@@ -701,13 +879,8 @@ def build_rebuttal_tradeoff_figure(
     axes[1].set_ylabel("Decision metric")
     axes[1].set_xticks(x_positions)
     axes[1].set_xticklabels([str(value) for value in sample_values])
-    y_values = [
-        point[field]
-        for point in sampling_points
-        for field in ["acc_mean", "f1_mean", "coverage_mean"]
-    ]
-    axes[1].set_ylim(max(0.0, min(y_values) - 0.05), min(1.0, max(y_values) + 0.07))
-    axes[1].set_title("Variance-Aware Decisions")
+    axes[1].set_ylim(metric_axis_lower, metric_axis_upper)
+    axes[1].set_title("Decision Trade-off")
     axes[1].grid(alpha=0.22)
     axes[1].spines["top"].set_visible(False)
     axes[1].spines["right"].set_visible(False)
@@ -757,11 +930,11 @@ def build_early_table(
         f"{window} min" if unit_by_dataset[datasets[0]] == "minutes" else f"{window} hop"
         for window in windows_by_dataset[datasets[0]]
     ]
-    body_lines: List[str] = []
+    metric_values_by_model: Dict[str, Dict[str, Dict[str, Dict[int, List[float]]]]] = {}
     for model in SELECTED_MODELS:
-        metric_values_by_dataset: Dict[str, Dict[str, Dict[int, List[float]]]] = {}
+        metric_values_by_model[model] = {}
         for dataset in datasets:
-            metric_values_by_dataset[dataset] = {"acc": {}, "macro_f1": {}, "ece": {}}
+            metric_values_by_model[model][dataset] = {"acc": {}, "macro_f1": {}, "ece": {}}
             for window in windows_by_dataset[dataset]:
                 tag = f"early_{int(window)}_{unit_by_dataset[dataset]}"
                 metrics = collect_prediction_metric_values(
@@ -774,14 +947,34 @@ def build_early_table(
                     expected_seed_keys=expected_seed_keys,
                     ece_bins=ece_bins,
                 )
-                for metric_name in metric_values_by_dataset[dataset]:
-                    metric_values_by_dataset[dataset][metric_name][window] = metrics[metric_name]
+                for metric_name in metric_values_by_model[model][dataset]:
+                    metric_values_by_model[model][dataset][metric_name][window] = metrics[metric_name]
+
+    best_values: Dict[Tuple[str, int, str], float] = {}
+    for dataset in datasets:
+        for window in windows_by_dataset[dataset]:
+            for metric_name in ("acc", "macro_f1", "ece"):
+                means = [
+                    mean_confidence(metric_values_by_model[model][dataset][metric_name][window])[0]
+                    for model in SELECTED_MODELS
+                ]
+                if metric_name == "ece":
+                    best_values[(dataset, window, metric_name)] = min(means)
+                else:
+                    best_values[(dataset, window, metric_name)] = max(means)
+
+    body_lines: List[str] = []
+    for model in SELECTED_MODELS:
         for metric_label, metric_name in [("Acc", "acc"), ("Macro-F1", "macro_f1"), ("ECE", "ece")]:
             row_label = MODEL_LABELS[model] if metric_name == "acc" else ""
             values = [row_label, metric_label]
             for dataset in datasets:
                 for window in windows_by_dataset[dataset]:
-                    values.append(format_stat(metric_values_by_dataset[dataset][metric_name][window]))
+                    cell = format_stat(metric_values_by_model[model][dataset][metric_name][window])
+                    mean_value, _ = mean_confidence(metric_values_by_model[model][dataset][metric_name][window])
+                    if math.isclose(mean_value, best_values[(dataset, window, metric_name)], rel_tol=1e-12, abs_tol=1e-12):
+                        cell = highlight_best_cell(cell)
+                    values.append(cell)
             body_lines.append(" & ".join(values) + r" \\")
         body_lines.append(r"\midrule")
     if body_lines:
@@ -879,7 +1072,7 @@ def build_latency_table(results_dir: Path, expected_seed_keys: Set[str]) -> str:
         ("RumorDiffusion ($S=1$)", "sampling_sweep", "twitter16", "twitter16", "rumordiffusion", {"tag": "early_10_minutes_samples_1", "samples": "1"}),
         ("RumorDiffusion (early-stop, $S=2$)", "early_stop", "twitter16", "twitter16", "rumordiffusion", {"tag": "early_10_minutes", "samples": "2"}),
     ]
-    body_lines = []
+    row_entries: List[Dict[str, Any]] = []
     for label, artifact_type, dataset, source_dataset, model, filters in entries:
         tag = filters.get("tag")
         extra_filters = {key: value for key, value in filters.items() if key != "tag"}
@@ -904,9 +1097,24 @@ def build_latency_table(results_dir: Path, expected_seed_keys: Set[str]) -> str:
             expected_seed_keys=expected_seed_keys,
         )
         values = collect_revision_metric_values(rows, ["latency_mean_ms", "latency_p95_ms"], f"Latency artifact {label}")
-        body_lines.append(
-            f"{label} & {mean_confidence(values['latency_mean_ms'])[0]:.2f} & {mean_confidence(values['latency_p95_ms'])[0]:.2f} " + r"\\"
+        row_entries.append(
+            {
+                "label": label,
+                "mean_ms": mean_confidence(values["latency_mean_ms"])[0],
+                "p95_ms": mean_confidence(values["latency_p95_ms"])[0],
+            }
         )
+    best_mean_ms = min(entry["mean_ms"] for entry in row_entries)
+    best_p95_ms = min(entry["p95_ms"] for entry in row_entries)
+    body_lines = []
+    for entry in row_entries:
+        mean_cell = f"{entry['mean_ms']:.2f}"
+        p95_cell = f"{entry['p95_ms']:.2f}"
+        if math.isclose(float(entry["mean_ms"]), best_mean_ms, rel_tol=1e-12, abs_tol=1e-12):
+            mean_cell = highlight_best_cell(mean_cell)
+        if math.isclose(float(entry["p95_ms"]), best_p95_ms, rel_tol=1e-12, abs_tol=1e-12):
+            p95_cell = highlight_best_cell(p95_cell)
+        body_lines.append(f"{entry['label']} & {mean_cell} & {p95_cell} " + r"\\")
     return "\n".join(
         [
             r"\begin{table}[!h]",
@@ -933,7 +1141,7 @@ def build_sampling_budget_table(
     expected_samples: Sequence[int],
 ) -> str:
     revision_rows = read_rows(results_dir / "revision_artifacts.csv")
-    body_lines = []
+    row_entries: List[Dict[str, Any]] = []
     variance_values = []
     for samples in expected_samples:
         rows = collect_revision_rows(
@@ -953,22 +1161,38 @@ def build_sampling_budget_table(
             f"Sampling-budget artifact S={samples}",
         )
         variance_values.append((int(samples), mean_confidence(values["mean_var"])[0]))
-        body_lines.append(
-            " & ".join(
-                [
-                    str(int(samples)),
-                    f"{mean_confidence(values['coverage'])[0]:.3f}",
-                    f"{mean_confidence(values['acc_resolved'])[0]:.3f}",
-                    f"{mean_confidence(values['resolved_macro_f1'])[0]:.3f}",
-                    f"{mean_confidence(values['resolved_ece'])[0]:.3f}",
-                    f"{mean_confidence(values['latency_mean_ms'])[0]:.2f}",
-                    f"{mean_confidence(values['latency_p95_ms'])[0]:.2f}",
-                ]
-            )
-            + r" \\"
+        row_entries.append(
+            {
+                "samples": int(samples),
+                "coverage": mean_confidence(values["coverage"])[0],
+                "acc_resolved": mean_confidence(values["acc_resolved"])[0],
+                "resolved_macro_f1": mean_confidence(values["resolved_macro_f1"])[0],
+                "resolved_ece": mean_confidence(values["resolved_ece"])[0],
+                "latency_mean_ms": mean_confidence(values["latency_mean_ms"])[0],
+                "latency_p95_ms": mean_confidence(values["latency_p95_ms"])[0],
+            }
         )
     if not any(samples > 1 and value > 0.0 for samples, value in variance_values):
         raise RuntimeError("Sampling-budget table lacks nonzero stochastic variance for S>1.")
+    higher_is_better = ["coverage", "acc_resolved", "resolved_macro_f1"]
+    lower_is_better = ["resolved_ece", "latency_mean_ms", "latency_p95_ms"]
+    best_values = {field: max(entry[field] for entry in row_entries) for field in higher_is_better}
+    best_values.update({field: min(entry[field] for entry in row_entries) for field in lower_is_better})
+    body_lines = []
+    for entry in row_entries:
+        cells = [
+            str(int(entry["samples"])),
+            f"{entry['coverage']:.3f}",
+            f"{entry['acc_resolved']:.3f}",
+            f"{entry['resolved_macro_f1']:.3f}",
+            f"{entry['resolved_ece']:.3f}",
+            f"{entry['latency_mean_ms']:.2f}",
+            f"{entry['latency_p95_ms']:.2f}",
+        ]
+        for index, field in enumerate(higher_is_better + lower_is_better, start=1):
+            if math.isclose(float(entry[field]), best_values[field], rel_tol=1e-12, abs_tol=1e-12):
+                cells[index] = highlight_best_cell(cells[index])
+        body_lines.append(" & ".join(cells) + r" \\")
     return "\n".join(
         [
             r"\begin{table}[!h]",
@@ -991,7 +1215,7 @@ def build_sampling_budget_table(
 
 def build_threshold_table(results_dir: Path, expected_seed_keys: Set[str], display_thresholds: Sequence[Dict[str, Any]]) -> str:
     revision_rows = read_rows(results_dir / "revision_artifacts.csv")
-    body_lines = []
+    row_entries: List[Dict[str, Any]] = []
     for setting in display_thresholds:
         tau_low = float(setting["tau_low"])
         tau_high = float(setting["tau_high"])
@@ -1016,19 +1240,34 @@ def build_threshold_table(results_dir: Path, expected_seed_keys: Set[str], displ
             ["coverage", "acc_resolved", "resolved_macro_f1", "resolved_ece", "latency_mean_ms"],
             f"Threshold artifact tau={tau_low},{tau_high},gamma={gamma}",
         )
-        body_lines.append(
-            " & ".join(
-                [
-                    rf"$({tau_low:.1f}, {tau_high:.1f}, {gamma:.2f})$",
-                    f"{mean_confidence(values['coverage'])[0]:.3f}",
-                    f"{mean_confidence(values['acc_resolved'])[0]:.3f}",
-                    f"{mean_confidence(values['resolved_macro_f1'])[0]:.3f}",
-                    f"{mean_confidence(values['resolved_ece'])[0]:.3f}",
-                    f"{mean_confidence(values['latency_mean_ms'])[0]:.2f}",
-                ]
-            )
-            + r" \\"
+        row_entries.append(
+            {
+                "threshold": rf"$({tau_low:.1f}, {tau_high:.1f}, {gamma:.2f})$",
+                "coverage": mean_confidence(values["coverage"])[0],
+                "acc_resolved": mean_confidence(values["acc_resolved"])[0],
+                "resolved_macro_f1": mean_confidence(values["resolved_macro_f1"])[0],
+                "resolved_ece": mean_confidence(values["resolved_ece"])[0],
+                "latency_mean_ms": mean_confidence(values["latency_mean_ms"])[0],
+            }
         )
+    higher_is_better = ["coverage", "acc_resolved", "resolved_macro_f1"]
+    lower_is_better = ["resolved_ece", "latency_mean_ms"]
+    best_values = {field: max(entry[field] for entry in row_entries) for field in higher_is_better}
+    best_values.update({field: min(entry[field] for entry in row_entries) for field in lower_is_better})
+    body_lines = []
+    for entry in row_entries:
+        cells = [
+            entry["threshold"],
+            f"{entry['coverage']:.3f}",
+            f"{entry['acc_resolved']:.3f}",
+            f"{entry['resolved_macro_f1']:.3f}",
+            f"{entry['resolved_ece']:.3f}",
+            f"{entry['latency_mean_ms']:.2f}",
+        ]
+        for index, field in enumerate(higher_is_better + lower_is_better, start=1):
+            if math.isclose(float(entry[field]), best_values[field], rel_tol=1e-12, abs_tol=1e-12):
+                cells[index] = highlight_best_cell(cells[index])
+        body_lines.append(" & ".join(cells) + r" \\")
     return "\n".join(
         [
             r"\begin{table}[!h]",
@@ -1058,9 +1297,11 @@ def build_ablation_table(
 ) -> str:
     prediction_rows = read_rows(results_dir / "predictions.csv")
     windows, unit = resolve_windows_for_dataset(contract, dataset)
-    body_lines = []
+    row_entries: List[Dict[str, Any]] = []
     for model, label, calibration_state in ABLATION_ROWS:
         values = [label]
+        metric_means: List[float] = []
+        metric_directions: List[str] = []
         for window in windows:
             tag = f"early_{int(window)}_{unit}"
             if calibration_state == "uncalibrated":
@@ -1077,6 +1318,23 @@ def build_ablation_table(
             )
             values.append(format_stat(metrics["macro_f1"]))
             values.append(format_stat(metrics["ece"]))
+            metric_means.append(mean_confidence(metrics["macro_f1"])[0])
+            metric_directions.append("max")
+            metric_means.append(mean_confidence(metrics["ece"])[0])
+            metric_directions.append("min")
+        row_entries.append({"values": values, "metric_means": metric_means, "metric_directions": metric_directions})
+    best_values = []
+    for index, direction in enumerate(row_entries[0]["metric_directions"]):
+        values = [entry["metric_means"][index] for entry in row_entries]
+        best_values.append(max(values) if direction == "max" else min(values))
+    body_lines = []
+    for entry in row_entries:
+        values = [entry["values"][0]]
+        for index, cell in enumerate(entry["values"][1:]):
+            if math.isclose(entry["metric_means"][index], best_values[index], rel_tol=1e-12, abs_tol=1e-12):
+                values.append(highlight_best_cell(cell))
+            else:
+                values.append(cell)
         body_lines.append(" & ".join(values) + r" \\")
     header_cells = ["Variant"]
     for window in windows:
@@ -1194,6 +1452,7 @@ def build_case_study_table(results_dir: Path, raw_root: Path) -> str:
             r"\begin{table*}[!h]",
             r"\centering",
             r"\caption{Qualitative decision traces selected by the explain pipeline.}",
+            r"\resizebox{\textwidth}{!}{%",
             r"\label{tab:case_study_twitter16}",
             r"\small",
             r"\setlength{\tabcolsep}{4pt}",
@@ -1204,6 +1463,7 @@ def build_case_study_table(results_dir: Path, raw_root: Path) -> str:
             *body_lines,
             r"\bottomrule",
             r"\end{tabular}",
+            r"}",
             r"\end{table*}",
             "",
         ]
@@ -1392,6 +1652,7 @@ def main() -> None:
     parser.add_argument("--figures-dir", default="Docs/paper/Figs/generated", help="Directory for generated figures")
     parser.add_argument("--overview-figure", default="Docs/paper/Figs/overview.pdf", help="Path for the method overview figure")
     parser.add_argument("--rebuttal-tradeoff-copy", default="Docs/rebuttal/responses/round1/Figs/deployment_tradeoff.pdf", help="Reader-facing response copy of the deployment trade-off figure")
+    parser.add_argument("--transfer-table-only", action="store_true", help="Only regenerate the source-only transfer table")
     args = parser.parse_args()
 
     results_dir = Path(args.results_dir)
@@ -1407,6 +1668,17 @@ def main() -> None:
     expected_seed_keys = contract["seed_keys"]
     expected_samples = contract["samples"]
     ece_bins = int(contract["ece_bins"])
+
+    if bool(args.transfer_table_only):
+        transfer_table = build_transfer_table(
+            results_dir,
+            expected_seed_keys,
+            ece_bins,
+            contract["transfer_pairs"],
+            contract["transfer_models"],
+        )
+        write_text(tables_dir / "transfer_results.tex", transfer_table)
+        return
 
     twitter_table = build_main_table(
         results_dir=results_dir,
@@ -1424,7 +1696,13 @@ def main() -> None:
         expected_seed_keys=expected_seed_keys,
         ece_bins=ece_bins,
     )
-    transfer_table = build_transfer_table(results_dir, expected_seed_keys)
+    transfer_table = build_transfer_table(
+        results_dir,
+        expected_seed_keys,
+        ece_bins,
+        contract["transfer_pairs"],
+        contract["transfer_models"],
+    )
     early_twitter_table = build_early_table(
         results_dir=results_dir,
         datasets=["twitter15", "twitter16"],

@@ -61,6 +61,24 @@ model:
     cache_potentials: false
     infer_amp: true
     uncertainty_force_ctdm: true
+    prototype_residual:
+      enabled: false
+      temperature: 0.07
+      momentum: 0.95
+      logit_weight: 0.0
+      min_count: 1
+    semantic_residual:
+      enabled: false
+      use_root: true
+      use_text: true
+      dropout: 0.2
+      logit_weight: 0.0
+    posterior_aggregation:
+      enabled: false
+      samples: 1
+      mode: mean_logits
+      force_ctdm: false
+      stochastic: false
     # Optional class embedding to enhance class-awareness (disabled by default for stability)
     use_class_embedding: false
     transformer:

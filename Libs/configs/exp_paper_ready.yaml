@@ -40,9 +40,9 @@ dataset:
     drop_node: 0.0
     seed: 1024
 device:
-  force_cpu: false
+  force_cpu: true
   gpu_id: 0
-  type: cuda
+  type: cpu
 evaluation:
   ece_bins: 15
   class_names:
@@ -105,53 +105,53 @@ sbatch:
   conda_env: hw
   profiles:
     benchmark:
-      partition: gpu1
-      nodelist: gpu03
-      gres: gpu:1
+      partition: cpu
+      nodelist: ""
+      gres: ""
       cpus_per_task: 8
       mem: 32G
       log_dir: Output/logs/paper_aligned
-      cuda_devices: [0]
+      cuda_devices: [""]
     rumordiffusion_train:
-      partition: gpu1
-      nodelist: gpu03
-      gres: gpu:1
+      partition: cpu
+      nodelist: ""
+      gres: ""
       cpus_per_task: 8
       mem: 48G
       log_dir: Output/logs/paper_aligned
-      cuda_devices: [0]
+      cuda_devices: [""]
     transfer:
-      partition: gpu1
-      nodelist: gpu03
-      gres: gpu:1
+      partition: cpu
+      nodelist: ""
+      gres: ""
       cpus_per_task: 8
       mem: 32G
       log_dir: Output/logs/paper_aligned
-      cuda_devices: [0]
+      cuda_devices: [""]
     ablation:
-      partition: gpu1
-      nodelist: gpu03
-      gres: gpu:1
+      partition: cpu
+      nodelist: ""
+      gres: ""
       cpus_per_task: 8
       mem: 32G
       log_dir: Output/logs/paper_aligned
-      cuda_devices: [0]
+      cuda_devices: [""]
     hparam:
-      partition: gpu1
-      nodelist: gpu03
-      gres: gpu:1
+      partition: cpu
+      nodelist: ""
+      gres: ""
       cpus_per_task: 8
       mem: 32G
       log_dir: Output/logs/paper_aligned
-      cuda_devices: [0]
+      cuda_devices: [""]
     explain:
-      partition: gpu1
-      nodelist: gpu03
-      gres: gpu:1
+      partition: cpu
+      nodelist: ""
+      gres: ""
       cpus_per_task: 8
       mem: 16G
       log_dir: Output/logs/paper_aligned
-      cuda_devices: [0]
+      cuda_devices: [""]
     explain_summary:
       partition: cpu
       nodelist: cpu04
@@ -182,9 +182,14 @@ transfer:
     - source: weibo
       target: pheme
   models:
+    - Libs/configs/baselines/agad.yaml
+    - Libs/configs/baselines/hpcl_cascade.yaml
+    - Libs/configs/baselines/tpso.yaml
     - Libs/configs/baselines/rumordiffusion.yaml
   ckpt_name: best.pt
   lp_edges_policy: require_existing
+  metric_only: true
+  skip_existing: false
   results_path: Output/results/paper_aligned/transfer.csv
   adaptation:
     target_split: train

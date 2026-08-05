@@ -1850,6 +1850,30 @@ def run_transfer_eval(exp_cfg: Dict[str, Any], args: argparse.Namespace) -> None
     if not transfer_models:
         transfer_models = [p.strip() for p in args.model.split(",") if p.strip()]
     model_cfgs = [read_yaml_like(p) for p in transfer_models]
+    metric_only = bool(transfer_cfg.get("metric_only", False))
+    skip_existing = bool(transfer_cfg.get("skip_existing", False))
+    existing_transfer_rows: List[Dict[str, str]] = []
+    if skip_existing:
+        _, existing_transfer_rows = read_csv_rows(transfer_csv)
+        existing_transfer_rows = dedupe_csv_rows(
+            existing_transfer_rows,
+            key_fields=["train_dataset", "test_dataset", "transfer_mode", "model", "seed"],
+        )
+
+    def has_existing_transfer_metric(source: str, target: str, model_name: str, seed: int) -> bool:
+        for row in existing_transfer_rows:
+            if row.get("train_dataset", "") != source:
+                continue
+            if row.get("test_dataset", "") != target:
+                continue
+            if row.get("transfer_mode", "") != "source_only":
+                continue
+            if row.get("model", "") != model_name:
+                continue
+            if row.get("seed", "") != str(int(seed)):
+                continue
+            return all(parse_numeric_cell(row.get(field, "")) is not None for field in ("acc", "macro_f1", "ece"))
+        return False
 
     for pair in transfer_pairs:
         source = str(pair["source"])
@@ -1857,6 +1881,9 @@ def run_transfer_eval(exp_cfg: Dict[str, Any], args: argparse.Namespace) -> None
         for model_path, model_cfg in zip(transfer_models, model_cfgs):
             model_name = str(model_cfg["name"]).lower()
             for seed in seeds:
+                if skip_existing and has_existing_transfer_metric(source, target, model_name, int(seed)):
+                    print(f"[transfer] skip existing {source}->{target} model={model_name} seed={seed}")
+                    continue
                 ckpt_path = os.path.join(
                     base_ckpt_dir,
                     source,
@@ -1886,6 +1913,8 @@ def run_transfer_eval(exp_cfg: Dict[str, Any], args: argparse.Namespace) -> None
                 ]
                 if getattr(args, "sampling_budget_only", False):
                     cmd.append("--sampling_budget_only")
+                if metric_only:
+                    cmd.append("--transfer_metric_only")
                 print(f"[transfer] {source}->{target} model={model_name} seed={seed} ckpt={ckpt_path}")
                 subprocess.run(cmd, check=True)
             refresh_transfer_aggregate_row(
@@ -2258,6 +2287,8 @@ def main() -> None:
                         help="Refresh paired-bootstrap revision artifact rows from exported predictions")
     parser.add_argument("--sampling_budget_only", action="store_true",
                         help="Refresh stochastic sampling-budget revision rows after loading checkpoints")
+    parser.add_argument("--transfer_metric_only", action="store_true",
+                        help="For source-only transfer child runs, stop after exporting main transfer metrics")
     args = parser.parse_args()
 
     exp_cfg = read_yaml_like(args.exp)
@@ -2395,6 +2426,11 @@ def main() -> None:
     for model_cfg, model_path in zip(model_cfgs, model_paths):
         name = model_cfg["name"].lower()
         is_rumordiffusion = name == "rumordiffusion" or name.startswith("rumordiffusion_")
+        active_training_cfg = _deep_merge(
+            exp_cfg.get("training", {}),
+            model_cfg.get("training", {}) if isinstance(model_cfg.get("training", {}), dict) else {},
+        )
+        train_max_samples = int(active_training_cfg.get("max_samples", 0))
         lp_forced = name == "lp_gcn"
         use_lp = True if lp_forced else use_lp_edges
         robust_text_cfg: Dict[str, Any] = {}  # default to avoid undefined access
@@ -2754,30 +2790,30 @@ def main() -> None:
                     ctdm.edge_drop_rate = float(struct_cfg.get("edge", 0.0))
 
                 ctdm_train_cfg = TrainerConfig(
-                    epochs=int(exp_cfg["training"].get("epochs_ctdm", exp_cfg["training"]["epochs"])),
-                    learning_rate=float(exp_cfg["training"].get("lr_ctdm", exp_cfg["training"].get("lr", 3e-4))),
-                    weight_decay=float(exp_cfg["training"].get("weight_decay_ctdm", exp_cfg["training"].get("weight_decay", 0.0))),
-                    batch_size=int(exp_cfg["training"].get("batch_size_ctdm", 1)),
-                    grad_clip=float(exp_cfg["training"].get("grad_clip", 0.0)),
-                    amp=bool(exp_cfg["training"].get("amp", True)),
+                    epochs=int(active_training_cfg.get("epochs_ctdm", active_training_cfg["epochs"])),
+                    learning_rate=float(active_training_cfg.get("lr_ctdm", active_training_cfg.get("lr", 3e-4))),
+                    weight_decay=float(active_training_cfg.get("weight_decay_ctdm", active_training_cfg.get("weight_decay", 0.0))),
+                    batch_size=int(active_training_cfg.get("batch_size_ctdm", 1)),
+                    grad_clip=float(active_training_cfg.get("grad_clip", 0.0)),
+                    amp=bool(active_training_cfg.get("amp", True)),
                     early_stopping_patience=int(
-                        exp_cfg["training"].get(
+                        active_training_cfg.get(
                             "early_stopping_patience_ctdm",
-                            exp_cfg["training"].get("early_stopping_patience", 20),
+                            active_training_cfg.get("early_stopping_patience", 20),
                         )
                     ),
-                    num_workers=int(exp_cfg["training"].get("num_workers", 4)),
+                    num_workers=int(active_training_cfg.get("num_workers", 4)),
                     device=device,
-                    use_tqdm=bool(exp_cfg["training"].get("use_tqdm", True)),
+                    use_tqdm=bool(active_training_cfg.get("use_tqdm", True)),
                     class_weights=None,
-                    max_batches_per_epoch=exp_cfg["training"].get(
+                    max_batches_per_epoch=active_training_cfg.get(
                         "max_batches_per_epoch_ctdm",
-                        exp_cfg["training"].get("max_batches_per_epoch"),
+                        active_training_cfg.get("max_batches_per_epoch"),
                     ),
                     min_epochs=int(
-                        exp_cfg["training"].get(
+                        active_training_cfg.get(
                             "min_epochs_ctdm",
-                            exp_cfg["training"].get("min_epochs", 30),
+                            active_training_cfg.get("min_epochs", 30),
                         )
                     ),
                     selection_metric="objective_loss",
@@ -2807,7 +2843,7 @@ def main() -> None:
                     ds_train, list(range(min(len(ds_train), train_max_samples)))
                 )
                 ctdm_val_ds = _maybe_subset_ctdm(ds_val)
-                ctdm_metadata_model_name = name
+                ctdm_metadata_model_name = "rumordiffusion"
                 ctdm_pretrain_dir = os.path.join(
                     ctdm_ckpt_root, source_dataset_name, ctdm_subdir, f"seed{seed}"
                 )
@@ -2818,7 +2854,7 @@ def main() -> None:
                     derived_ctdm_path = derive_ctdm_checkpoint_from_arbiter_checkpoint(args.ckpt, ctdm_subdir=ctdm_subdir)
                     if derived_ctdm_path is not None and os.path.isfile(derived_ctdm_path):
                         ctdm_pretrain_path = derived_ctdm_path
-                reuse_ctdm_pretrain = bool(exp_cfg["training"].get("reuse_ctdm_pretrain", False))
+                reuse_ctdm_pretrain = bool(active_training_cfg.get("reuse_ctdm_pretrain", False))
                 ctdm_checkpoint_metadata = build_checkpoint_metadata(
                     model_name=ctdm_metadata_model_name,
                     stage="ctdm",
@@ -2831,20 +2867,20 @@ def main() -> None:
                         "text": rd_cfg.get("text", {}),
                         "dataset_text_runtime": text_runtime_cfg,
                         "training": {
-                            "epochs_ctdm": int(exp_cfg["training"].get("epochs_ctdm", exp_cfg["training"]["epochs"])),
-                            "lr_ctdm": float(exp_cfg["training"].get("lr_ctdm", exp_cfg["training"].get("lr", 3e-4))),
-                            "weight_decay_ctdm": float(exp_cfg["training"].get("weight_decay_ctdm", exp_cfg["training"].get("weight_decay", 0.0))),
-                            "batch_size_ctdm": int(exp_cfg["training"].get("batch_size_ctdm", 1)),
+                            "epochs_ctdm": int(active_training_cfg.get("epochs_ctdm", active_training_cfg["epochs"])),
+                            "lr_ctdm": float(active_training_cfg.get("lr_ctdm", active_training_cfg.get("lr", 3e-4))),
+                            "weight_decay_ctdm": float(active_training_cfg.get("weight_decay_ctdm", active_training_cfg.get("weight_decay", 0.0))),
+                            "batch_size_ctdm": int(active_training_cfg.get("batch_size_ctdm", 1)),
                             "early_stopping_patience_ctdm": int(
-                                exp_cfg["training"].get(
+                                active_training_cfg.get(
                                     "early_stopping_patience_ctdm",
-                                    exp_cfg["training"].get("early_stopping_patience", 20),
+                                    active_training_cfg.get("early_stopping_patience", 20),
                                 )
                             ),
                             "min_epochs_ctdm": int(
-                                exp_cfg["training"].get(
+                                active_training_cfg.get(
                                     "min_epochs_ctdm",
-                                    exp_cfg["training"].get("min_epochs", 30),
+                                    active_training_cfg.get("min_epochs", 30),
                                 )
                             ),
                         },
@@ -2892,11 +2928,11 @@ def main() -> None:
                                 model=ctdm,
                                 dataset=split_dataset,
                                 out_dir=potentials_dir,
-                                batch_size=int(exp_cfg["training"].get("potentials_batch_size", 1)),
-                                num_workers=int(exp_cfg["training"].get("potentials_num_workers", 0)),
+                                batch_size=int(active_training_cfg.get("potentials_batch_size", 1)),
+                                num_workers=int(active_training_cfg.get("potentials_num_workers", 0)),
                                 device=device,
                                 stride=int(ctdm_cfg.get("t_stride", 20)),
-                                skip_existing=bool(exp_cfg["training"].get("reuse_cached_potentials", True)),
+                                skip_existing=bool(active_training_cfg.get("reuse_cached_potentials", True)),
                             )
                     if not os.path.isdir(potentials_dir):
                         raise FileNotFoundError(f"Missing RumorDiffusion potentials directory: {potentials_dir}")
@@ -3048,6 +3084,11 @@ def main() -> None:
                     loss_logging=bool(rd_loss_cfg.get("loss_logging", False)),
                     lambda_supcon=float(rd_loss_cfg.get("lambda_supcon", 0.0)),
                     supcon_temperature=float(rd_loss_cfg.get("supcon_temperature", 0.07)),
+                    prototype_residual_cfg=arb_cfg.get("prototype_residual", {}),
+                    semantic_residual_cfg=arb_cfg.get("semantic_residual", {}),
+                    posterior_aggregation_cfg=arb_cfg.get("posterior_aggregation", {}),
+                    root_feature_dim=int(num_features),
+                    text_feature_dim=int(text_channels),
                 )
                 logging.info(
                     "RD uncertainty cfg -> "
@@ -3236,21 +3277,21 @@ def main() -> None:
                     model_cfg["name"], model_cfg["model"], num_features, num_classes, text_channels=text_channels)
 
             trainer_cfg = TrainerConfig(
-                epochs=int(exp_cfg["training"]["epochs"]),
-                learning_rate=float(exp_cfg["training"].get("lr", 3e-4)),
-                weight_decay=float(exp_cfg["training"].get("weight_decay", 0.0)),
-                batch_size=int(exp_cfg["training"]["batch_size"]),
-                grad_clip=float(exp_cfg["training"].get("grad_clip", 0.0)),
-                amp=bool(exp_cfg["training"].get("amp", True)),
+                epochs=int(active_training_cfg["epochs"]),
+                learning_rate=float(active_training_cfg.get("lr", 3e-4)),
+                weight_decay=float(active_training_cfg.get("weight_decay", 0.0)),
+                batch_size=int(active_training_cfg["batch_size"]),
+                grad_clip=float(active_training_cfg.get("grad_clip", 0.0)),
+                amp=bool(active_training_cfg.get("amp", True)),
                 early_stopping_patience=int(
-                    exp_cfg["training"].get("early_stopping_patience", 20)),
-                num_workers=int(exp_cfg["training"].get("num_workers", 4)),
+                    active_training_cfg.get("early_stopping_patience", 20)),
+                num_workers=int(active_training_cfg.get("num_workers", 4)),
                 device=device,
-                use_tqdm=bool(exp_cfg["training"].get("use_tqdm", True)),
+                use_tqdm=bool(active_training_cfg.get("use_tqdm", True)),
                 class_weights=class_weights,
-                max_batches_per_epoch=exp_cfg["training"].get(
+                max_batches_per_epoch=active_training_cfg.get(
                     "max_batches_per_epoch"),
-                min_epochs=int(exp_cfg["training"].get("min_epochs", 30)),
+                min_epochs=int(active_training_cfg.get("min_epochs", 30)),
             )
 
             eval_cfg = exp_cfg.get("evaluation", {})
@@ -3323,7 +3364,7 @@ def main() -> None:
             ckpt_path = os.path.join(ckpt_dir, ckpt_filename)
             actual_ckpt_path = args.ckpt if args.ckpt else ckpt_path
 
-            wb_cfg = exp_cfg.get("training", {}).get("wandb", {})
+            wb_cfg = active_training_cfg.get("wandb", {})
             wb_enabled = bool(wb_cfg.get("enabled", False))
             if wb_enabled:
                 import wandb
@@ -3342,12 +3383,12 @@ def main() -> None:
                 )
             trainer = Trainer(model=m, cfg=trainer_cfg)
             if is_rumordiffusion:
-                joint_cfg = exp_cfg.get("training", {}).get("joint_finetuning", {})
+                joint_cfg = active_training_cfg.get("joint_finetuning", {})
                 if isinstance(joint_cfg, dict) and bool(joint_cfg.get("enabled", False)):
                     configure_ctdm_joint_finetuning(trainer.model, joint_cfg)
-                    arbiter_lr = float(joint_cfg.get("arbiter_lr", exp_cfg["training"].get("lr", 3e-4)))
-                    ctdm_lr = float(joint_cfg.get("ctdm_lr", exp_cfg["training"].get("lr_ctdm", arbiter_lr * 0.1)))
-                    weight_decay_joint = float(joint_cfg.get("weight_decay", exp_cfg["training"].get("weight_decay", 0.0)))
+                    arbiter_lr = float(joint_cfg.get("arbiter_lr", active_training_cfg.get("lr", 3e-4)))
+                    ctdm_lr = float(joint_cfg.get("ctdm_lr", active_training_cfg.get("lr_ctdm", arbiter_lr * 0.1)))
+                    weight_decay_joint = float(joint_cfg.get("weight_decay", active_training_cfg.get("weight_decay", 0.0)))
                     arbiter_params: List[nn.Parameter] = []
                     ctdm_params: List[nn.Parameter] = []
                     other_params: List[nn.Parameter] = []
@@ -3400,13 +3441,13 @@ def main() -> None:
                     config_payload={
                         "rumordiffusion": checkpoint_relevant_rumordiffusion_cfg(rd_cfg),
                         "training": {
-                            "epochs": int(exp_cfg["training"]["epochs"]),
-                            "lr": float(exp_cfg["training"].get("lr", 3e-4)),
-                            "weight_decay": float(exp_cfg["training"].get("weight_decay", 0.0)),
-                            "batch_size": int(exp_cfg["training"]["batch_size"]),
-                            "early_stopping_patience": int(exp_cfg["training"].get("early_stopping_patience", 20)),
-                            "min_epochs": int(exp_cfg["training"].get("min_epochs", 30)),
-                            "joint_finetuning": exp_cfg.get("training", {}).get("joint_finetuning", {}),
+                            "epochs": int(active_training_cfg["epochs"]),
+                            "lr": float(active_training_cfg.get("lr", 3e-4)),
+                            "weight_decay": float(active_training_cfg.get("weight_decay", 0.0)),
+                            "batch_size": int(active_training_cfg["batch_size"]),
+                            "early_stopping_patience": int(active_training_cfg.get("early_stopping_patience", 20)),
+                            "min_epochs": int(active_training_cfg.get("min_epochs", 30)),
+                            "joint_finetuning": active_training_cfg.get("joint_finetuning", {}),
                         },
                         "prefix": prefix_cfg,
                         "observability": observability_cfg,
@@ -4080,6 +4121,12 @@ def main() -> None:
                     "test/macro_f1": float(test_metrics.get("macro_f1", 0.0)),
                 })
                 wandb.finish()
+
+            if bool(args.transfer_metric_only) and dataset_name != source_dataset_name:
+                logging.info(
+                    "Transfer metric-only evaluation completed after result and transfer CSV export."
+                )
+                continue
 
             early_windows, early_unit = resolve_early_observation_spec(
                 eval_cfg=eval_cfg,
