@@ -1,0 +1,66 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Packaging and build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+*.whl
+notebook.ipynb
+# Virtual environments and local config
+.env
+.envrc
+env/
+venv/
+.venv/
+.conda/
+
+# Tooling caches
+.cursor/
+.mypy_cache/
+.pytest_cache/
+.cache/
+.ruff_cache/
+.ipynb_checkpoints
+.coverage*
+htmlcov/
+
+# Editor settings
+.vscode/
+.idea/
+.DS_Store
+
+# Data and training artifacts
+Input/
+Output/
+runs/
+Docs/
+lightning_logs/
+wandb/
+tensorboard/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.npy
+*.npz
+*.pkl
+
+# Logs and reports
+*.log
+*.out
+*.err
+*.csv
+
+# Archives
+*.tar
+*.tar.gz
+*.zip
+*.7z
