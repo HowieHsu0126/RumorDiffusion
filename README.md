@@ -11,7 +11,7 @@ Official PyTorch and PyTorch Geometric (PyG) implementation, evaluation suite, a
 > *Haowei Xu, Chao Gao\*, Xianghua Li, and Zhen Wang*  
 > **Accepted in:** *ACM Transactions on Intelligent Systems and Technology (ACM TIST / ACM T-TIST)*  
 > **Affiliations:** *School of Artificial Intelligence, Optics and Electronics (iOPEN) and School of Cybersecurity, Northwestern Polytechnical University, Xi'an, Shaanxi, P.R. China*  
-> **Note:** *A preliminary version of this work ($D^2$) was presented at the Eighteenth ACM International Conference on Web Search and Data Mining (WSDM 2025).*
+> **Note:** *A preliminary version of this work (D²) was presented at the Eighteenth ACM International Conference on Web Search and Data Mining (WSDM 2025).*
 
 ---
 
@@ -40,53 +40,51 @@ To address partial observability and decision timing under incomplete propagatio
 
 ### 1. Predictive Distribution via Prefix-Conditioned Latent Simulation
 
-Let $o_k$ denote the social cascade prefix observed at early window $k$ (measured in elapsed minutes on timestamped streams or structural hop depth on tree-structured cascades), and let $\mathbf{c}^{(k)} = f_{\mathrm{pre}}(o_k)$ denote its encoded prefix condition vector. Rather than mapping $o_k$ to a single deterministic point estimate, RumorDiffusion introduces a latent state $\mathbf{x}_0$ representing the mature cascade and marginalizes the veracity prediction $y \in \{0, 1, \dots, C-1\}$ over the conditional distribution of plausible completions:
+Let $o_k$ denote the social cascade prefix observed at early window $k$ (measured in elapsed minutes on timestamped streams or structural hop depth on tree-structured cascades), and let $\mathbf{c}^{(k)}$ denote its encoded prefix condition vector produced by the prefix encoder $f_{\mathrm{pre}}$. Rather than mapping $o_k$ to a single deterministic point estimate, RumorDiffusion introduces a latent state $\mathbf{x}_0$ representing the mature cascade and marginalizes the veracity prediction $y \in \lbrace 0, 1, \dots, C-1 \rbrace$ over the conditional distribution of plausible completions:
 
 $$
-p(y \mid o_k) = \int p_\phi(y \mid \mathbf{x}_0, o_k)\, p_\theta(\mathbf{x}_0 \mid \mathbf{c}^{(k)})\, d\mathbf{x}_0
+\mathbf{c}^{(k)} = f_{\mathrm{pre}}(o_k), \qquad p(y \mid o_k) = \int p_\phi(y \mid \mathbf{x}_0, o_k) p_\theta(\mathbf{x}_0 \mid \mathbf{c}^{(k)}) d\mathbf{x}_0
 $$
 
-where $y$ is the cascade veracity label over $C$ classes, $o_k$ is the observed prefix at window $k$, $\mathbf{c}^{(k)}$ is the prefix condition vector produced by the prefix encoder $f_{\mathrm{pre}}$, $\mathbf{x}_0$ is the latent state of the complete cascade, $p_\theta(\mathbf{x}_0 \mid \mathbf{c}^{(k)})$ is the conditional distribution modeled by the diffusion generator with parameters $\theta$, and $p_\phi(y \mid \mathbf{x}_0, o_k)$ is the discriminative predictive distribution parameterized by arbiter weights $\phi$.
+where $y$ is the cascade veracity label over $C$ classes, $o_k$ is the observed prefix at window $k$, $\mathbf{c}^{(k)}$ is the prefix condition vector, $f_{\mathrm{pre}}$ is the prefix encoder, $\mathbf{x}_0$ is the latent state of the complete cascade, $p_\theta$ is the conditional diffusion distribution parameterized by generator weights $\theta$, and $p_\phi$ is the discriminative predictive distribution parameterized by arbiter weights $\phi$.
 
 ### 2. Prefix Graph Encoding and Masked Attentive Pooling
 
 Given the observed prefix graph $G^{(k)} = (V^{(k)}, E^{(k)})$ with recomputed structural and temporal node attributes $X^{(k)}$ (normalized time since the root post, tree depth, in-degree, out-degree, and normalized parent-child time gap), a residual message-passing backbone $\mathrm{GEnc}$ contextualizes node representations and pools them over the visible node mask:
 
 $$
-\left\{
-\begin{aligned}
-\mathbf{g}_j &= \mathrm{GEnc}\!\left(G^{(k)}, X^{(k)}\right)_j, \\
-\alpha_j^{(k)} &= \frac{m_j^{(k)} \exp\!\left(\mathbf{q}^\top \mathbf{g}_j\right)}{\sum_{\ell=1}^{M} m_\ell^{(k)} \exp\!\left(\mathbf{q}^\top \mathbf{g}_\ell\right)}, \qquad \mathbf{h}^{(k)} = \sum_{j=1}^{M} \alpha_j^{(k)} \mathbf{g}_j
-\end{aligned}
-\right.
+\mathbf{g}_j = \mathrm{GEnc}(G^{(k)}, X^{(k)})_j, \qquad \alpha_j^{(k)} = \frac{m_j^{(k)} \exp\left(\mathbf{q}^\top \mathbf{g}_j\right)}{\sum_{\ell=1}^{M} m_\ell^{(k)} \exp\left(\mathbf{q}^\top \mathbf{g}_\ell\right)}, \qquad \mathbf{h}^{(k)} = \sum_{j=1}^{M} \alpha_j^{(k)} \mathbf{g}_j
 $$
 
-where $j, \ell \in \{1, \dots, M\}$ index the $M$ candidate cascade nodes, $\mathbf{g}_j \in \mathbb{R}^{D_g}$ is the contextualized graph representation of node $j$ of dimension $D_g$, $m_j^{(k)} \in \{0, 1\}$ is the binary observability mask indicating whether node $j$ belongs to the root-connected prefix at window $k$, $\mathbf{q} \in \mathbb{R}^{D_g}$ is a learnable attention query vector, $\alpha_j^{(k)}$ is the normalized attention weight of node $j$, and $\mathbf{h}^{(k)} \in \mathbb{R}^{D_g}$ is the pooled cascade representation at window $k$.
+where $j, \ell \in \lbrace 1, \dots, M \rbrace$ index the $M$ candidate cascade nodes, $\mathbf{g}_j$ is the contextualized graph representation of node $j$ of dimension $D$, $m_j^{(k)} \in \lbrace 0, 1 \rbrace$ is the binary observability mask indicating whether node $j$ belongs to the root-connected prefix at window $k$, $\mathbf{q} \in \mathbb{R}^{D}$ is a learnable attention query vector, $\alpha_j^{(k)}$ is the normalized attention weight of node $j$, and $\mathbf{h}^{(k)} \in \mathbb{R}^{D}$ is the pooled cascade representation at window $k$.
 
 ### 3. Conditional Topological Diffusion Model (CTDM)
 
-During stage-one pretraining, mature training cascades supply the complete topology-and-feature state $\mathbf{x}_0 = \mathrm{vec}(A_{\mathrm{full}}, X_{\mathrm{full}})$, where $A_{\mathrm{full}}$ is the full training adjacency matrix and $X_{\mathrm{full}}$ is the full node feature matrix. A $T$-step Gaussian forward diffusion process perturbs $\mathbf{x}_0$ according to variance schedule $\{\beta_t\}_{t=1}^T$:
+During stage-one pretraining, mature training cascades supply the complete topology-and-feature state $\mathbf{x}_0$ constructed from the full training adjacency matrix $A_{\mathrm{full}}$ and full node feature matrix $X_{\mathrm{full}}$. A Gaussian forward diffusion process of $T$ steps perturbs $\mathbf{x}_0$ according to the variance schedule $\beta_1$, $\dots$, $\beta_T$ as follows:
 
 $$
-\left\{
-\begin{aligned}
-q(\mathbf{x}_t \mid \mathbf{x}_0) &= \mathcal{N}\!\left(\sqrt{\bar{\alpha}_t}\,\mathbf{x}_0,\; (1 - \bar{\alpha}_t)\mathbf{I}\right), \\
-\mathbf{x}_t &= \sqrt{\bar{\alpha}_t}\,\mathbf{x}_0 + \sqrt{1 - \bar{\alpha}_t}\,\boldsymbol{\epsilon}, \qquad \boldsymbol{\epsilon} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})
-\end{aligned}
-\right.
+q(\mathbf{x}_t \mid \mathbf{x}_0) = \mathcal{N}\left(\sqrt{\bar{\alpha}_t}\mathbf{x}_0, (1 - \bar{\alpha}_t)\mathbf{I}\right), \quad \mathbf{x}_t = \sqrt{\bar{\alpha}_t}\mathbf{x}_0 + \sqrt{1 - \bar{\alpha}_t}\epsilon, \quad \alpha_t = 1 - \beta_t, \quad \bar{\alpha}_t = \prod_{r=1}^{t} \alpha_r
 $$
 
-where $t \in \{1, \dots, T\}$ is the diffusion timestep, $\beta_t \in (0, 1)$ is the step variance, $\alpha_t = 1 - \beta_t$, $\bar{\alpha}_t = \prod_{r=1}^t \alpha_r$ is the cumulative signal retention factor, $\mathbf{I}$ is the identity matrix, $\boldsymbol{\epsilon}$ is standard Gaussian noise, and $\mathbf{x}_t$ is the noisy cascade state at step $t$. Using the $v$-parameterization denoiser $v_\theta(\mathbf{x}_t, t, y, \mathbf{x}_{\mathrm{obs}})$ conditioned on class hypothesis $y$ and observed prefix state $\mathbf{x}_{\mathrm{obs}}$, the diffusion training loss is:
+where $t \in \lbrace 1, \dots, T \rbrace$ is the diffusion timestep, $\beta_t \in (0, 1)$ is the step variance, $\alpha_t$ is the per-step signal retention factor, $\bar{\alpha}_t$ is the cumulative signal retention factor, $\mathbf{I}$ is the identity matrix, $\epsilon$ is standard Gaussian noise, and $\mathbf{x}_t$ is the noisy cascade state at step $t$. Using the velocity-parameterized denoiser $v_\theta$ conditioned on class hypothesis $y$ and observed prefix state $\mathbf{x}_{\mathrm{obs}}$, the diffusion training loss and reverse observation-anchoring update are:
 
 $$
-\mathcal{L}_{\mathrm{diff}} = \mathbb{E}_{(\mathbf{x}_0, \mathbf{x}_{\mathrm{obs}}, y),\, t,\, \boldsymbol{\epsilon}} \left[ \left\| v_\theta(\mathbf{x}_t, t, y, \mathbf{x}_{\mathrm{obs}}) - \left(\sqrt{\bar{\alpha}_t}\,\boldsymbol{\epsilon} - \sqrt{1 - \bar{\alpha}_t}\,\mathbf{x}_0\right) \right\|_2^2 \right]
+\mathcal{L}_{\mathrm{diff}} = \mathbb{E}_{t, \epsilon} \left[ \left\Vert v_\theta(\mathbf{x}_t, t, y, \mathbf{x}_{\mathrm{obs}}) - \left(\sqrt{\bar{\alpha}_t}\epsilon - \sqrt{1 - \bar{\alpha}_t}\mathbf{x}_0\right) \right\Vert_2^2 \right]
 $$
 
-where $\mathbf{x}_{\mathrm{obs}}$ is the observed prefix state, $v_\theta$ is the neural velocity predictor, and $\|\cdot\|_2$ denotes the Euclidean norm. During reverse inference with stride $\Delta t$ and classifier-free guidance scale $w$, observed entries are anchored at each reverse step via $\mathbf{x} \leftarrow (1 - M_{\mathrm{obs}}) \odot \mathbf{x} + M_{\mathrm{obs}} \odot \mathbf{x}_{\mathrm{obs}}$, where $M_{\mathrm{obs}}$ is the binary observation mask and $\odot$ denotes element-wise multiplication, and the denoised state is re-encoded with the fixed source-post sentence embedding to produce one potential vector $\mathbf{h}_c^{(s)} \in \mathbb{R}^{D_x}$ per class hypothesis $c \in \{0, \dots, C-1\}$ for draw $s$.
+$$
+\mathbf{x} \leftarrow (1 - M_{\mathrm{obs}}) \odot \mathbf{x} + M_{\mathrm{obs}} \odot \mathbf{x}_{\mathrm{obs}}
+$$
+
+where $\mathbf{x}_{\mathrm{obs}}$ is the observed prefix state, $v_\theta$ is the neural velocity predictor, $\Vert \cdot \Vert_2$ denotes the Euclidean norm, $M_{\mathrm{obs}}$ is the binary observation mask, and $\odot$ denotes element-wise multiplication. During reverse inference with stride $\Delta t$ and classifier-free guidance scale $w$, the denoised state is re-encoded with the fixed source-post sentence embedding to produce one potential vector $\mathbf{h}_c^{(s)}$ per class hypothesis $c \in \lbrace 0, \dots, C-1 \rbrace$ for draw $s$.
 
 ### 4. Frozen-CTDM Transformer Arbiter
 
-In stage two, CTDM parameters $\theta^\star$ are frozen and the Transformer arbiter $A_\phi$ maps the class-conditioned potential set $H^{(s)} = [\mathbf{h}_0^{(s)}, \dots, \mathbf{h}_{C-1}^{(s)}]$ (augmented with confusable-pair difference tokens) to class logits $\mathbf{z}_k^{(s)} = A_\phi(H^{(s)}, o_k)$:
+In stage two, CTDM parameters $\theta^\star$ are frozen and the Transformer arbiter $A_\phi$ maps the class-conditioned potential set $H^{(s)}$ (augmented with confusable-pair difference tokens) to class logits $\mathbf{z}_k^{(s)}$ as follows:
+
+$$
+H^{(s)} = \left[\mathbf{h}_0^{(s)}, \dots, \mathbf{h}_{C-1}^{(s)}\right], \qquad \mathbf{z}_k^{(s)} = A_\phi\left(H^{(s)}, o_k\right)
+$$
 
 $$
 \phi^\star = \arg\min_\phi \left( \mathcal{L}_{\mathrm{cls}} + \mathcal{L}_{\mathrm{pair}} + \lambda_{\mathrm{Brier}} \mathcal{L}_{\mathrm{Brier}} + \lambda_{\mathrm{cons}} \mathcal{L}_{\mathrm{cons}} \right)
@@ -96,13 +94,13 @@ where $\mathcal{L}_{\mathrm{cls}}$ is the logit-adjusted focal classification lo
 
 ### 5. Calibration and Uncertainty-Aware Early Stopping
 
-Given $S$ stochastic reverse-diffusion draws at prefix window $k$ and a scalar temperature $T_{\mathrm{cal}} > 0$ fitted on validation logits, RumorDiffusion computes calibrated draw probabilities $p_k^{(s)} = \mathrm{softmax}(\mathbf{z}_k^{(s)} / T_{\mathrm{cal}})$, predictive mean $\bar{p}_k$, and completion-disagreement variance $u_k$:
+Given $S$ stochastic reverse-diffusion draws at prefix window $k$ and a scalar temperature $T_{\mathrm{cal}} > 0$ fitted on validation logits, RumorDiffusion computes calibrated draw probabilities $p_k^{(s)}$, predictive mean $\bar{p}_k$, and completion-disagreement variance $u_k$ as follows:
 
 $$
-\bar{p}_k(c) = \frac{1}{S} \sum_{s=1}^{S} p_k^{(s)}(c), \qquad u_k = \frac{1}{S} \sum_{s=1}^{S} \left( p_k^{(s)}(c^\star) - \bar{p}_k(c^\star) \right)^2, \qquad c^\star = \arg\max_{c \in \{0,\dots,C-1\}} \bar{p}_k(c)
+p_k^{(s)} = \mathrm{softmax}\left(\frac{\mathbf{z}_k^{(s)}}{T_{\mathrm{cal}}}\right), \qquad \bar{p}_k(c) = \frac{1}{S} \sum_{s=1}^{S} p_k^{(s)}(c), \qquad c^\star = \arg\max_{c} \bar{p}_k(c), \qquad u_k = \frac{1}{S} \sum_{s=1}^{S} \left( p_k^{(s)}(c^\star) - \bar{p}_k(c^\star) \right)^2
 $$
 
-where $s \in \{1, \dots, S\}$ indexes the stochastic diffusion trajectories, $p_k^{(s)}(c)$ is the calibrated probability of class $c$ in draw $s$, $\bar{p}_k(c)$ is the posterior predictive mean probability for class $c$, $c^\star$ is the top-scoring predicted class, and $u_k$ is the empirical variance across draws for $c^\star$. The uncertainty-stabilized decision policy accepts $c^\star$ at window $k$ if confidence $\bar{p}_k(c^\star) \ge \tau$ and disagreement $u_k \le \gamma$ (where $\tau$ and $\gamma$ are validation-selected confidence and variance thresholds), and defers ($\bot$) to acquire further propagation evidence otherwise.
+where $s \in \lbrace 1, \dots, S \rbrace$ indexes the stochastic diffusion trajectories, $p_k^{(s)}(c)$ is the calibrated probability of class $c$ in draw $s$, $\bar{p}_k(c)$ is the posterior predictive mean probability for class $c$, $c^\star$ is the top-scoring predicted class, and $u_k$ is the empirical variance across draws for $c^\star$. The uncertainty-stabilized decision policy accepts $c^\star$ at window $k$ if confidence $\bar{p}_k(c^\star) \ge \tau$ and disagreement $u_k \le \gamma$ (where $\tau$ and $\gamma$ are validation-selected confidence and variance thresholds), and defers with action $\bot$ to acquire further propagation evidence otherwise.
 
 ---
 
@@ -327,7 +325,7 @@ Under the shared observed-prefix protocol (60 minutes on Twitter15/16 and 3 hops
 | **TextOnly (Sentence Emb.)** | 0.759±0.003 | 0.748±0.004 | 0.793±0.014 | 0.791±0.015 | 0.794±0.005 | 0.794±0.005 | **0.856±0.007** | **0.844±0.008** |
 | **BiGCN** | 0.420±0.023 | 0.399±0.027 | 0.393±0.050 | 0.360±0.053 | 0.832±0.007 | 0.832±0.007 | 0.610±0.013 | 0.492±0.022 |
 | **TGAT** | 0.433±0.036 | 0.412±0.046 | 0.384±0.024 | 0.351±0.027 | 0.837±0.004 | 0.837±0.004 | 0.621±0.002 | 0.493±0.023 |
-| **LP-GCN ($D^2$)** | 0.388±0.017 | 0.367±0.025 | 0.428±0.021 | 0.389±0.026 | 0.842±0.004 | 0.842±0.004 | 0.624±0.010 | 0.446±0.040 |
+| **LP-GCN (D²)** | 0.388±0.017 | 0.367±0.025 | 0.428±0.021 | 0.389±0.026 | 0.842±0.004 | 0.842±0.004 | 0.624±0.010 | 0.446±0.040 |
 | **DGA-Fake** | 0.775±0.000 | 0.774±0.002 | 0.744±0.025 | 0.743±0.024 | **0.887±0.007** | **0.887±0.008** | 0.816±0.004 | 0.799±0.005 |
 | **AGAD** | 0.340±0.067 | 0.262±0.101 | 0.327±0.032 | 0.305±0.056 | 0.836±0.009 | 0.836±0.009 | 0.623±0.002 | 0.474±0.032 |
 | **HPCL-cascade** | **0.808±0.018** | **0.802±0.021** | **0.819±0.009** | **0.817±0.009** | 0.876±0.004 | 0.876±0.004 | 0.849±0.006 | 0.837±0.006 |
@@ -356,7 +354,7 @@ Under strict source-only transfer (no target-domain fine-tuning or target-label 
 
 ### 3. Hyperparameter Sensitivity Analysis
 
-Sensitivity sweeps across diffusion horizon $T \in \{100, 200, 400\}$, classifier-free guidance scale $s \in \{1, 2, 3, 5\}$, and diffusion coupling weight confirm stable performance around the canonical operating point ($T = 200$, stride 20, guidance scale $3.0$):
+Sensitivity sweeps across diffusion horizon $T \in \lbrace 100, 200, 400 \rbrace$, classifier-free guidance scale $s \in \lbrace 1, 2, 3, 5 \rbrace$, and diffusion coupling weight confirm stable performance around the canonical operating point of $T = 200$, stride $20$, and guidance scale $w = 3.0$ as shown below:
 
 <p align="center">
   <img src="Docs/assets/hyper_sweep_T.png" width="31%" alt="Sensitivity to Diffusion Horizon T"/>
