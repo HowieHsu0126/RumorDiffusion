@@ -1,41 +1,11 @@
-from typing import List, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch_geometric.nn import GCNConv, global_mean_pool
 
 from Libs.models.baselines.ContrastiveObjectives import prototype_class_logits, supervised_contrastive_loss
-
-
-class _RootAwareCascadeEncoder(nn.Module):
-    """Cascade graph encoder with root-context propagation."""
-
-    def __init__(self, in_channels: int, hidden_channels: int, num_layers: int, dropout: float) -> None:
-        super().__init__()
-        self.convs: List[GCNConv] = nn.ModuleList()
-        self.norms: List[nn.LayerNorm] = nn.ModuleList()
-        last_channels = int(in_channels)
-        for _ in range(int(num_layers)):
-            self.convs.append(GCNConv(last_channels * 2, int(hidden_channels)))
-            self.norms.append(nn.LayerNorm(int(hidden_channels)))
-            last_channels = int(hidden_channels)
-        self.output_channels = int(hidden_channels) * 2
-        self.dropout = nn.Dropout(p=float(dropout))
-
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, batch: torch.Tensor, root_index: torch.Tensor) -> torch.Tensor:
-        root_index = root_index.view(-1).to(torch.long)
-        for conv, norm in zip(self.convs, self.norms):
-            root_features = x[root_index]
-            expanded_root = root_features[batch]
-            h = torch.cat([x, expanded_root], dim=-1)
-            x = conv(h, edge_index)
-            x = norm(x)
-            x = F.relu(x)
-            x = self.dropout(x)
-        graph_features = global_mean_pool(x, batch)
-        root_features = x[root_index]
-        return torch.cat([graph_features, root_features], dim=-1)
+from Libs.models.modules.root_aware_cascade import RootAwareCascadeEncoder
 
 
 class HPCLCascade(nn.Module):
@@ -70,7 +40,7 @@ class HPCLCascade(nn.Module):
         if not 0.0 <= float(dropout) < 1.0:
             raise ValueError("HPCL-cascade dropout must be in [0, 1)")
 
-        self.graph_encoder = _RootAwareCascadeEncoder(
+        self.graph_encoder = RootAwareCascadeEncoder(
             in_channels=int(in_channels),
             hidden_channels=int(hidden_channels),
             num_layers=int(num_layers),

@@ -13,6 +13,7 @@ dist/
 pip-wheel-metadata/
 *.whl
 notebook.ipynb
+
 # Virtual environments and local config
 .env
 .envrc
@@ -31,35 +32,74 @@ venv/
 .coverage*
 htmlcov/
 
-# Editor settings
+# Editor settings and OS files
 .vscode/
 .idea/
 .DS_Store
+.codex
+Libs/configs/*.backup.*
 
-# Data and training artifacts
-Input/
-Output/
+# Data and training artifacts (except bundled sample data, manifests, and paper_aligned result summaries)
+Input/*
+!Input/sample/
+!Input/sample/**
+!Input/raw/
+Input/raw/*
+!Input/raw/twitter15/
+Input/raw/twitter15/*
+!Input/raw/twitter15/label.txt
+!Input/raw/twitter15/source_tweets.txt
+!Input/raw/twitter15/tree/
+Input/raw/twitter15/tree/*
+!Input/raw/twitter16/
+Input/raw/twitter16/*
+!Input/raw/twitter16/label.txt
+!Input/raw/twitter16/source_tweets.txt
+!Input/raw/twitter16/tree/
+Input/raw/twitter16/tree/*
+!Input/raw/weibo/
+Input/raw/weibo/*
+!Input/raw/pheme/
+Input/raw/pheme/*
+!Input/processed_canonical_v1/
+Input/processed_canonical_v1/*
+!Input/processed_canonical_v1/*/
+Input/processed_canonical_v1/*/*
+!Input/processed_canonical_v1/*/*.json
+!Input/processed_paper_aligned/
+Input/processed_paper_aligned/*
+!Input/processed_paper_aligned/*/
+Input/processed_paper_aligned/*/*
+!Input/processed_paper_aligned/*/*.json
+
+Output/*
+!Output/results/
+Output/results/*
+!Output/results/paper_aligned/
+Output/results/paper_aligned/*
+!Output/results/paper_aligned/twitter15.csv
+!Output/results/paper_aligned/twitter16.csv
+!Output/results/paper_aligned/weibo.csv
+!Output/results/paper_aligned/pheme.csv
+!Output/results/paper_aligned/transfer.csv
+!Output/results/paper_aligned/rd_sweeps.csv
+!Output/results/paper_aligned/twitter16_selected_cases.json
+!Output/results/paper_aligned/in_scope_baseline_gate.json
+
+Docs/*
+!Docs/assets/
+!Docs/assets/*.png
+
 runs/
-Docs/
 lightning_logs/
 wandb/
 tensorboard/
 checkpoints/
-*.pt
-*.pth
-*.bin
-*.ckpt
-*.npy
-*.npz
-*.pkl
 
-# Logs and reports
+# Logs and archives
 *.log
 *.out
 *.err
-*.csv
-
-# Archives
 *.tar
 *.tar.gz
 *.zip

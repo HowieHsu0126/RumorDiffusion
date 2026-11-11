@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -14,6 +15,169 @@ from torch_geometric.data import Data, InMemoryDataset
 os.environ["USE_TF"] = "0"
 os.environ["USE_TORCH"] = "1"
 os.environ["TRANSFORMERS_NO_TF"] = "1"
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_json(payload: object) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_json(path: str, payload: object) -> None:
+    """Writes a deterministic UTF-8 JSON artifact and creates its parent."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
+        handle.write("\n")
+
+
+def _class_distribution(labels: List[int]) -> Dict[str, int]:
+    distribution: Dict[str, int] = {}
+    for value in labels:
+        key = str(int(value))
+        distribution[key] = distribution.get(key, 0) + 1
+    return dict(sorted(distribution.items()))
+
+
+def _label_schema_payload(dataset_name: str, label_cfg: "LabelConfig") -> Dict[str, object]:
+    mapping = {str(key): int(value) for key, value in label_cfg.mapping.items()}
+    values = sorted(set(mapping.values()))
+    if values != list(range(len(values))):
+        raise ValueError(f"Label mapping for {dataset_name} must use contiguous IDs from zero: {mapping}")
+    return {
+        "schema_version": "1",
+        "dataset": str(dataset_name),
+        "allowed": [str(value) for value in label_cfg.allowed],
+        "mapping": mapping,
+        "num_classes": len(values),
+        "skip_unknown": bool(label_cfg.skip_unknown),
+        "numeric": bool(label_cfg.numeric),
+        "mapping_sha256": _sha256_json(mapping),
+    }
+
+
+def _write_dataset_manifests(
+    dataset_name: str,
+    out_root: str,
+    raw_dir: str,
+    data_list: List[Data],
+    labels: List[int],
+    splits: Dict[str, List[int]],
+    split_seed: int,
+    split_strategy: str,
+    label_cfg: "LabelConfig",
+    time_unit: str,
+    generation_command: str,
+) -> None:
+    """Writes immutable raw/processed/split manifests for one processed dataset."""
+    dataset_dir = os.path.join(out_root, dataset_name)
+    data_path = os.path.join(dataset_dir, "pyg", "data.pt")
+    slices_path = os.path.join(dataset_dir, "pyg", "slices.pt")
+    splits_path = os.path.join(dataset_dir, "splits.json")
+    source_ids = [str(getattr(data, "source_id")) for data in data_list]
+    if len(source_ids) != len(set(source_ids)):
+        raise ValueError(f"Duplicate source_id while processing {dataset_name}")
+    validate_split_integrity(splits, source_ids)
+
+    label_schema = _label_schema_payload(dataset_name, label_cfg)
+    _write_json(os.path.join(dataset_dir, "label_schema.json"), label_schema)
+
+    raw_manifest = {
+        "schema_version": "1",
+        "dataset": str(dataset_name),
+        "raw_root": os.path.abspath(raw_dir),
+        "files": _directory_manifest(raw_dir),
+        "source_id_sha256": _sha256_json(source_ids),
+        "label_schema_sha256": _sha256_json(label_schema),
+    }
+    raw_manifest_path = os.path.join(dataset_dir, "raw_manifest.json")
+    _write_json(raw_manifest_path, raw_manifest)
+
+    processed_manifest = {
+        "schema_version": "1",
+        "dataset": str(dataset_name),
+        "processed_root": os.path.abspath(dataset_dir),
+        "data_sha256": _sha256_file(data_path),
+        "slices_sha256": _sha256_file(slices_path),
+        "sample_count": len(data_list),
+        "source_id_sha256": _sha256_json(source_ids),
+        "class_distribution": _class_distribution(labels),
+        "time_unit": str(time_unit),
+        "label_schema_sha256": _sha256_json(label_schema),
+        "raw_manifest_sha256": _sha256_file(raw_manifest_path),
+    }
+    processed_manifest_path = os.path.join(dataset_dir, "processed_manifest.json")
+    _write_json(processed_manifest_path, processed_manifest)
+
+    split_manifest = {
+        "schema_version": "1",
+        "dataset": str(dataset_name),
+        "split_seed": int(split_seed),
+        "split_strategy": str(split_strategy),
+        "generation_command": str(generation_command),
+        "splits_sha256": _sha256_file(splits_path),
+        "raw_manifest_sha256": _sha256_file(raw_manifest_path),
+        "processed_manifest_sha256": _sha256_file(processed_manifest_path),
+        "sample_count": len(source_ids),
+        "source_id_sha256": _sha256_json(source_ids),
+        "splits": {
+            name: {
+                "sample_count": len(splits[name]),
+                "source_ids": [source_ids[index] for index in splits[name]],
+                "source_id_sha256": _sha256_json([source_ids[index] for index in splits[name]]),
+                "class_distribution": _class_distribution([labels[index] for index in splits[name]]),
+            }
+            for name in ("train", "val", "test")
+        },
+    }
+    _write_json(os.path.join(dataset_dir, "split_manifest.json"), split_manifest)
+
+
+def _directory_manifest(root: str) -> Dict[str, object]:
+    files: List[Dict[str, object]] = []
+    if os.path.isdir(root):
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for filename in sorted(filenames):
+                path = os.path.join(dirpath, filename)
+                rel = os.path.relpath(path, root)
+                files.append({"path": rel, "sha256": _sha256_file(path), "size": os.path.getsize(path)})
+    return {
+        "root": os.path.abspath(root),
+        "file_count": len(files),
+        "files": files,
+        "sha256": _sha256_json(files),
+    }
+
+
+def validate_split_integrity(splits: Dict[str, List[int]], source_ids: List[str]) -> None:
+    """Validates disjoint, exhaustive index and source-id split membership."""
+    if len(source_ids) != len(set(str(value) for value in source_ids)):
+        raise ValueError("Processed samples contain duplicate source IDs")
+    expected = set(range(len(source_ids)))
+    seen_indices: set[int] = set()
+    seen_sources: set[str] = set()
+    for split_name in ("train", "val", "test"):
+        if split_name not in splits:
+            raise ValueError(f"Missing split: {split_name}")
+        split_indices = {int(index) for index in splits[split_name]}
+        if not split_indices <= expected:
+            raise ValueError(f"Split {split_name} contains an out-of-range index")
+        if seen_indices.intersection(split_indices):
+            raise ValueError(f"Split {split_name} overlaps another split")
+        split_sources = {str(source_ids[index]) for index in split_indices}
+        if seen_sources.intersection(split_sources):
+            raise ValueError(f"Split {split_name} contains a duplicate source_id")
+        seen_indices.update(split_indices)
+        seen_sources.update(split_sources)
+    if seen_indices != expected:
+        raise ValueError("Splits do not cover every processed sample exactly once")
 
 
 @dataclass
@@ -118,10 +282,16 @@ def load_config(config_path: str) -> DatasetConfig:
         truncation_window = None if truncation_window_raw in (None, "") else int(truncation_window_raw)
         truncation_unit = str(truncation_cfg.get("unit", "auto")).lower()
 
+    def _path_value(value: object) -> str:
+        resolved = os.path.expandvars(str(value))
+        if "$" in resolved:
+            raise ValueError(f"Unresolved environment variable in dataset config path: {value}")
+        return resolved
+
     return DatasetConfig(
         datasets=list(cfg["datasets"]),
-        raw_root=str(cfg["raw_root"]),
-        processed_root=str(cfg["processed_root"]),
+        raw_root=_path_value(cfg["raw_root"]),
+        processed_root=_path_value(cfg["processed_root"]),
         split_type=str(split["type"]),
         split_ratios={
             "train": float(split["ratios"]["train"]),
@@ -141,7 +311,7 @@ def load_config(config_path: str) -> DatasetConfig:
         features_structural=list(features["structural"]),
         augment_enabled=bool(augment["enabled"]),
         augment_method=str(augment["method"]),
-        text_encoder_path=text_cfg.get("encoder_path"),
+        text_encoder_path=_path_value(text_cfg["encoder_path"]) if text_cfg.get("encoder_path") else None,
         text_normalize=bool(text_cfg.get("normalize", False)),
         text_cache_name=str(text_cfg.get("cache_name", "text_embs.pt")),
         text_batch_size=int(text_cfg.get("batch_size", 64)),
@@ -210,6 +380,37 @@ def resolve_text_model_path(model_name_or_path: str, raw_root: str) -> str:
     return model_text
 
 
+def _text_tokenizer_hash(model_path: str) -> str:
+    candidates = ("tokenizer_config.json", "tokenizer.json", "vocab.txt", "spiece.model", "merges.txt")
+    payload = []
+    for name in candidates:
+        path = os.path.join(model_path, name)
+        if os.path.isfile(path):
+            payload.append({"name": name, "sha256": _sha256_file(path)})
+    return _sha256_json(payload)
+
+
+def _text_cache_metadata(
+    model_path: str,
+    encoder_name: str,
+    ids: List[str],
+    normalized_texts: List[str],
+    normalization_cfg: Optional[Dict[str, object]],
+    dimension: int,
+    dtype: str,
+) -> Dict[str, object]:
+    return {
+        "encoder_name": str(encoder_name),
+        "weights_sha256": _directory_manifest(model_path).get("sha256") if os.path.isdir(model_path) else "",
+        "tokenizer_sha256": _text_tokenizer_hash(model_path) if os.path.isdir(model_path) else "",
+        "normalization_config_sha256": _sha256_json(normalization_cfg or {}),
+        "source_id_sha256": _sha256_json(ids),
+        "normalized_text_sha256": _sha256_json(normalized_texts),
+        "embedding_dimension": int(dimension),
+        "dtype": str(dtype),
+    }
+
+
 def parse_source_texts(raw_dir: str) -> Dict[str, str]:
     """Parses `source_tweets.txt` into a mapping from source_id to raw text.
 
@@ -232,7 +433,12 @@ def parse_source_texts(raw_dir: str) -> Dict[str, str]:
 
 
 def collect_json_source_texts(raw_dir: str) -> Dict[str, str]:
-    """Collects source texts from JSON-format datasets (e.g., weibo, pheme)."""
+    """Collects source texts from JSON-format datasets (e.g., weibo, pheme).
+
+    JSON raw files are keyed by the file stem, not by the mutable `source`
+    payload field. Some releases repeat the payload source identifier across
+    distinct cascades; file stems remain the stable per-cascade identity.
+    """
     mapping: Dict[str, str] = {}
     for fname in sorted(os.listdir(raw_dir)):
         if not fname.endswith(".json"):
@@ -243,23 +449,25 @@ def collect_json_source_texts(raw_dir: str) -> Dict[str, str]:
         source = obj.get("source", {})
         if not isinstance(source, dict):
             continue
-        sid = (
-            source.get("tweet id")
-            or source.get("tweet_id")
-            or source.get("source id")
-            or source.get("source_id")
-            or source.get("id")
-        )
-        assert sid is not None, f"Missing source id in {fpath}"
+        sid = os.path.splitext(fname)[0]
         text = str(source.get("content", "")).strip()
         if len(text) == 0:
             continue
-        mapping[str(sid)] = text
+        if sid in mapping:
+            raise ValueError(f"Duplicate JSON cascade file stem while collecting texts: {sid}")
+        mapping[sid] = text
     assert len(mapping) > 0, f"No JSON sources found in {raw_dir}"
     return mapping
 
 
-def try_reuse_text_embedding_cache(out_path: str, processed_root: str, dataset: str, cache_name: str, expected_ids: List[str]) -> bool:
+def try_reuse_text_embedding_cache(
+    out_path: str,
+    processed_root: str,
+    dataset: str,
+    cache_name: str,
+    expected_ids: List[str],
+    expected_metadata: Optional[Dict[str, object]] = None,
+) -> bool:
     """Copies an identical existing text cache from a sibling processed root when available."""
     root_dir = os.path.abspath(os.path.dirname(processed_root))
     candidate_roots = [
@@ -273,7 +481,27 @@ def try_reuse_text_embedding_cache(out_path: str, processed_root: str, dataset: 
             continue
         obj = torch.load(candidate_path, weights_only=False)
         candidate_ids = list(obj.get("ids", []))
-        if candidate_ids != expected_ids:
+        candidate_metadata = obj.get("manifest", {})
+        if candidate_ids != expected_ids or not isinstance(candidate_metadata, dict):
+            continue
+        if expected_metadata is not None:
+            # Compare every declared value. Empty values are intentionally not
+            # treated as wildcards except for dimension/dtype, which can only
+            # be known after loading the candidate tensor.
+            mismatch = False
+            for key, expected_value in expected_metadata.items():
+                if key in {"embedding_dimension", "dtype"} and expected_value in {None, "", 0}:
+                    continue
+                if candidate_metadata.get(key) != expected_value:
+                    mismatch = True
+                    break
+            if mismatch:
+                continue
+        if not isinstance(obj.get("emb"), Tensor) or obj["emb"].dim() != 2:
+            continue
+        if int(candidate_metadata.get("embedding_dimension", -1)) != int(obj["emb"].size(-1)):
+            continue
+        if str(candidate_metadata.get("dtype", "")) != str(obj["emb"].dtype).replace("torch.", ""):
             continue
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         torch.save(obj, out_path)
@@ -302,19 +530,48 @@ def build_text_embedding_cache(dataset: str,
     sid_to_text = parse_source_texts(raw_dir)
     ids = sorted(sid_to_text.keys())
     texts = [normalize_tweet_text(sid_to_text[sid], normalization_cfg) for sid in ids]
-    if try_reuse_text_embedding_cache(out_path, processed_root, dataset, cache_name, ids):
+    model_path = resolve_text_model_path(model_name, raw_root)
+    expected_metadata = _text_cache_metadata(
+        model_path=model_path,
+        encoder_name=str(model_name),
+        ids=ids,
+        normalized_texts=texts,
+        normalization_cfg=normalization_cfg,
+        dimension=0,
+        dtype="",
+    )
+    if try_reuse_text_embedding_cache(
+        out_path,
+        processed_root,
+        dataset,
+        cache_name,
+        ids,
+        expected_metadata=expected_metadata,
+    ):
         return out_path
 
-    model_path = resolve_text_model_path(model_name, raw_root)
     emb = _encode_texts_transformer_mean_pool(texts, model_path=model_path, batch_size=batch_size)
+
+    metadata = _text_cache_metadata(
+        model_path=model_path,
+        encoder_name=str(model_name),
+        ids=ids,
+        normalized_texts=texts,
+        normalization_cfg=normalization_cfg,
+        dimension=int(emb.size(-1)),
+        dtype=str(emb.dtype).replace("torch.", ""),
+    )
 
     obj = {
         "model": str(model_name),
         "dim": int(emb.size(-1)),
         "ids": ids,
         "emb": emb,
+        "manifest": metadata,
     }
     torch.save(obj, out_path)
+    with open(f"{out_path}.manifest.json", "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, sort_keys=True, indent=2)
     return out_path
 
 
@@ -393,25 +650,76 @@ def build_text_embedding_cache_from_mapping(dataset: str,
     out_path = os.path.join(out_dir, str(cache_name))
     ids = sorted(mapping.keys())
     texts = [normalize_tweet_text(mapping[i], normalization_cfg) for i in ids]
-    if try_reuse_text_embedding_cache(out_path, processed_root, dataset, cache_name, ids):
+    model_path = resolve_text_model_path(model_path, os.path.dirname(processed_root))
+    expected_metadata = _text_cache_metadata(
+        model_path=model_path,
+        encoder_name=str(model_path),
+        ids=ids,
+        normalized_texts=texts,
+        normalization_cfg=normalization_cfg,
+        dimension=0,
+        dtype="",
+    )
+    if try_reuse_text_embedding_cache(
+        out_path,
+        processed_root,
+        dataset,
+        cache_name,
+        ids,
+        expected_metadata=expected_metadata,
+    ):
         return out_path
     emb = _encode_texts_transformer_mean_pool(texts, model_path=model_path, batch_size=batch_size)
+    metadata = _text_cache_metadata(
+        model_path=model_path,
+        encoder_name=str(model_path),
+        ids=ids,
+        normalized_texts=texts,
+        normalization_cfg=normalization_cfg,
+        dimension=int(emb.size(-1)),
+        dtype=str(emb.dtype).replace("torch.", ""),
+    )
     obj = {
         "model": str(model_path),
         "dim": int(emb.size(-1)),
         "ids": ids,
         "emb": emb,
+        "manifest": metadata,
     }
     torch.save(obj, out_path)
+    with open(f"{out_path}.manifest.json", "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, sort_keys=True, indent=2)
     return out_path
 
 
-def _load_text_embedding_cache(processed_root: str, dataset: str, cache_name: str = "text_embs.pt") -> Tuple[Dict[str, int], Tensor]:
+def _load_text_embedding_cache(
+    processed_root: str,
+    dataset: str,
+    cache_name: str = "text_embs.pt",
+    expected_metadata: Optional[Dict[str, object]] = None,
+) -> Tuple[Dict[str, int], Tensor]:
     """Loads text embedding cache and returns (id_to_index, emb_matrix)."""
     path = os.path.join(processed_root, dataset, str(cache_name))
     obj = torch.load(path, weights_only=False)
     ids: List[str] = list(obj["ids"])  # type: ignore[index]
     emb: Tensor = obj["emb"].to(torch.float32)  # type: ignore[index]
+    manifest = obj.get("manifest") if isinstance(obj, dict) else None
+    required = {
+        "encoder_name", "weights_sha256", "tokenizer_sha256", "normalization_config_sha256",
+        "source_id_sha256", "normalized_text_sha256", "embedding_dimension", "dtype",
+    }
+    if not isinstance(manifest, dict) or not required.issubset(manifest):
+        raise ValueError(f"Text embedding cache lacks strict manifest metadata: {path}")
+    if int(manifest["embedding_dimension"]) != int(emb.size(-1)):
+        raise ValueError(f"Text embedding cache dimension mismatch: {path}")
+    if str(manifest["source_id_sha256"]) != _sha256_json(ids):
+        raise ValueError(f"Text embedding cache source ID hash mismatch: {path}")
+    if expected_metadata is not None:
+        for key, expected_value in expected_metadata.items():
+            if key in {"embedding_dimension", "dtype"} and expected_value in {None, "", 0}:
+                continue
+            if manifest.get(key) != expected_value:
+                raise ValueError(f"Text embedding cache manifest mismatch for {key}: {path}")
     id_to_idx = {sid: i for i, sid in enumerate(ids)}
     return id_to_idx, emb
 
@@ -482,7 +790,9 @@ def select_observation_view(nodes: List[Tuple[str, str, int]],
                             edges: List[Tuple[int, int]],
                             truncation_mode: str,
                             truncation_window: Optional[int],
-                            enforce_root_component: bool) -> Tuple[List[int], List[Tuple[int, int]], int, List[int]]:
+                            enforce_root_component: bool,
+                            truncation_unit: str = "auto",
+                            source_time_unit: str = "minutes") -> Tuple[List[int], List[Tuple[int, int]], int, List[int]]:
     """Applies an explicit processing-time observation policy.
 
     Returns:
@@ -495,6 +805,15 @@ def select_observation_view(nodes: List[Tuple[str, str, int]],
     min_time = int(original_times.min().item())
     shifted_times = original_times - min_time
     mode = str(truncation_mode).lower()
+    unit = str(truncation_unit).lower()
+    native_unit = str(source_time_unit).lower()
+    if unit not in {"auto", "minutes", "hop"}:
+        raise ValueError(f"Unsupported truncation unit: {truncation_unit}")
+    if unit != "auto" and unit != native_unit:
+        raise ValueError(
+            f"Truncation unit {unit} does not match the sample time unit {native_unit}; "
+            "minutes and hop horizons must use separate fields."
+        )
     if mode == "none":
         keep_mask = torch.ones_like(shifted_times, dtype=torch.bool)
     elif mode in {"window", "minutes", "hop"}:
@@ -510,7 +829,6 @@ def select_observation_view(nodes: List[Tuple[str, str, int]],
         raise ValueError("No nodes kept after applying the observation policy")
 
     # Identify root as node with minimal time (prefer time==0)
-    min_kept_time = int(shifted_times[keep_mask].min().item())
     candidate_indices = [i for i in keep_nodes if shifted_times[i].item() == 0]
     if candidate_indices:
         root_idx = min(candidate_indices)
@@ -727,8 +1045,7 @@ def build_pyg_data(nodes: List[Tuple[str, str, int]],
 
     node_uid = [nodes[i][0] for i in keep_nodes]
     node_tid = [nodes[i][1] for i in keep_nodes]
-    node_time = torch.tensor([nodes[i][2]
-                             for i in keep_nodes], dtype=torch.long)
+    node_time = torch.tensor([nodes[i][2] for i in keep_nodes], dtype=torch.long)
     node_time_shifted = torch.tensor(shifted_times_list, dtype=torch.long)
 
     data = Data(
@@ -741,8 +1058,21 @@ def build_pyg_data(nodes: List[Tuple[str, str, int]],
     data.source_id = source_id
     data.node_uid = node_uid
     data.node_tweet_id = node_tid
-    data.node_time_minutes = node_time
-    data.node_time_minutes_shifted = node_time_shifted
+    unit = str(time_unit).lower()
+    if unit == "minutes":
+        data.node_time_minutes = node_time
+        data.node_time_minutes_shifted = node_time_shifted
+        data.node_time_hops = torch.zeros_like(node_time)
+        data.node_time_hops_shifted = torch.zeros_like(node_time_shifted)
+    elif unit == "hop":
+        # Hop depth is kept in its own fields. Minutes tensors are zero-filled
+        # rather than silently reusing hop values under a minutes name.
+        data.node_time_minutes = torch.zeros_like(node_time)
+        data.node_time_minutes_shifted = torch.zeros_like(node_time_shifted)
+        data.node_time_hops = node_time
+        data.node_time_hops_shifted = node_time_shifted
+    else:
+        raise ValueError(f"Unsupported time unit for processed sample: {time_unit}")
     data.time_unit = str(time_unit)
     return data
 
@@ -759,20 +1089,6 @@ def read_labels(label_path: str) -> Dict[str, str]:
             label, sid = line.split(":", 1)
             mapping[sid.strip()] = label.strip()
     return mapping
-
-
-def generate_splits(num_samples: int, ratios: Dict[str, float], seed: int) -> Dict[str, List[int]]:
-    assert abs(sum(ratios.values()) -
-               1.0) < 1e-6, "Split ratios must sum to 1.0"
-    g = torch.Generator()
-    g.manual_seed(seed)
-    indices = torch.randperm(num_samples, generator=g).tolist()
-    n_train = int(num_samples * ratios["train"])
-    n_val = int(num_samples * ratios["val"])
-    train_idx = indices[:n_train]
-    val_idx = indices[n_train:n_train + n_val]
-    test_idx = indices[n_train + n_val:]
-    return {"train": train_idx, "val": val_idx, "test": test_idx}
 
 
 def generate_stratified_splits(labels: List[int], ratios: Dict[str, float], seed: int) -> Dict[str, List[int]]:
@@ -850,7 +1166,11 @@ def collate_and_save(dataset_name: str,
                      out_root: str,
                      split_ratios: Dict[str, float],
                      split_seed: int,
-                     split_strategy: str) -> None:
+                     split_strategy: str,
+                     raw_dir: Optional[str] = None,
+                     label_cfg: Optional[LabelConfig] = None,
+                     time_unit: str = "minutes",
+                     generation_command: str = "processor.py") -> None:
     out_dir = os.path.join(out_root, dataset_name, "pyg")
     os.makedirs(out_dir, exist_ok=True)
     # Use collate without touching internal storage attributes to avoid warnings
@@ -866,6 +1186,31 @@ def collate_and_save(dataset_name: str,
     splits = generate_splits(labels, split_ratios, split_seed, split_strategy)
     with open(os.path.join(out_root, dataset_name, "splits.json"), "w", encoding="utf-8") as f:
         json.dump(splits, f, ensure_ascii=False, indent=2)
+    if raw_dir is None:
+        raw_dir = os.path.join(out_root, dataset_name)
+    if label_cfg is None:
+        inferred = sorted(set(int(value) for value in labels))
+        if inferred != list(range(len(inferred))):
+            raise ValueError("A declared label schema is required when labels are not contiguous")
+        label_cfg = LabelConfig(
+            allowed=[str(value) for value in inferred],
+            mapping={str(value): int(value) for value in inferred},
+            skip_unknown=False,
+            numeric=True,
+        )
+    _write_dataset_manifests(
+        dataset_name=dataset_name,
+        out_root=out_root,
+        raw_dir=raw_dir,
+        data_list=data_list,
+        labels=labels,
+        splits=splits,
+        split_seed=split_seed,
+        split_strategy=split_strategy,
+        label_cfg=label_cfg,
+        time_unit=time_unit,
+        generation_command=generation_command,
+    )
 
 
 def load_labels_from_processed(data_path: str, slices_path: str) -> List[int]:
@@ -879,6 +1224,51 @@ def load_labels_from_processed(data_path: str, slices_path: str) -> List[int]:
         y_tensor = data_obj.y[start:end]
         labels.append(int(y_tensor.view(-1)[0].item()))
     return labels
+
+
+def write_manifests_from_processed(
+    ds: str,
+    cfg: DatasetConfig,
+    *,
+    generation_command: str,
+    splits_override: Optional[Dict[str, List[int]]] = None,
+) -> None:
+    """Write canonical manifests from existing processed data and splits.
+
+    This path does not fabricate samples or reorder an existing split. It only
+    binds already materialized PyG tensors, the current splits.json, declared
+    label schema, and raw input tree into hash-bearing manifests.
+    """
+    data_path = os.path.join(cfg.processed_root, ds, "pyg", "data.pt")
+    slices_path = os.path.join(cfg.processed_root, ds, "pyg", "slices.pt")
+    splits_path = os.path.join(cfg.processed_root, ds, "splits.json")
+    assert os.path.isfile(data_path), f"Missing {data_path}"
+    assert os.path.isfile(slices_path), f"Missing {slices_path}"
+    if splits_override is None:
+        assert os.path.isfile(splits_path), f"Missing {splits_path}"
+        with open(splits_path, "r", encoding="utf-8") as handle:
+            splits = json.load(handle)
+    else:
+        splits = splits_override
+    labels = load_labels_from_processed(data_path, slices_path)
+    data_obj = torch.load(data_path, map_location="cpu", weights_only=False)
+    source_ids = [str(value) for value in getattr(data_obj, "source_id", [])]
+    if len(source_ids) != len(labels):
+        raise ValueError(f"Processed source_id/label count mismatch for {ds}: {len(source_ids)} vs {len(labels)}")
+    data_list = [Data(source_id=source_id) for source_id in source_ids]
+    _write_dataset_manifests(
+        dataset_name=ds,
+        out_root=cfg.processed_root,
+        raw_dir=os.path.join(cfg.raw_root, ds),
+        data_list=data_list,
+        labels=labels,
+        splits={str(name): [int(index) for index in values] for name, values in splits.items()},
+        split_seed=cfg.split_seed,
+        split_strategy=cfg.split_type,
+        label_cfg=resolve_label_config(ds, cfg),
+        time_unit=resolve_time_source(ds, cfg),
+        generation_command=generation_command,
+    )
 
 
 def process_dataset(ds: str, cfg: DatasetConfig) -> None:
@@ -905,7 +1295,21 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
                 normalization_cfg=cfg.text_normalization,
                 cache_name=cfg.text_cache_name,
             )
-        id_to_idx, emb_matrix = _load_text_embedding_cache(cfg.processed_root, ds, cfg.text_cache_name)
+        expected_cache_metadata = _text_cache_metadata(
+            model_path=text_model_path,
+            encoder_name=str(text_model_path),
+            ids=sorted(source_texts.keys()),
+            normalized_texts=[normalize_tweet_text(source_texts[sid], cfg.text_normalization) for sid in sorted(source_texts.keys())],
+            normalization_cfg=cfg.text_normalization,
+            dimension=0,
+            dtype="",
+        )
+        id_to_idx, emb_matrix = _load_text_embedding_cache(
+            cfg.processed_root,
+            ds,
+            cfg.text_cache_name,
+            expected_metadata=expected_cache_metadata,
+        )
 
         data_list: List[Data] = []
         labels: List[int] = []
@@ -916,16 +1320,15 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
             with open(fpath, "r", encoding="utf-8") as f:
                 obj = json.load(f)
             source = obj.get("source", {})
-            source_id = (
+            source_id = os.path.splitext(fname)[0]
+            raw_source_id = (
                 source.get("tweet id")
                 or source.get("tweet_id")
                 or source.get("source id")
                 or source.get("source_id")
                 or source.get("id")
             )
-            assert source_id is not None, f"Missing source id in {fpath}"
-            if str(source_id) not in source_texts:
-                # Skip samples without valid source content to keep embeddings consistent
+            if source_id not in source_texts:
                 continue
 
             label_raw = source.get("label")
@@ -948,6 +1351,8 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
                 cfg.truncation_mode,
                 cfg.truncation_window,
                 cfg.enforce_root_component,
+                truncation_unit=cfg.truncation_unit,
+                source_time_unit=time_source,
             )
 
             data = build_pyg_data(
@@ -962,8 +1367,9 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
                 str(source_id),
                 time_source,
             )
-            assert str(source_id) in id_to_idx, f"Text embedding missing for source {source_id}"
-            row = int(id_to_idx[str(source_id)])
+            data.raw_source_id = "" if raw_source_id is None else str(raw_source_id)
+            assert source_id in id_to_idx, f"Text embedding missing for source {source_id}"
+            row = int(id_to_idx[source_id])
             vec = emb_matrix[row].to(torch.float32).unsqueeze(0)
             if cfg.text_normalize:
                 vec = torch.nn.functional.normalize(vec, p=2, dim=-1)
@@ -985,6 +1391,10 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
             split_ratios=cfg.split_ratios,
             split_seed=cfg.split_seed,
             split_strategy=cfg.split_type,
+            raw_dir=raw_dir,
+            label_cfg=label_cfg,
+            time_unit=time_source,
+            generation_command=f"processor.py --config <resolved> --dataset {ds}",
         )
         return
 
@@ -996,6 +1406,7 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
     if not os.path.isfile(label_path):
         raise FileNotFoundError(f"Missing label file: {label_path}")
 
+    sid_to_text = parse_source_texts(raw_dir)
     cache_path = os.path.join(cfg.processed_root, ds, cfg.text_cache_name)
     if not os.path.isfile(cache_path):
         build_text_embedding_cache(
@@ -1007,9 +1418,21 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
             normalization_cfg=cfg.text_normalization,
             cache_name=cfg.text_cache_name,
         )
-    id_to_idx, emb_matrix = _load_text_embedding_cache(cfg.processed_root, ds, cfg.text_cache_name)
-
-    sid_to_text = parse_source_texts(raw_dir)
+    expected_cache_metadata = _text_cache_metadata(
+        model_path=text_model_path,
+        encoder_name=str(text_model_path),
+        ids=sorted(sid_to_text.keys()),
+        normalized_texts=[normalize_tweet_text(sid_to_text[sid], cfg.text_normalization) for sid in sorted(sid_to_text.keys())],
+        normalization_cfg=cfg.text_normalization,
+        dimension=0,
+        dtype="",
+    )
+    id_to_idx, emb_matrix = _load_text_embedding_cache(
+        cfg.processed_root,
+        ds,
+        cfg.text_cache_name,
+        expected_metadata=expected_cache_metadata,
+    )
     label_map_raw = read_labels(label_path)
     data_list: List[Data] = []
     labels: List[int] = []
@@ -1040,6 +1463,8 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
             cfg.truncation_mode,
             cfg.truncation_window,
             cfg.enforce_root_component,
+            truncation_unit=cfg.truncation_unit,
+            source_time_unit=time_source,
         )
 
         data = build_pyg_data(
@@ -1079,6 +1504,10 @@ def process_dataset(ds: str, cfg: DatasetConfig) -> None:
         split_ratios=cfg.split_ratios,
         split_seed=cfg.split_seed,
         split_strategy=cfg.split_type,
+        raw_dir=raw_dir,
+        label_cfg=label_cfg,
+        time_unit=time_source,
+        generation_command=f"processor.py --config <resolved> --dataset {ds}",
     )
 
 
@@ -1090,12 +1519,16 @@ def main() -> None:
                         choices=["twitter15", "twitter16", "weibo", "pheme"], required=True)
     parser.add_argument("--regen_splits_only", action="store_true",
                         help="Recompute splits.json using existing processed data without rebuilding features")
+    parser.add_argument("--write_manifests_only", action="store_true",
+                        help="Write canonical manifests for existing processed data and splits without changing splits")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     if args.dataset not in cfg.datasets:
         raise ValueError(
             f"Dataset {args.dataset} not in configured list: {cfg.datasets}")
+    if args.regen_splits_only and args.write_manifests_only:
+        raise ValueError("--regen_splits_only and --write_manifests_only are mutually exclusive")
     if args.regen_splits_only:
         data_path = os.path.join(cfg.processed_root, args.dataset, "pyg", "data.pt")
         slices_path = os.path.join(cfg.processed_root, args.dataset, "pyg", "slices.pt")
@@ -1106,7 +1539,21 @@ def main() -> None:
         splits_path = os.path.join(cfg.processed_root, args.dataset, "splits.json")
         with open(splits_path, "w", encoding="utf-8") as f:
             json.dump(splits, f, ensure_ascii=False, indent=2)
+        write_manifests_from_processed(
+            args.dataset,
+            cfg,
+            generation_command=f"processor.py --config {args.config} --dataset {args.dataset} --regen_splits_only",
+            splits_override=splits,
+        )
         print(f"Regenerated stratified splits for {args.dataset} at {splits_path}")
+        return
+    if args.write_manifests_only:
+        write_manifests_from_processed(
+            args.dataset,
+            cfg,
+            generation_command=f"processor.py --config {args.config} --dataset {args.dataset} --write_manifests_only",
+        )
+        print(f"Wrote canonical manifests for {args.dataset} under {os.path.join(cfg.processed_root, args.dataset)}")
         return
     process_dataset(args.dataset, cfg)
 

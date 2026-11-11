@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 import re
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Any, Dict, Iterable, List, Tuple
 
 import torch

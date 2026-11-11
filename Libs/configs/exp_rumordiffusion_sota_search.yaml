@@ -61,14 +61,14 @@ evaluation:
     pheme:
       0: non-rumor
       1: rumor
-  max_samples: 1
+  max_samples: 64
   export_predictions:
     enabled: true
   latency:
     enabled: true
     repeat: 1
     warmup_batches: 0
-    max_batches: 1
+  max_batches: 4
   significance:
     enabled: false
     baseline_models: []
@@ -118,11 +118,10 @@ transfer:
   pairs:
     - source: twitter15
       target: twitter16
+    - source: weibo
+      target: pheme
   models:
-    - Libs/configs/baselines/rumordiffusion_posterior_prototype.yaml
-    - Libs/configs/baselines/rumordiffusion_semantic_residual.yaml
-    - Libs/configs/baselines/rumordiffusion_joint_ctdm.yaml
-    - Libs/configs/baselines/rumordiffusion_posterior_prototype_semantic_joint.yaml
+    - Libs/configs/baselines/rumordiffusion_sota_candidate.yaml
   ckpt_name: best.pt
   lp_edges_policy: require_existing
   metric_only: true
@@ -296,9 +295,9 @@ training:
   amp: true
   batch_size: 1
   batch_size_ctdm: 1
-  early_stopping_patience: 1
-  epochs: 1
-  epochs_ctdm: 1
+  early_stopping_patience: 2
+  epochs: 2
+  epochs_ctdm: 5
   grad_clip: 1.0
   lr: 0.0003
   lr_ctdm: 0.0003
@@ -307,9 +306,9 @@ training:
   weight_decay: 0.0001
   weight_decay_ctdm: 0.0001
   reuse_ctdm_pretrain: false
-  max_batches_per_epoch: 1
-  max_batches_per_epoch_ctdm: 1
-  max_samples: 1
+  max_batches_per_epoch: 4
+  max_batches_per_epoch_ctdm: 4
+  max_samples: 64
   min_epochs: 1
   min_epochs_ctdm: 1
   potentials_batch_size: 1

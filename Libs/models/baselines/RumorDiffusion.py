@@ -1,4 +1,5 @@
 import math
+import warnings
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -7,6 +8,37 @@ from torch import Tensor, nn
 from torch.cuda.amp import autocast
 
 from Libs.models.baselines.ContrastiveObjectives import supervised_contrastive_loss
+from Libs.models.modules.root_aware_cascade import RootAwareCascadeEncoder
+
+
+def _resolve_global_root_index(batch) -> Tensor:
+    """Normalizes PyG root indices to global node indices for a graph batch."""
+    if not hasattr(batch, "x") or not hasattr(batch, "root_index"):
+        raise ValueError("Root-aware branches require batch.x and batch.root_index.")
+    root_index = batch.root_index.view(-1).to(device=batch.x.device, dtype=torch.long)
+    if hasattr(batch, "ptr"):
+        ptr = batch.ptr.to(device=batch.x.device, dtype=torch.long)
+        graph_count = int(ptr.numel()) - 1
+        if int(root_index.numel()) != graph_count:
+            raise ValueError(
+                f"root_index length {int(root_index.numel())} does not match graph count {graph_count}."
+            )
+        global_valid = bool(((root_index >= ptr[:-1]) & (root_index < ptr[1:])).all().item())
+        local_index = root_index + ptr[:-1]
+        local_valid = bool(((local_index >= ptr[:-1]) & (local_index < ptr[1:])).all().item())
+        if global_valid:
+            root_global = root_index
+        elif local_valid:
+            root_global = local_index
+        else:
+            raise ValueError("root_index is neither a valid global nor local batch index.")
+    else:
+        root_global = root_index
+    if int(root_global.numel()) == 0:
+        raise ValueError("Root-aware branches received an empty root_index tensor.")
+    if int(root_global.min().item()) < 0 or int(root_global.max().item()) >= int(batch.x.size(0)):
+        raise ValueError("root_index is outside the node-feature tensor.")
+    return root_global
 
 
 class ArbiterMLP(nn.Module):
@@ -173,32 +205,7 @@ class SemanticResidualBranch(nn.Module):
 
     @staticmethod
     def _extract_root_features(batch) -> Tensor:
-        if not hasattr(batch, "x") or not hasattr(batch, "root_index"):
-            raise ValueError("Semantic residual branch requires batch.x and batch.root_index.")
-        root_index = batch.root_index.view(-1).to(device=batch.x.device, dtype=torch.long)
-        if hasattr(batch, "ptr"):
-            ptr = batch.ptr.to(device=batch.x.device, dtype=torch.long)
-            graph_count = int(ptr.numel()) - 1
-            if int(root_index.numel()) != graph_count:
-                raise ValueError(
-                    f"root_index length {int(root_index.numel())} does not match graph count {graph_count}."
-                )
-            global_valid = bool(((root_index >= ptr[:-1]) & (root_index < ptr[1:])).all().item())
-            local_index = root_index + ptr[:-1]
-            local_valid = bool(((local_index >= ptr[:-1]) & (local_index < ptr[1:])).all().item())
-            if global_valid:
-                root_global = root_index
-            elif local_valid:
-                root_global = local_index
-            else:
-                raise ValueError("root_index is neither a valid global nor local batch index.")
-        else:
-            root_global = root_index
-        if int(root_global.numel()) == 0:
-            raise ValueError("Semantic residual branch received an empty root_index tensor.")
-        if int(root_global.min().item()) < 0 or int(root_global.max().item()) >= int(batch.x.size(0)):
-            raise ValueError("Semantic residual root indices are outside the node-feature tensor.")
-        return batch.x[root_global].to(torch.float32)
+        return batch.x[_resolve_global_root_index(batch)].to(torch.float32)
 
     def forward(self, batch, expected_batch_size: int) -> Tuple[Tensor, Tensor]:
         parts: List[Tensor] = []
@@ -220,6 +227,149 @@ class SemanticResidualBranch(nn.Module):
             parts.append(self.text_proj(text_emb))
         semantic_feature = self.fusion(torch.cat(parts, dim=-1))
         return float(self.logit_weight) * self.classifier(semantic_feature), semantic_feature
+
+
+class PrefixGraphExpertBranch(nn.Module):
+    """Observed-prefix root-aware graph expert fused inside RumorDiffusion."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        text_dim: int,
+        hidden_channels: int,
+        graph_hidden: int,
+        num_layers: int,
+        num_classes: int,
+        dropout: float,
+        logit_weight: float,
+        use_text: bool,
+    ) -> None:
+        super().__init__()
+        if int(in_channels) <= 0 or int(hidden_channels) <= 0 or int(graph_hidden) <= 0:
+            raise ValueError("Prefix graph expert channel dimensions must be positive.")
+        if bool(use_text) and int(text_dim) <= 0:
+            raise ValueError("Prefix graph expert text_dim must be positive when text is enabled.")
+        self.num_classes = int(num_classes)
+        self.hidden_channels = int(hidden_channels)
+        self.use_text = bool(use_text)
+        self.logit_weight = float(logit_weight)
+        self.graph_encoder = RootAwareCascadeEncoder(
+            in_channels=int(in_channels),
+            hidden_channels=int(graph_hidden),
+            num_layers=int(num_layers),
+            dropout=float(dropout),
+        )
+        feature_width = int(self.graph_encoder.output_channels)
+        if self.use_text:
+            self.text_projection = nn.Sequential(
+                nn.Linear(int(text_dim), int(graph_hidden)),
+                nn.LayerNorm(int(graph_hidden)),
+                nn.GELU(),
+                nn.Dropout(p=float(dropout)),
+            )
+            feature_width += int(graph_hidden)
+        self.feature_projection = nn.Sequential(
+            nn.Linear(feature_width, self.hidden_channels),
+            nn.LayerNorm(self.hidden_channels),
+            nn.GELU(),
+            nn.Dropout(p=float(dropout)),
+        )
+        self.classifier = nn.Linear(self.hidden_channels, self.num_classes)
+
+    def forward(self, batch, expected_batch_size: int) -> Tuple[Tensor, Tensor]:
+        if not hasattr(batch, "edge_index") or not hasattr(batch, "batch"):
+            raise ValueError("Prefix graph expert requires batched graph edges and assignments.")
+        root_index = _resolve_global_root_index(batch)
+        graph_features = self.graph_encoder(
+            batch.x.to(dtype=next(self.parameters()).dtype),
+            batch.edge_index,
+            batch.batch,
+            root_index,
+        )
+        if int(graph_features.size(0)) != int(expected_batch_size):
+            raise ValueError(
+                f"Prefix graph expert expected B={expected_batch_size}, got {int(graph_features.size(0))}."
+            )
+        parts = [graph_features]
+        if self.use_text:
+            text_emb = SemanticResidualBranch._extract_text_embedding(batch, expected_batch_size).to(
+                device=graph_features.device,
+                dtype=graph_features.dtype,
+            )
+            parts.append(self.text_projection(text_emb))
+        feature = self.feature_projection(torch.cat(parts, dim=-1))
+        return float(self.logit_weight) * self.classifier(feature), feature
+
+
+class GatedLogitFusion(nn.Module):
+    """Learns sample-specific weights for diffusion, semantic, and prototype logits."""
+
+    def __init__(
+        self,
+        hidden_channels: int,
+        num_classes: int,
+        num_branches: int,
+        hidden: int,
+        dropout: float,
+        temperature: float,
+        init_diffusion_bias: float,
+        init_branch_biases: Optional[List[float]] = None,
+    ) -> None:
+        super().__init__()
+        if int(num_branches) < 2:
+            raise ValueError("Gated logit fusion requires diffusion plus at least one residual branch.")
+        if float(temperature) <= 0.0:
+            raise ValueError("Gated fusion temperature must be positive.")
+        self.hidden_channels = int(hidden_channels)
+        self.num_classes = int(num_classes)
+        self.num_branches = int(num_branches)
+        self.temperature = float(temperature)
+        self.gate = nn.Sequential(
+            nn.Linear(2 * self.hidden_channels + self.num_branches * self.num_classes, int(hidden)),
+            nn.GELU(),
+            nn.Dropout(p=float(dropout)),
+            nn.Linear(int(hidden), self.num_branches),
+        )
+        with torch.no_grad():
+            final = self.gate[-1]
+            assert isinstance(final, nn.Linear)
+            final.weight.zero_()
+            final.bias.zero_()
+            if init_branch_biases is None:
+                final.bias[0] = float(init_diffusion_bias)
+            else:
+                if len(init_branch_biases) != self.num_branches:
+                    raise ValueError(
+                        "gated_fusion.init_branch_biases must match the number of enabled logit branches."
+                    )
+                final.bias.copy_(torch.tensor(init_branch_biases, dtype=final.bias.dtype))
+
+    def forward(
+        self,
+        logit_sources: List[Tensor],
+        representation: Optional[Tensor],
+        semantic_feature: Optional[Tensor],
+    ) -> Tuple[Tensor, Tensor]:
+        if len(logit_sources) != self.num_branches:
+            raise ValueError(f"Expected {self.num_branches} logit sources, got {len(logit_sources)}.")
+        base_logits = logit_sources[0]
+        if base_logits.dim() != 2 or int(base_logits.size(1)) != self.num_classes:
+            raise ValueError("Gated fusion logits must have shape [B, C].")
+        batch_size = int(base_logits.size(0))
+        device, dtype = base_logits.device, base_logits.dtype
+        if representation is None:
+            representation = torch.zeros((batch_size, self.hidden_channels), device=device, dtype=dtype)
+        if semantic_feature is None:
+            semantic_feature = torch.zeros((batch_size, self.hidden_channels), device=device, dtype=dtype)
+        if representation.shape != semantic_feature.shape or tuple(representation.shape) != (batch_size, self.hidden_channels):
+            raise ValueError("Gated fusion features must have shape [B, hidden_channels].")
+        stacked = torch.stack(logit_sources, dim=1)
+        gate_input = torch.cat(
+            [representation, semantic_feature, stacked.reshape(batch_size, -1)],
+            dim=-1,
+        )
+        weights = F.softmax(self.gate(gate_input) / self.temperature, dim=-1)
+        return (weights.unsqueeze(-1) * stacked).sum(dim=1), weights
 
 
 class RumorDiffusion(nn.Module):
@@ -282,7 +432,11 @@ class RumorDiffusion(nn.Module):
         supcon_temperature: float = 0.07,
         prototype_residual_cfg: Optional[Dict[str, object]] = None,
         semantic_residual_cfg: Optional[Dict[str, object]] = None,
+        prefix_graph_expert_cfg: Optional[Dict[str, object]] = None,
+        gated_fusion_cfg: Optional[Dict[str, object]] = None,
         posterior_aggregation_cfg: Optional[Dict[str, object]] = None,
+        prefix_consistency_cfg: Optional[Dict[str, object]] = None,
+        source_robustness_cfg: Optional[Dict[str, object]] = None,
         root_feature_dim: int = 0,
         text_feature_dim: int = 0,
     ) -> None:
@@ -333,9 +487,14 @@ class RumorDiffusion(nn.Module):
         self.supcon_temperature = float(supcon_temperature)
         prototype_residual_cfg = prototype_residual_cfg if isinstance(prototype_residual_cfg, dict) else {}
         semantic_residual_cfg = semantic_residual_cfg if isinstance(semantic_residual_cfg, dict) else {}
+        prefix_graph_expert_cfg = prefix_graph_expert_cfg if isinstance(prefix_graph_expert_cfg, dict) else {}
+        gated_fusion_cfg = gated_fusion_cfg if isinstance(gated_fusion_cfg, dict) else {}
         posterior_aggregation_cfg = posterior_aggregation_cfg if isinstance(posterior_aggregation_cfg, dict) else {}
+        prefix_consistency_cfg = prefix_consistency_cfg if isinstance(prefix_consistency_cfg, dict) else {}
+        source_robustness_cfg = source_robustness_cfg if isinstance(source_robustness_cfg, dict) else {}
         self.prototype_residual_enabled = bool(prototype_residual_cfg.get("enabled", False))
         self.semantic_residual_enabled = bool(semantic_residual_cfg.get("enabled", False))
+        self.prefix_graph_expert_enabled = bool(prefix_graph_expert_cfg.get("enabled", False))
         self.posterior_aggregation_enabled = bool(posterior_aggregation_cfg.get("enabled", False))
         if self.prototype_residual_enabled:
             self.prototype_residual = PrototypeResidualBranch(
@@ -357,6 +516,54 @@ class RumorDiffusion(nn.Module):
                 use_root=bool(semantic_residual_cfg["use_root"]),
                 use_text=bool(semantic_residual_cfg["use_text"]),
             )
+        if self.prefix_graph_expert_enabled:
+            self.prefix_graph_expert = PrefixGraphExpertBranch(
+                in_channels=int(root_feature_dim),
+                text_dim=int(text_feature_dim),
+                hidden_channels=self.hidden_channels,
+                graph_hidden=int(prefix_graph_expert_cfg.get("hidden", max(1, self.hidden_channels // 2))),
+                num_layers=int(prefix_graph_expert_cfg.get("num_layers", 2)),
+                num_classes=self.num_classes,
+                dropout=float(prefix_graph_expert_cfg.get("dropout", dropout)),
+                logit_weight=float(prefix_graph_expert_cfg.get("logit_weight", 1.0)),
+                use_text=bool(prefix_graph_expert_cfg.get("use_text", True)),
+            )
+        self.gated_fusion_enabled = bool(gated_fusion_cfg.get("enabled", False))
+        fusion_branches = (
+            1
+            + int(self.semantic_residual_enabled)
+            + int(self.prefix_graph_expert_enabled)
+            + int(self.prototype_residual_enabled)
+        )
+        if self.gated_fusion_enabled:
+            self.gated_fusion = GatedLogitFusion(
+                hidden_channels=self.hidden_channels,
+                num_classes=self.num_classes,
+                num_branches=fusion_branches,
+                hidden=int(gated_fusion_cfg.get("hidden", self.hidden_channels)),
+                dropout=float(gated_fusion_cfg.get("dropout", dropout)),
+                temperature=float(gated_fusion_cfg.get("temperature", 1.0)),
+                init_diffusion_bias=float(gated_fusion_cfg.get("init_diffusion_bias", 1.5)),
+                init_branch_biases=gated_fusion_cfg.get("init_branch_biases", None),
+            )
+        self.prefix_consistency_enabled = bool(prefix_consistency_cfg.get("enabled", False))
+        self.prefix_consistency_supervised_weight = float(prefix_consistency_cfg.get("supervised_weight", 0.0))
+        self.prefix_consistency_kl_weight = float(prefix_consistency_cfg.get("symmetric_kl_weight", 0.0))
+        self.prefix_consistency_temperature = float(prefix_consistency_cfg.get("temperature", 1.0))
+        if self.prefix_consistency_enabled and self.prefix_consistency_temperature <= 0.0:
+            raise ValueError("Prefix-consistency temperature must be positive.")
+        self.source_robustness_enabled = bool(source_robustness_cfg.get("enabled", False))
+        self.source_robustness_weight = float(source_robustness_cfg.get("weight", 0.0))
+        self.source_robustness_edge_dropout = float(source_robustness_cfg.get("edge_dropout", 0.0))
+        self.source_robustness_text_dropout = float(source_robustness_cfg.get("text_dropout", 0.0))
+        self.source_robustness_text_noise_std = float(source_robustness_cfg.get("text_noise_std", 0.0))
+        self.source_robustness_prefix_weight = float(source_robustness_cfg.get("prefix_weight", 0.0))
+        for name, value in (
+            ("edge_dropout", self.source_robustness_edge_dropout),
+            ("text_dropout", self.source_robustness_text_dropout),
+        ):
+            if not 0.0 <= value < 1.0:
+                raise ValueError(f"Source-robustness {name} must be in [0, 1).")
         if self.posterior_aggregation_enabled:
             self.posterior_aggregation_samples = int(posterior_aggregation_cfg["samples"])
             self.posterior_aggregation_mode = str(posterior_aggregation_cfg["mode"]).lower()
@@ -366,6 +573,13 @@ class RumorDiffusion(nn.Module):
                 raise ValueError("posterior_aggregation.samples must be positive.")
             if self.posterior_aggregation_mode not in {"mean_logits", "logmeanexp", "mean_prob"}:
                 raise ValueError("posterior_aggregation.mode must be mean_logits, logmeanexp, or mean_prob.")
+            if self.posterior_aggregation_samples > 1 and not self.posterior_aggregation_stochastic:
+                warnings.warn(
+                    "Deterministic posterior aggregation repeats identical logits; reducing samples to 1.",
+                    RuntimeWarning,
+                )
+                self.posterior_aggregation_samples = 1
+        self._posterior_repeat_warned = False
         # Multi-pair margin loss configuration (for handling multiple confusable class pairs)
         self.multi_pair_margin_list = []
         self.multi_pair_margin_values = []
@@ -559,20 +773,39 @@ class RumorDiffusion(nn.Module):
         targets: Optional[Tensor] = None,
         update_prototypes: bool = False,
     ) -> Tensor:
-        out = logits
+        logit_sources = [logits]
         residual_features = representation
+        semantic_feature: Optional[Tensor] = None
         if self.semantic_residual_enabled:
             semantic_logits, semantic_feature = self.semantic_residual(batch, expected_batch_size=int(logits.size(0)))
-            out = out + semantic_logits
+            logit_sources.append(semantic_logits)
             if residual_features is None:
                 residual_features = semantic_feature
+        if self.prefix_graph_expert_enabled:
+            graph_logits, graph_feature = self.prefix_graph_expert(
+                batch,
+                expected_batch_size=int(logits.size(0)),
+            )
+            logit_sources.append(graph_logits)
+            if residual_features is None:
+                residual_features = graph_feature
         if self.prototype_residual_enabled and residual_features is not None:
-            out = out + self.prototype_residual(residual_features)
+            logit_sources.append(self.prototype_residual(residual_features))
             if bool(update_prototypes):
                 if targets is None:
                     raise ValueError("Prototype residual update requires training targets.")
                 self.prototype_residual.update(residual_features.detach(), targets.detach())
-        return out
+        if self.gated_fusion_enabled:
+            if len(logit_sources) != self.gated_fusion.num_branches:
+                raise RuntimeError("Gated fusion branch configuration does not match available residual logits.")
+            fused_logits, fusion_gates = self.gated_fusion(
+                logit_sources,
+                representation=residual_features,
+                semantic_feature=semantic_feature,
+            )
+            self._last_fusion_gates = fusion_gates.detach()
+            return fused_logits
+        return sum(logit_sources)
 
     def _logits_from_tokens_with_residuals(
         self,
@@ -606,11 +839,28 @@ class RumorDiffusion(nn.Module):
         self._last_potentials = Hc
         return self._logits_from_tokens_with_residuals(Hc, batch)
 
+    def _ctdm_trainable_parameter_names(self) -> List[str]:
+        if self.ctdm is None:
+            return []
+        return [name for name, param in self.ctdm.named_parameters() if param.requires_grad]
+
+    def _ctdm_adapter_only_trainable(self) -> bool:
+        trainable_names = self._ctdm_trainable_parameter_names()
+        return len(trainable_names) > 0 and all(
+            name.startswith("potential_adapter.") for name in trainable_names
+        )
+
+    def _ctdm_reverse_trajectory_trainable(self) -> bool:
+        trainable_names = self._ctdm_trainable_parameter_names()
+        return any(not name.startswith("potential_adapter.") for name in trainable_names)
+
     def _compute_ctdm_potentials(self, batch, stochastic: bool = False) -> Tensor:
         assert self.ctdm is not None, "CTDM is required when potentials are not present in the batch"
-        ctdm_trainable = self.training and any(p.requires_grad for p in self.ctdm.parameters())
+        ctdm_trainable = self.training and len(self._ctdm_trainable_parameter_names()) > 0
         if bool(stochastic) and ctdm_trainable:
             raise ValueError("Stochastic CTDM uncertainty sampling is inference-only.")
+        if ctdm_trainable and self._ctdm_adapter_only_trainable():
+            return self.ctdm.potentials_all_adapter_grad(batch)
         if ctdm_trainable:
             return self.ctdm.potentials_all_grad(batch)
         if bool(stochastic):
@@ -650,6 +900,16 @@ class RumorDiffusion(nn.Module):
                 )
             logits_samples.append(sample_logits.to(torch.float32))
         stacked = torch.stack(logits_samples, dim=0)
+        if stacked.size(0) > 1:
+            repeated = all(torch.allclose(stacked[0], sample, rtol=1e-5, atol=1e-6) for sample in stacked[1:])
+            if repeated:
+                if not self._posterior_repeat_warned:
+                    warnings.warn(
+                        "Posterior aggregation produced repeated logits; reducing effective samples to 1.",
+                        RuntimeWarning,
+                    )
+                    self._posterior_repeat_warned = True
+                stacked = stacked[:1]
         if self.posterior_aggregation_mode == "mean_logits":
             return stacked.mean(dim=0)
         if self.posterior_aggregation_mode == "logmeanexp":
@@ -659,6 +919,17 @@ class RumorDiffusion(nn.Module):
 
     def forward(self, batch) -> Tensor:
         """Build token sequence and arbitrate via Transformer [CLS] output by default."""
+        if not self.training and hasattr(batch, "to_data_list"):
+            mature_fields = (
+                "full_x", "full_edge_index", "full_root_index", "full_node_time_minutes",
+                "full_node_time_minutes_shifted", "full_node_time_hops", "full_node_time_hops_shifted",
+                "full_node_uid", "full_node_tweet_id",
+            )
+            for sample in batch.to_data_list():
+                if any(hasattr(sample, field) for field in mature_fields):
+                    raise RuntimeError(
+                        "RumorDiffusion eval received mature-state attributes; use eval_prefix input only."
+                    )
         def _compute():
             if (not self.training) and self.posterior_aggregation_enabled:
                 return self._posterior_aggregated_logits(batch)
@@ -811,6 +1082,118 @@ class RumorDiffusion(nn.Module):
         kl_qp = (q * (q / p).log()).sum(dim=1)
         return (kl_pq + kl_qp).mean()
 
+    def _symmetric_kl_logits(self, logits_a: Tensor, logits_b: Tensor, temperature: float = 1.0) -> Tensor:
+        temp = max(float(temperature), 1e-6)
+        return self._symmetric_kl(
+            F.softmax(logits_a / temp, dim=1),
+            F.softmax(logits_b / temp, dim=1),
+        )
+
+    def _prefix_view_batches(self, batch) -> List:
+        views = getattr(batch, "prefix_views", None)
+        if not isinstance(views, (list, tuple)) or len(views) == 0:
+            raise RuntimeError("Enabled prefix regularization requires batched prefix_views from GraphDataset.")
+        if isinstance(views[0], (list, tuple)):
+            from torch_geometric.data import Batch
+
+            batch_size = int(batch.y.view(-1).numel())
+            if len(views) == batch_size:
+                # PyG preserves arbitrary nested Data attributes per source graph.
+                view_count = len(views[0])
+                if view_count == 0 or any(len(sample_views) != view_count for sample_views in views):
+                    raise RuntimeError("Prefix views must have a consistent view count for every source graph.")
+                return [Batch.from_data_list([sample_views[index] for sample_views in views]) for index in range(view_count)]
+            if all(len(view_sources) == batch_size for view_sources in views):
+                # Also support an already transposed [view][source] representation.
+                return [Batch.from_data_list(list(view_sources)) for view_sources in views]
+            raise RuntimeError("Unable to align nested prefix views with the current source batch.")
+        return list(views)
+
+    def _source_robust_batch(self, batch):
+        """Applies source-only edge/text perturbations without changing labels or splits."""
+        from torch_geometric.data import Batch
+
+        robust_graphs = []
+        for graph in batch.to_data_list():
+            if hasattr(graph, "prefix_views"):
+                delattr(graph, "prefix_views")
+            # Cached potentials describe the unperturbed observed prefix. They
+            # are invalid once this graph is changed, so robustness training
+            # must recompute CTDM potentials instead of comparing stale logits.
+            for stale_attr in ("h0", "h1", "h_cat"):
+                if hasattr(graph, stale_attr):
+                    delattr(graph, stale_attr)
+            if self.source_robustness_edge_dropout > 0.0 and hasattr(graph, "edge_index"):
+                edge_index = graph.edge_index
+                if int(edge_index.size(1)) > 0:
+                    keep = torch.rand((int(edge_index.size(1)),), device=edge_index.device) >= self.source_robustness_edge_dropout
+                    if not bool(keep.any()):
+                        keep[0] = True
+                    graph.edge_index = edge_index[:, keep]
+                    if hasattr(graph, "prefix_edge_index"):
+                        graph.prefix_edge_index = graph.edge_index.clone()
+            if hasattr(graph, "text_emb"):
+                text_emb = graph.text_emb.to(torch.float32)
+                if self.source_robustness_text_dropout > 0.0:
+                    text_emb = F.dropout(text_emb, p=self.source_robustness_text_dropout, training=True)
+                if self.source_robustness_text_noise_std > 0.0:
+                    text_emb = text_emb + torch.randn_like(text_emb) * self.source_robustness_text_noise_std
+                graph.text_emb = text_emb
+            robust_graphs.append(graph)
+        return Batch.from_data_list(robust_graphs)
+
+    def _multiview_regularization(self, batch, main_logits: Tensor, targets: Tensor) -> Tuple[Tensor, Dict[str, float]]:
+        """Computes source-only prefix and perturbation consistency objectives."""
+        total = main_logits.new_zeros(())
+        details: Dict[str, float] = {}
+        main_potentials = getattr(self, "_last_potentials", None)
+        view_logits: List[Tensor] = []
+        if self.prefix_consistency_enabled:
+            supervised_losses: List[Tensor] = []
+            consistency_losses: List[Tensor] = []
+            for view_batch in self._prefix_view_batches(batch):
+                view_batch = view_batch.to(main_logits.device)
+                view_logits_i = self._forward_once(view_batch)
+                view_targets = view_batch.y.view(-1).long()
+                if not torch.equal(view_targets, targets):
+                    raise RuntimeError("Prefix consistency views must preserve source-order labels.")
+                view_logits.append(view_logits_i)
+                supervised_losses.append(self._la_focal_loss(view_logits_i, targets))
+                consistency_losses.append(
+                    self._symmetric_kl_logits(
+                        main_logits,
+                        view_logits_i,
+                        temperature=self.prefix_consistency_temperature,
+                    )
+                )
+            supervised = torch.stack(supervised_losses).mean()
+            consistency = torch.stack(consistency_losses).mean()
+            total = total + self.prefix_consistency_supervised_weight * supervised
+            total = total + self.prefix_consistency_kl_weight * consistency
+            details["prefix_supervised"] = float(supervised.detach().item())
+            details["prefix_symmetric_kl"] = float(consistency.detach().item())
+
+        if self.source_robustness_enabled and self.source_robustness_weight > 0.0:
+            robust_logits = self._forward_once(self._source_robust_batch(batch))
+            robust_kl = self._symmetric_kl_logits(main_logits, robust_logits)
+            total = total + self.source_robustness_weight * robust_kl
+            details["source_robustness"] = float(robust_kl.detach().item())
+            if self.source_robustness_prefix_weight > 0.0:
+                if not view_logits:
+                    view_logits = [
+                        self._forward_once(view_batch.to(main_logits.device))
+                        for view_batch in self._prefix_view_batches(batch)
+                    ]
+                prefix_robust_kl = torch.stack(
+                    [self._symmetric_kl_logits(main_logits, logits) for logits in view_logits]
+                ).mean()
+                total = total + self.source_robustness_prefix_weight * prefix_robust_kl
+                details["source_prefix_robustness"] = float(prefix_robust_kl.detach().item())
+
+        if main_potentials is not None:
+            self._last_potentials = main_potentials
+        return total, details
+
     def training_step(self, batch) -> Tuple[Tensor, float]:
         """Performs one training step and returns (loss, aux_acc).
 
@@ -821,9 +1204,10 @@ class RumorDiffusion(nn.Module):
         targets = batch.y.view(-1).long()
         loss_dict = {}
         has_cached_potentials = hasattr(batch, "h_cat") or (hasattr(batch, "h0") and hasattr(batch, "h1"))
-        ctdm_trainable = self.ctdm is not None and any(p.requires_grad for p in self.ctdm.parameters())
+        ctdm_trainable = self.ctdm is not None and len(self._ctdm_trainable_parameter_names()) > 0
+        ctdm_reverse_trajectory_trainable = self._ctdm_reverse_trajectory_trainable()
         diffusion_loss: Optional[Tensor] = None
-        if ctdm_trainable and float(self.lambda_diffusion) > 0.0:
+        if ctdm_reverse_trajectory_trainable and float(self.lambda_diffusion) > 0.0:
             diffusion_loss, _ = self.ctdm.training_step(batch)
 
         if self.dd_gan_enabled:
@@ -971,6 +1355,10 @@ class RumorDiffusion(nn.Module):
                 loss = loss + float(self.lambda_diffusion) * diffusion_loss
                 loss_dict["diffusion"] = float(diffusion_loss.detach().item())
 
+            multiview_loss, multiview_details = self._multiview_regularization(batch, logits_main, targets)
+            loss = loss + multiview_loss
+            loss_dict.update(multiview_details)
+
             for p in self.discriminator.parameters():
                 p.requires_grad = True
             self.discriminator.train()
@@ -1077,6 +1465,9 @@ class RumorDiffusion(nn.Module):
         if diffusion_loss is not None:
             loss = loss + float(self.lambda_diffusion) * diffusion_loss
             loss_dict["diffusion"] = float(diffusion_loss.detach().item())
+        multiview_loss, multiview_details = self._multiview_regularization(batch, logits, targets)
+        loss = loss + multiview_loss
+        loss_dict.update(multiview_details)
         loss_dict["total"] = float(loss.detach().item())
         if self.loss_logging:
             self._last_loss_breakdown = loss_dict

@@ -1,0 +1,102 @@
+--- a/Libs/models/baselines/CTDM_syn.py
++++ b/Libs/models/baselines/CTDM_syn.py
+@@ -1144,7 +1144,7 @@
+             pass
+         return G0, Gobs, Mobs, y
+ 
+-    def _pred_theta(self, G_t: Tensor, t: Tensor, y: Optional[Tensor], G_obs: Tensor, drop_mask: Optional[Tensor] = None) -> Tensor:
++    def _pred_theta(self, G_t: Tensor, t: Tensor, y: Optional[Tensor], G_obs: Tensor, drop_mask: Optional[Tensor] = None, *, Mobs: Tensor) -> Tensor:
+         """Predicts parameterization vector ('eps' or 'v') over flattened [A, X].
+ 
+         Args:
+@@ -1152,6 +1152,7 @@
+             t: [B] diffusion step indices.
+             y: [B] class ids or None for unconditional branch.
+             G_obs: [B, L] observed flattened vector.
++            Mobs: [B, L] authoritative packed observation mask.
+             drop_mask: Optional [B] boolean mask; when True zeros out class embedding.
+ 
+         Returns:
+@@ -1161,6 +1162,7 @@
+         _assert_shape(t, (-1,))
+         _assert_shape(G_obs, (-1, -1))
+         B, L = G_t.shape
++        _assert_shape(Mobs, (B, L))
+         N = self.max_nodes
+         D = self.in_channels
+         assert int(L) == N * N + N * D
+@@ -1272,6 +1274,18 @@
+         else:
+             pair_mask = base_mask
+         pred_a = scores * pair_mask.to(scores.dtype)
++        # Observed coordinates retain the original sparse-pruned head output.
++        # Only unobserved adjacency coordinates interpret dense scores as A0.
++        observed_pairs = Mobs[:, :N * N].reshape(B, N, N).to(device=scores.device, dtype=torch.bool)
++        c1, c2 = self._get_c1_c2(t)
++        c1 = c1.view(B, 1, 1).to(device=A_t.device, dtype=A_t.dtype)
++        c2 = c2.view(B, 1, 1).to(device=A_t.device, dtype=A_t.dtype).clamp_min(self._eps)
++        clean_a = scores.to(dtype=A_t.dtype)
++        if self.parameterization == "eps":
++            unobserved_pred_a = (A_t - c1 * clean_a) / c2
++        else:
++            unobserved_pred_a = (c1 * A_t - clean_a) / c2
++        pred_a = torch.where(observed_pairs, pred_a, unobserved_pred_a.to(dtype=pred_a.dtype))
+ 
+         pred = torch.cat([pred_a.reshape(B, N * N), pred_x.reshape(B, N * D)], dim=-1)
+         return pred
+@@ -1398,8 +1412,8 @@
+             t = torch.full((B,), int(step), dtype=torch.long, device=device)
+             prev_t = torch.full((B,), max(0, int(step) - step_stride), dtype=torch.long, device=device)
+             # CFG combine conditional/unconditional predictions
+-            pred_c = self._pred_theta(Gt, t, y_h, Gobs, drop_mask=None)
+-            pred_u = self._pred_theta(Gt, t, None, Gobs, drop_mask=None)
++            pred_c = self._pred_theta(Gt, t, y_h, Gobs, drop_mask=None, Mobs=Mobs)
++            pred_u = self._pred_theta(Gt, t, None, Gobs, drop_mask=None, Mobs=Mobs)
+             pred = pred_u + self.guidance_scale * (pred_c - pred_u)
+             eps_pred = self._to_eps(Gt, t, pred)
+             Gt = self._reverse_inference_update(Gt, t, eps_pred, prev_t)
+@@ -1500,8 +1514,8 @@
+             for step in range(self.T, 0, -step_stride):
+                 t = torch.full((B,), int(step), dtype=torch.long, device=device)
+                 prev_t = torch.full((B,), max(0, int(step) - step_stride), dtype=torch.long, device=device)
+-                pred_c = self._pred_theta(Gt, t, y_h, Gobs, drop_mask=None)
+-                pred_u = self._pred_theta(Gt, t, None, Gobs, drop_mask=None)
++                pred_c = self._pred_theta(Gt, t, y_h, Gobs, drop_mask=None, Mobs=Mobs)
++                pred_u = self._pred_theta(Gt, t, None, Gobs, drop_mask=None, Mobs=Mobs)
+                 pred = pred_u + self.guidance_scale * (pred_c - pred_u)
+                 eps_pred = self._to_eps(Gt, t, pred)
+                 Gt = self._reverse_inference_update(Gt, t, eps_pred, prev_t)
+@@ -1548,7 +1562,7 @@
+             drop_mask = (torch.rand((B,), device=device) < float(self.guidance_p))
+         else:
+             drop_mask = None
+-        pred = self._pred_theta(Gt, t, y, Gobs, drop_mask=drop_mask)
++        pred = self._pred_theta(Gt, t, y, Gobs, drop_mask=drop_mask, Mobs=Mobs)
+         target = self._v_target(G0, t, noise) if self.parameterization == "v" else noise
+         _assert_shape(target, (-1, -1))
+         _assert_shape(pred, (-1, -1))
+@@ -1694,8 +1708,8 @@
+             stride = max(1, getattr(self, "t_stride", self.T // 20 if self.T >= 20 else 1))
+             for step in range(self.T, 0, -stride):
+                 t = torch.full((B,), int(step), dtype=torch.long, device=device)
+-                pred_c = self._pred_theta(Gt, t, y_h, Gobs, drop_mask=None)
+-                pred_u = self._pred_theta(Gt, t, None, Gobs, drop_mask=None)
++                pred_c = self._pred_theta(Gt, t, y_h, Gobs, drop_mask=None, Mobs=Mobs)
++                pred_u = self._pred_theta(Gt, t, None, Gobs, drop_mask=None, Mobs=Mobs)
+                 pred = pred_u + self.guidance_scale * (pred_c - pred_u)
+                 eps_pred = self._to_eps(Gt, t, pred)
+                 mean, _var = self._posterior_mean_variance(Gt, t, eps_pred)
+--- a/Libs/exp/validation_diagnostics.py
++++ b/Libs/exp/validation_diagnostics.py
+@@ -893,9 +893,9 @@
+         finally:
+             active.clear()
+ 
+-    def pred_theta(G_t, t, y, G_obs, drop_mask=None):
++    def pred_theta(G_t, t, y, G_obs, drop_mask=None, *, Mobs):
+         _finite_tensors("denoiser input states", G_t, G_obs)
+-        result = original["_pred_theta"](G_t, t, y, G_obs, drop_mask=drop_mask)
++        result = original["_pred_theta"](G_t, t, y, G_obs, drop_mask=drop_mask, Mobs=Mobs)
+         _finite_tensors("denoiser output and hidden states", result, ctdm._last_hidden, ctdm._last_xobs)
+         active["denoiser_calls"].append({"t": t.detach().cpu().tolist(), "class_hypothesis": None if y is None else y.detach().cpu().tolist()})
+         return result

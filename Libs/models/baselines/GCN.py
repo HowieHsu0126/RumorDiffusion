@@ -1,4 +1,3 @@
-import math
 from typing import List
 
 import torch
@@ -65,5 +64,4 @@ class GCN(nn.Module):
         x = self.dropout(x)
         logits = self.classifier(x)
         return logits
-
 

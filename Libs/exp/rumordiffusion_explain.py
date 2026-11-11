@@ -14,10 +14,9 @@ import csv
 import json
 import os
 from datetime import datetime
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
-from torch import Tensor
 from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader as PyGDataLoader
 

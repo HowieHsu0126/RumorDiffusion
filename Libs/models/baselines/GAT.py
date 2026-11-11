@@ -40,14 +40,12 @@ class GAT(nn.Module):
         self.convs: List[GATConv] = nn.ModuleList()
         self.bns: List[nn.LayerNorm] = nn.ModuleList()
         last_c = in_channels
-        last_heads = 1
         for layer in range(num_layers):
             conv = GATConv(last_c, hidden_channels, heads=heads, concat=True, dropout=dropout)
             self.convs.append(conv)
             out_c = hidden_channels * heads
             self.bns.append(nn.LayerNorm(out_c))
             last_c = out_c
-            last_heads = heads
 
         self.dropout = nn.Dropout(p=dropout)
         self.classifier = nn.Linear(last_c, num_classes)
@@ -71,5 +69,3 @@ class GAT(nn.Module):
         x = self.dropout(x)
         logits = self.classifier(x)
         return logits
-
-

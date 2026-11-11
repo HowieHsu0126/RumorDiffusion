@@ -1,6 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
+# Submission is deliberately opt-in. A shell invocation is not evidence that
+# the repository owner explicitly authorized a scheduler state change.
+if [ "${RUMORDIFFUSION_SLURM_CONFIRMATION:-}" != "I_HAVE_EXPLICIT_USER_CONFIRMATION" ]; then
+  sbatch() {
+    echo "Refusing sbatch: set RUMORDIFFUSION_SLURM_CONFIRMATION=I_HAVE_EXPLICIT_USER_CONFIRMATION after explicit user approval." >&2
+    return 64
+  }
+fi
+
 profile_get() {
   local exp_cfg="$1"
   local profile="$2"
@@ -62,17 +71,27 @@ resolve_project_prefix() {
   printf '%s\n' "${prefix}"
 }
 
+ensure_repo_pythonpath() {
+  local repo_root="/share/home/hwxu/Researches/D2Plus"
+  case ":${PYTHONPATH:-}:" in
+    *":${repo_root}:"*) ;;
+    *) export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}" ;;
+  esac
+}
+
 activate_conda_env() {
   local conda_env="$1"
   export USE_TF=0
   export USE_TORCH=1
   export TRANSFORMERS_NO_TF=1
+  ensure_repo_pythonpath
   set +u
   source /share/home/hwxu/miniconda3/bin/activate "${conda_env}"
   set -u
   export USE_TF=0
   export USE_TORCH=1
   export TRANSFORMERS_NO_TF=1
+  ensure_repo_pythonpath
 }
 
 record_env_snapshot() {

@@ -1,8 +1,151 @@
-from typing import Dict, List, Optional, Union
+import math
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import torch
 
 import torch.nn.functional as F
+
+
+def _as_probabilities(probs: torch.Tensor) -> torch.Tensor:
+    if probs.dim() != 2 or probs.size(1) < 2:
+        raise ValueError("probs must have shape [N, C] with C >= 2")
+    if not torch.isfinite(probs).all():
+        raise ValueError("probabilities must be finite")
+    if torch.any(probs < 0):
+        raise ValueError("probabilities must be non-negative")
+    row_sums = probs.sum(dim=1)
+    if not torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5, rtol=1e-5):
+        raise ValueError("probability rows must sum to one")
+    return probs
+
+
+def compute_brier(probs: torch.Tensor, targets: torch.Tensor, num_classes: Optional[int] = None) -> float:
+    """Multiclass Brier score over the declared complete class space."""
+    probs = _as_probabilities(probs)
+    if targets.dim() != 1 or targets.numel() != probs.size(0):
+        raise ValueError("targets must have shape [N] matching probs")
+    classes = int(num_classes or probs.size(1))
+    if classes != probs.size(1) or torch.any((targets < 0) | (targets >= classes)):
+        raise ValueError("targets are outside the declared class space")
+    one_hot = F.one_hot(targets.to(torch.long), num_classes=classes).to(probs.dtype)
+    return float(torch.mean(torch.sum((probs - one_hot) ** 2, dim=1)).item())
+
+
+def metrics_from_probabilities(
+    probs: torch.Tensor,
+    targets: torch.Tensor,
+    num_classes: Optional[int] = None,
+    ece_bins: int = 15,
+) -> Dict[str, Any]:
+    """Compute report metrics without reconstructing logits or scanning labels."""
+    probs = _as_probabilities(probs)
+    classes = int(num_classes or probs.size(1))
+    if classes != probs.size(1):
+        raise ValueError("num_classes must match probability dimension")
+    logits = torch.log(probs.clamp_min(torch.finfo(probs.dtype).tiny))
+    result = metrics_from_logits(logits, targets, classes, detailed=True, compute_calibration=True, ece_bins=ece_bins)
+    result["brier"] = compute_brier(probs, targets, classes)
+    return result
+
+
+def seed_level_summary(values: Sequence[float], *, ci: str = "student_t", confidence: float = 0.95) -> Dict[str, Any]:
+    """Summarise independent seed values; pooled-example intervals are disallowed."""
+    numbers = [float(value) for value in values]
+    if not numbers or not all(math.isfinite(value) for value in numbers):
+        raise ValueError("seed values must be non-empty and finite")
+    n = len(numbers)
+    mean = sum(numbers) / n
+    sd = math.sqrt(sum((value - mean) ** 2 for value in numbers) / (n - 1)) if n > 1 else 0.0
+    if ci not in {"student_t", "none"}:
+        raise ValueError(f"Unsupported CI method: {ci}")
+    if ci == "none" or n == 1:
+        half_width = 0.0
+    else:
+        try:
+            from scipy.stats import t
+
+            critical = float(t.ppf((1.0 + confidence) / 2.0, df=n - 1))
+        except Exception as exc:  # pragma: no cover - scipy is an optional runtime dependency
+            raise RuntimeError("Student-t CI requires scipy") from exc
+        half_width = critical * sd / math.sqrt(n)
+    return {
+        "values": numbers,
+        "n": n,
+        "mean": mean,
+        "sample_sd": sd,
+        "ci_method": ci,
+        "confidence": confidence,
+        "df": n - 1 if n > 1 else 0,
+        "ci95": [mean - half_width, mean + half_width],
+    }
+
+
+def paired_bootstrap(
+    reference: Mapping[str, float], comparison: Mapping[str, float],
+    *, n_bootstrap: int = 2000, seed: int = 42,
+) -> Dict[str, Any]:
+    """Paired bootstrap of per-example scalar scores keyed by immutable IDs."""
+    if set(reference) != set(comparison) or not reference:
+        raise ValueError("paired comparison requires identical non-empty sample IDs")
+    import random
+
+    ids = sorted(reference)
+    deltas = [float(comparison[item]) - float(reference[item]) for item in ids]
+    if not all(math.isfinite(value) for value in deltas):
+        raise ValueError("paired scores must be finite")
+    rng = random.Random(int(seed))
+    observed = sum(deltas) / len(deltas)
+    samples = []
+    for _ in range(max(1, int(n_bootstrap))):
+        draw = [deltas[rng.randrange(len(deltas))] for _ in deltas]
+        samples.append(sum(draw) / len(draw))
+    samples.sort()
+    lo = samples[int(0.025 * (len(samples) - 1))]
+    hi = samples[int(0.975 * (len(samples) - 1))]
+    p = 2.0 * min(sum(value <= 0.0 for value in samples), sum(value >= 0.0 for value in samples)) / len(samples)
+    return {"estimate": observed, "ci95": [lo, hi], "p_value": min(1.0, p), "n": len(ids), "n_bootstrap": len(samples), "seed": int(seed)}
+
+
+def holm_bonferroni(p_values: Mapping[str, float]) -> Dict[str, float]:
+    """Holm step-down adjusted p-values, preserving comparison names."""
+    ordered = sorted(((name, float(value)) for name, value in p_values.items()), key=lambda item: item[1])
+    adjusted: Dict[str, float] = {}
+    running = 0.0
+    total = len(ordered)
+    for rank, (name, value) in enumerate(ordered):
+        candidate = min(1.0, max(running, value * (total - rank)))
+        running = candidate
+        adjusted[name] = candidate
+    return adjusted
+
+
+def hierarchical_bootstrap(
+    grouped_values: Mapping[Any, Sequence[float]],
+    *, n_bootstrap: int = 2000, seed: int = 42,
+) -> Dict[str, Any]:
+    """Outer-seed/inner-example bootstrap; every group must be non-empty."""
+    groups = {key: [float(value) for value in values] for key, values in grouped_values.items()}
+    if not groups or any(not values for values in groups.values()):
+        raise ValueError("hierarchical bootstrap requires non-empty groups")
+    if any(not math.isfinite(value) for values in groups.values() for value in values):
+        raise ValueError("bootstrap values must be finite")
+    import random
+
+    keys = list(groups)
+    rng = random.Random(int(seed))
+    observed = sum(sum(values) / len(values) for values in groups.values()) / len(groups)
+    samples = []
+    for _ in range(max(1, int(n_bootstrap))):
+        outer = [keys[rng.randrange(len(keys))] for _ in keys]
+        means = []
+        for key in outer:
+            vals = groups[key]
+            means.append(sum(vals[rng.randrange(len(vals))] for _ in vals) / len(vals))
+        samples.append(sum(means) / len(means))
+    samples.sort()
+    lo = samples[int(0.025 * (len(samples) - 1))]
+    hi = samples[int(0.975 * (len(samples) - 1))]
+    return {"estimate": observed, "ci95": [lo, hi], "n_outer": len(keys), "n_bootstrap": len(samples), "seed": int(seed), "stratification": "outer_seed_inner_example"}
 
 
 def compute_accuracy(preds: torch.Tensor, targets: torch.Tensor) -> float:
@@ -210,7 +353,11 @@ def compute_ece(probs: torch.Tensor, targets: torch.Tensor, n_bins: int = 15) ->
     bins = torch.linspace(0.0, 1.0, steps=n_bins + 1, device=probs.device)
     ece = torch.zeros((), device=probs.device)
     for i in range(n_bins):
-        mask = (confidences > bins[i]) & (confidences <= bins[i + 1])
+        # Include the left edge of the first bin so confidence=0.0 is covered.
+        if i == 0:
+            mask = (confidences >= bins[i]) & (confidences <= bins[i + 1])
+        else:
+            mask = (confidences > bins[i]) & (confidences <= bins[i + 1])
         if mask.sum() == 0:
             continue
         avg_conf = confidences[mask].mean()
@@ -289,4 +436,3 @@ def metrics_from_logits(
         )
 
     return result
-

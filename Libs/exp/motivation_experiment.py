@@ -7,12 +7,10 @@ mature-stage graphs are separable.
 
 import argparse
 import csv
-import json
 import logging
 import os
 import sys
 import warnings
-from datetime import datetime
 from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
@@ -30,7 +28,7 @@ from sklearn.metrics import (
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from torch_geometric.data import Data
-from torch_geometric.utils import negative_sampling, train_test_split_edges
+from torch_geometric.utils import negative_sampling
 from tqdm import tqdm
 
 # 抑制sklearn的UndefinedMetricWarning
@@ -38,9 +36,9 @@ warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from Libs.data.dataset import GraphDataset
-from Libs.models.baselines.GAE import create_gae_model
-from Libs.utils.seed import set_global_seed
+from Libs.data.dataset import GraphDataset  # noqa: E402
+from Libs.models.baselines.GAE import create_gae_model  # noqa: E402
+from Libs.utils.seed import set_global_seed  # noqa: E402
 
 
 def setup_logging(output_dir: str) -> logging.Logger:
@@ -254,13 +252,13 @@ def prepare_data_nodecount(all_graphs: List[Data], config: Dict) -> Tuple[List[D
     outputs = []
     for m_min in mature_candidates:
         for e_max in early_candidates:
-    mature_graphs = []
-    early_graphs = []
-    for data in all_graphs:
+            mature_graphs = []
+            early_graphs = []
+            for data in all_graphs:
                 if data.num_nodes > m_min:
-            mature_graphs.append(data)
-                    early_sub = create_early_subgraph_by_nodecount(data, e_max)
-            early_graphs.append(early_sub)
+                    mature_graphs.append(data)
+                early_sub = create_early_subgraph_by_nodecount(data, e_max)
+                early_graphs.append(early_sub)
             outputs.append(((m_min, e_max), mature_graphs, early_graphs))
     return outputs
 
@@ -280,14 +278,14 @@ def prepare_data_timecutoff(all_graphs: List[Data], config: Dict) -> Tuple[List[
     outputs = []
     for m_min in mature_candidates:
         for cutoff in cutoff_candidates:
-    mature_graphs = []
-    early_graphs = []
-    for data in all_graphs:
+            mature_graphs = []
+            early_graphs = []
+            for data in all_graphs:
                 if data.num_nodes >= m_min:
-            mature_graphs.append(data)
-                    early_sub = create_early_subgraph_by_timecutoff(data, cutoff)
-                    if early_sub is not None:
-                early_graphs.append(early_sub)
+                    mature_graphs.append(data)
+                early_sub = create_early_subgraph_by_timecutoff(data, cutoff)
+                if early_sub is not None:
+                    early_graphs.append(early_sub)
             outputs.append(((m_min, cutoff), mature_graphs, early_graphs))
     return outputs
 
@@ -523,7 +521,7 @@ def generate_embeddings(model: torch.nn.Module,
                 graph_emb = z.mean(dim=0)  # Mean pooling
                 embeddings.append(graph_emb.cpu())
                 labels.append(data.y.cpu())
-            except Exception as e:
+            except Exception:
                 # 跳过有问题的图
                 failed_count += 1
                 continue
@@ -646,26 +644,26 @@ def run_experiment(experiment_type: str,
             logger.warning(f"Skip combo m={m_param}, e={e_param} due to too few graphs (<10)")
             continue
         logger.info(f"[{experiment_type}] combo m={m_param}, e={e_param} -> mature {len(mature_graphs)}, early {len(early_graphs)}")
-    mature_nodes = [g.num_nodes for g in mature_graphs]
-    early_nodes = [g.num_nodes for g in early_graphs]
+        mature_nodes = [g.num_nodes for g in mature_graphs]
+        early_nodes = [g.num_nodes for g in early_graphs]
         logger.info(f"Mature nodes mean/std: {np.mean(mature_nodes):.1f}/{np.std(mature_nodes):.1f}; Early nodes mean/std: {np.mean(early_nodes):.1f}/{np.std(early_nodes):.1f}")
-    mature_labels = [g.y.item() for g in mature_graphs]
-    early_labels = [g.y.item() for g in early_graphs]
-    logger.info(f"Mature label distribution: {dict(zip(*np.unique(mature_labels, return_counts=True)))}")
-    logger.info(f"Early label distribution: {dict(zip(*np.unique(early_labels, return_counts=True)))}")
-    model = train_gae(mature_graphs, config['gae'], logger)
+        mature_labels = [g.y.item() for g in mature_graphs]
+        early_labels = [g.y.item() for g in early_graphs]
+        logger.info(f"Mature label distribution: {dict(zip(*np.unique(mature_labels, return_counts=True)))}")
+        logger.info(f"Early label distribution: {dict(zip(*np.unique(early_labels, return_counts=True)))}")
+        model = train_gae(mature_graphs, config['gae'], logger)
         tag = f"{experiment_type}_m{m_param}_e{e_param}_seed{seed}"
         model_path = f"{config['experiment']['output_dir']}/gae_{tag}.pt"
-    torch.save(model.state_dict(), model_path)
-    mature_embs, mature_labels_tensor = generate_embeddings(model, mature_graphs, config['gae'], logger)
-    early_embs, early_labels_tensor = generate_embeddings(model, early_graphs, config['gae'], logger)
+        torch.save(model.state_dict(), model_path)
+        mature_embs, mature_labels_tensor = generate_embeddings(model, mature_graphs, config['gae'], logger)
+        early_embs, early_labels_tensor = generate_embeddings(model, early_graphs, config['gae'], logger)
         emb_path = f"{config['experiment']['output_dir']}/embeddings_{tag}.pt"
-    torch.save({
-        'mature_embeddings': mature_embs,
-        'mature_labels': mature_labels_tensor,
-        'early_embeddings': early_embs,
-        'early_labels': early_labels_tensor
-    }, emb_path)
+        torch.save({
+            'mature_embeddings': mature_embs,
+            'mature_labels': mature_labels_tensor,
+            'early_embeddings': early_embs,
+            'early_labels': early_labels_tensor
+        }, emb_path)
         mature_metrics = evaluate_embeddings(mature_embs, mature_labels_tensor, lin_cfg, seed)
         early_metrics = evaluate_embeddings(early_embs, early_labels_tensor, lin_cfg, seed)
         metrics_rows.append([
@@ -736,12 +734,12 @@ def main():
         config['experiment']['current_dataset'] = ds
         logger.info(f"\nLoading dataset: {ds}")
         all_graphs = load_dataset(ds, data_root)
-    logger.info(f"Loaded {len(all_graphs)} graphs")
+        logger.info(f"Loaded {len(all_graphs)} graphs")
         for seed in seeds:
             set_global_seed(int(seed))
-    if run_experiments in ['nodecount', 'both']:
+            if run_experiments in ['nodecount', 'both']:
                 run_experiment('nodecount', all_graphs, config, logger, seed, metrics_rows, lin_cfg)
-    if run_experiments in ['timecutoff', 'both']:
+            if run_experiments in ['timecutoff', 'both']:
                 run_experiment('timecutoff', all_graphs, config, logger, seed, metrics_rows, lin_cfg)
     append_rows_csv(metrics_path, metrics_headers, metrics_rows)
     logger.info("\nAll experiments completed successfully!")
@@ -749,4 +747,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

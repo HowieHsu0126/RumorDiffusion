@@ -1,5 +1,4 @@
-import math
-from typing import List, Tuple
+from typing import List
 
 import torch
 from torch import Tensor, nn
@@ -130,5 +129,4 @@ class TGN(nn.Module):
         src, dst = torch.where(mask)
         pairs = torch.stack([src, dst], dim=0)
         return pairs
-
 

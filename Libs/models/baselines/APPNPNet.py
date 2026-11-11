@@ -1,6 +1,5 @@
 from typing import List
 
-import torch
 from torch import nn
 from torch_geometric.nn import APPNP, global_mean_pool
 

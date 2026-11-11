@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import math
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -12,6 +13,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch, FancyBboxPatch, Rectangle
 import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from Libs.scripts.validate_canonical_results import validate_canonical_root  # noqa: E402
+from Libs.utils.artifact_schema import file_sha256, reject_placeholders, validate_metrics_artifact  # noqa: E402
 
 
 SELECTED_MODELS = [
@@ -121,13 +129,19 @@ def parse_float(value: str) -> float | None:
 
 
 def latest_rows_by_key(rows: Iterable[Dict[str, str]], key_fields: Sequence[str]) -> List[Dict[str, str]]:
-    latest: Dict[Tuple[str, ...], Dict[str, str]] = {}
+    """Returns unique rows and fails on conflicting duplicate keys.
+
+    Historical callers used timestamp-based latest-row selection. Canonical
+    evidence must not silently overwrite a conflicting result, so duplicates
+    are now an explicit validation error.
+    """
+    unique: Dict[Tuple[str, ...], Dict[str, str]] = {}
     for row in rows:
         key = tuple(row.get(field, "") for field in key_fields)
-        timestamp = row.get("timestamp", "")
-        if key not in latest or timestamp > latest[key].get("timestamp", ""):
-            latest[key] = row
-    return list(latest.values())
+        if key in unique:
+            raise ValueError(f"Duplicate result key {key!r}; timestamp conflict resolution is disabled")
+        unique[key] = row
+    return list(unique.values())
 
 
 def mean_confidence(values: Sequence[float]) -> Tuple[float, float]:
@@ -1611,16 +1625,16 @@ def build_method_overview_figure(figure_path: Path) -> None:
     add_round_box(ax, (0.055, 0.36), 0.20, 0.10, "Fixed text\nembedding", facecolor="white", fontsize=10)
     add_round_box(ax, (0.055, 0.23), 0.20, 0.10, "Temporal /\nstructural features", facecolor="white", fontsize=10)
 
-    encoder = add_round_box(ax, (0.355, 0.42), 0.095, 0.20, "Prefix\nencoder", facecolor="white", edgecolor=PALETTE["teal"], fontsize=10)
-    condition = add_round_box(ax, (0.482, 0.42), 0.100, 0.20, "Condition\nvector $c^{(k)}$", facecolor="white", edgecolor=PALETTE["teal"], fontsize=10)
+    _encoder = add_round_box(ax, (0.355, 0.42), 0.095, 0.20, "Prefix\nencoder", facecolor="white", edgecolor=PALETTE["teal"], fontsize=10)
+    _condition = add_round_box(ax, (0.482, 0.42), 0.100, 0.20, "Condition\nvector $c^{(k)}$", facecolor="white", edgecolor=PALETTE["teal"], fontsize=10)
     add_round_box(ax, (0.390, 0.69), 0.16, 0.10, "Gaussian noise\n$z_T \\sim \\mathcal{N}(0, I)$", facecolor="white", edgecolor=PALETTE["teal"], fontsize=9)
-    denoise = add_round_box(ax, (0.390, 0.22), 0.17, 0.11, "Reverse denoising\nchain", facecolor="white", edgecolor=PALETTE["teal"], fontsize=10)
+    _denoise = add_round_box(ax, (0.390, 0.22), 0.17, 0.11, "Reverse denoising\nchain", facecolor="white", edgecolor=PALETTE["teal"], fontsize=10)
     samples = add_round_box(ax, (0.592, 0.22), 0.032, 0.53, "$S$\nlatent\nsamples", facecolor="#D4EFEA", edgecolor=PALETTE["teal"], fontsize=8)
     del samples
     for y_value in [0.31, 0.43, 0.55, 0.67]:
         ax.add_patch(Rectangle((0.599, y_value), 0.017, 0.055, color=PALETTE["teal"], alpha=0.65))
 
-    dist = add_round_box(ax, (0.705, 0.53), 0.22, 0.20, "Aggregate class\nprobabilities", facecolor="white", edgecolor=PALETTE["gold"], fontsize=10)
+    _dist = add_round_box(ax, (0.705, 0.53), 0.22, 0.20, "Aggregate class\nprobabilities", facecolor="white", edgecolor=PALETTE["gold"], fontsize=10)
     ax.plot([0.735, 0.775, 0.815, 0.855, 0.895], [0.575, 0.66, 0.61, 0.69, 0.59], color=PALETTE["blue"], linewidth=2.0)
     ax.fill_between([0.735, 0.775, 0.815, 0.855, 0.895], [0.555, 0.62, 0.58, 0.63, 0.56], [0.595, 0.70, 0.64, 0.73, 0.62], color=PALETTE["blue"], alpha=0.13)
     add_round_box(ax, (0.705, 0.36), 0.22, 0.10, "Estimate uncertainty\nfrom sample variance", facecolor="white", edgecolor=PALETTE["gold"], fontsize=10)
@@ -1643,8 +1657,67 @@ def build_method_overview_figure(figure_path: Path) -> None:
     plt.close(fig)
 
 
+def _json_pointer(payload: Any, pointer: str) -> Any:
+    if not pointer.startswith("/"):
+        raise ValueError(f"table registry metric pointer must start with '/': {pointer}")
+    value = payload
+    for part in pointer.lstrip("/").split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(value, list):
+            value = value[int(part)]
+        elif isinstance(value, dict):
+            value = value[part]
+        else:
+            raise ValueError(f"table registry pointer cannot traverse {pointer}")
+    return value
+
+
+def validate_canonical_table_registry(canonical_root: Path, registry_path: Path) -> Dict[str, Any]:
+    """Validate registry cells against validated metric artifacts, without writing paper assets."""
+    validate_canonical_root(canonical_root)
+    payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema_version") != "1" or not isinstance(payload.get("cells"), dict):
+        raise ValueError("table_cell_registry.json must be schema version 1 with a cells object")
+    runs_root = canonical_root / "runs" if (canonical_root / "runs").is_dir() else canonical_root
+    approved_metrics: Dict[Path, str] = {}
+    for manifest_path in runs_root.glob("*/manifest.json"):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record = manifest["metrics"]
+        path = Path(str(record["path"]))
+        if not path.is_absolute():
+            path = manifest_path.parent / path
+        approved_metrics[path.resolve()] = str(record["sha256"])
+    verified: Dict[str, Any] = {}
+    for cell_key, cell in payload["cells"].items():
+        if not isinstance(cell, dict):
+            raise ValueError(f"table cell {cell_key} must be an object")
+        for field in ("artifact_path", "artifact_sha256", "metric_pointer", "value"):
+            if field not in cell:
+                raise ValueError(f"table cell {cell_key} is missing {field}")
+        artifact = Path(str(cell["artifact_path"]))
+        if not artifact.is_absolute():
+            artifact = registry_path.parent / artifact
+        artifact = artifact.resolve()
+        if artifact not in approved_metrics:
+            raise ValueError(f"table cell {cell_key} points outside validated canonical metrics: {artifact}")
+        observed_hash = file_sha256(artifact)
+        if observed_hash != approved_metrics[artifact] or observed_hash != str(cell["artifact_sha256"]):
+            raise ValueError(f"table cell {cell_key} metric artifact hash mismatch")
+        metrics = json.loads(artifact.read_text(encoding="utf-8"))
+        validate_metrics_artifact(metrics)
+        pointed_value = _json_pointer(metrics, str(cell["metric_pointer"]))
+        reject_placeholders(pointed_value, f"table cell {cell_key}")
+        if pointed_value != cell["value"]:
+            raise ValueError(f"table cell {cell_key} value differs from metric artifact")
+        verified[cell_key] = {"artifact": str(artifact), "metric_pointer": cell["metric_pointer"], "value": pointed_value}
+    return {"schema_version": "1", "canonical_root": str(canonical_root), "registry_sha256": file_sha256(registry_path), "verified_cells": verified}
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate paper-ready tables and figures from canonical RD results.")
+    parser = argparse.ArgumentParser(description="Validate canonical table evidence. This command never writes manuscript assets.")
+    parser.add_argument("--canonical-root", type=Path, help="Output/canonical/<protocol_id> root")
+    parser.add_argument("--canonical-registry", type=Path, help="Validated table_cell_registry.json")
+    parser.add_argument("--validation-report", type=Path, help="Optional machine-readable validation report outside Docs/paper")
     parser.add_argument("--exp", default="Libs/configs/exp_paper_ready.yaml", help="Formal experiment config that declares the seed list")
     parser.add_argument("--sampling-model-config", default=MODEL_CONFIGS["rumordiffusion"], help="RumorDiffusion config that declares the sampling-budget sweep")
     parser.add_argument("--results-dir", default="Output/results/paper_aligned", help="Canonical result directory")
@@ -1654,6 +1727,19 @@ def main() -> None:
     parser.add_argument("--rebuttal-tradeoff-copy", default="Docs/rebuttal/responses/round1/Figs/deployment_tradeoff.pdf", help="Reader-facing response copy of the deployment trade-off figure")
     parser.add_argument("--transfer-table-only", action="store_true", help="Only regenerate the source-only transfer table")
     args = parser.parse_args()
+
+    if args.canonical_root is not None or args.canonical_registry is not None:
+        if args.canonical_root is None or args.canonical_registry is None:
+            parser.error("--canonical-root and --canonical-registry must be supplied together")
+        report = validate_canonical_table_registry(args.canonical_root, args.canonical_registry)
+        if args.validation_report:
+            if "Docs/paper" in args.validation_report.as_posix():
+                parser.error("canonical validation reports must not be written under Docs/paper")
+            write_text(args.validation_report, json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+        print(f"canonical table evidence passed: {args.canonical_registry}")
+        return
+
+    parser.error("legacy CSV/paper-figure generation is disabled; use --canonical-root and --canonical-registry")
 
     results_dir = Path(args.results_dir)
     tables_dir = Path(args.tables_dir)

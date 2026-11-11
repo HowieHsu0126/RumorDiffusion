@@ -1,4 +1,5 @@
 import math
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import torch
@@ -402,7 +403,6 @@ class GatedTextFusion(nn.Module):
         """
         _assert_shape(h_graph, (-1, -1))
         _assert_shape(h_text, (-1, -1))
-        B = int(h_graph.size(0))
         assert int(h_graph.size(1)) == self.hidden_channels
         assert int(h_text.size(1)) == self.text_dim
 
@@ -458,6 +458,35 @@ class AttentionReadout(nn.Module):
             out[keep] = (attn_all[keep].unsqueeze(-1) * H[keep]).sum(dim=1)
         # For all_empty samples, out rows remain zeros
         return out
+
+
+class PotentialResidualAdapter(nn.Module):
+    """Zero-initialized residual adapter applied after CTDM potential readout.
+
+    Keeping this adapter outside the reverse denoising loop allows candidate
+    fine-tuning to improve downstream potentials without destabilizing the
+    diffusion trajectory or changing its cached-state semantics.
+    """
+
+    def __init__(self, hidden_channels: int, bottleneck_dim: int) -> None:
+        super().__init__()
+        if hidden_channels <= 0 or bottleneck_dim <= 0:
+            raise ValueError("Potential adapter dimensions must be positive.")
+        self.norm = nn.LayerNorm(int(hidden_channels))
+        self.down = nn.Linear(int(hidden_channels), int(bottleneck_dim))
+        self.up = nn.Linear(int(bottleneck_dim), int(hidden_channels))
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, h: Tensor) -> Tensor:
+        _assert_shape(h, (-1, -1))
+        if int(h.size(-1)) != int(self.norm.normalized_shape[0]):
+            raise ValueError(
+                "Potential adapter hidden dimension mismatch: "
+                f"got {int(h.size(-1))}, expected {int(self.norm.normalized_shape[0])}."
+            )
+        residual = self.up(F.gelu(self.down(self.norm(h))))
+        return h + residual
 
 
 class CTDMSyn(nn.Module):
@@ -570,8 +599,12 @@ class CTDMSyn(nn.Module):
         self.forecast_head: nn.Module = nn.Identity()
         # Structure dropout for robustness
         self.edge_drop_rate = 0.0
+        # The default identity preserves pretrained CTDM behavior. Candidate
+        # configurations can replace it before checkpoint loading/pretraining.
+        self.potential_adapter: nn.Module = nn.Identity()
         self.register_buffer("prototypes", torch.zeros((self.num_classes, self.hidden_channels), dtype=torch.float32), persistent=True)
         self._eps = 1e-8
+        self._objective_eval_target_access_depth = 0
         # Additional regularizers for class-pair separation
         self.lambda_proto_orth = 0.0
         self.lambda_supcon_pair = 0.0
@@ -639,6 +672,26 @@ class CTDMSyn(nn.Module):
         self._last_xobs: Optional[Tensor] = None
         # Saved adjacency scores from last call to _pred_theta
         self._last_scores: Optional[Tensor] = None
+
+    def configure_potential_adapter(self, enabled: bool, bottleneck_dim: Optional[int] = None) -> None:
+        """Configures the post-readout residual adapter before checkpoint I/O.
+
+        The adapter is intentionally constructed after ``_reset_parameters``
+        so its output projection remains exactly zero at initialization.
+        """
+        if not bool(enabled):
+            self.potential_adapter = nn.Identity()
+            return
+        width = int(bottleneck_dim if bottleneck_dim is not None else max(1, self.hidden_channels // 4))
+        self.potential_adapter = PotentialResidualAdapter(
+            hidden_channels=self.hidden_channels,
+            bottleneck_dim=width,
+        )
+
+    def _adapt_potential(self, h: Tensor) -> Tensor:
+        """Applies the optional residual adapter outside reverse denoising."""
+        _assert_shape(h, (-1, -1))
+        return self.potential_adapter(h)
 
     def update_prototypes(self, h_graph: Tensor, labels: Tensor) -> None:
         """Updates class prototypes using EMA with per-batch class means.
@@ -837,12 +890,43 @@ class CTDMSyn(nn.Module):
         betas = torch.clamp(betas, 1e-5, 0.999)
         return betas
 
+    @contextmanager
+    def objective_eval_target_access(self):
+        """Allows CTDM validation-objective code to read held-out mature targets.
+
+        This is intentionally narrower than `eval()`: public prefix inference
+        must never receive or consume `full_*` mature-state fields, while stage
+        one CTDM objective validation needs the full graph as the prediction
+        target for validation-only model selection.
+        """
+        self._objective_eval_target_access_depth += 1
+        try:
+            yield
+        finally:
+            self._objective_eval_target_access_depth = max(
+                0,
+                self._objective_eval_target_access_depth - 1,
+            )
+
+    def _mature_state_target_access_allowed(self) -> bool:
+        return bool(self.training) or int(self._objective_eval_target_access_depth) > 0
+
     def _tensorize_full(self, data) -> Tuple[Tensor, Tensor]:
         """Builds padded [A, X] tensors for the full graph.
 
         Returns:
             (A_full [N,N], X_full [N,D])
         """
+        if not self._mature_state_target_access_allowed() and any(
+            hasattr(data, field)
+            for field in (
+                "full_x", "full_edge_index", "full_node_time_minutes", "full_node_time_minutes_shifted",
+                "full_node_time_hops", "full_node_time_hops_shifted",
+            )
+        ):
+            raise RuntimeError(
+                "CTDM eval received mature-state attributes; use an eval_prefix batch without full_* fields."
+            )
         full_edge_index = data.full_edge_index.to(torch.long) if hasattr(data, "full_edge_index") else data.edge_index.to(torch.long)
         full_x = data.full_x.to(torch.float32) if hasattr(data, "full_x") else data.x.to(torch.float32)
         n = int(full_x.size(0))
@@ -863,7 +947,13 @@ class CTDMSyn(nn.Module):
         Returns:
             A_obs [N,N], X_obs [N,D], M_A [N,N], M_X [N,D]
         """
-        times = data.node_time_minutes_shifted.to(torch.long)
+        time_unit = str(getattr(data, "time_unit", "minutes")).lower()
+        if time_unit == "hop":
+            if not hasattr(data, "node_time_hops_shifted"):
+                raise RuntimeError("CTDM hop input lacks node_time_hops_shifted")
+            times = data.node_time_hops_shifted.to(torch.long)
+        else:
+            times = data.node_time_minutes_shifted.to(torch.long)
         obs_m = int(self.obs_minutes if obs_minutes_override is None else obs_minutes_override)
         if hasattr(data, "prefix_node_mask"):
             mask = data.prefix_node_mask.to(torch.bool)
@@ -1221,6 +1311,7 @@ class CTDMSyn(nn.Module):
         class_id: int,
         stride: Optional[int] = None,
         readout_source: str = "observed_prefix",
+        apply_potential_adapter: bool = True,
     ) -> Tensor:
         """Runs a reverse denoising trajectory under a class hypothesis and
         returns graph-level potential embeddings from the final hidden states.
@@ -1261,7 +1352,7 @@ class CTDMSyn(nn.Module):
         assert X_obs_last is not None
         h = self._potential_readout(H, Gt, G0, X_obs_last, readout_source)
         h = self._fuse_text_embedding(h, batch)
-        return h
+        return self._adapt_potential(h) if apply_potential_adapter else h
 
     @torch.no_grad()
     def infer_potentials_all(
@@ -1269,6 +1360,7 @@ class CTDMSyn(nn.Module):
         batch,
         stride: Optional[int] = None,
         readout_source: str = "observed_prefix",
+        apply_potential_adapter: bool = True,
     ) -> Tensor:
         """Computes potential embeddings for all classes.
 
@@ -1288,12 +1380,35 @@ class CTDMSyn(nn.Module):
                 class_id=int(cls),
                 stride=stride,
                 readout_source=readout_source,
+                apply_potential_adapter=apply_potential_adapter,
             )
             outs.append(h)
         Hc = torch.stack(outs, dim=1)
         if B is not None:
             assert int(Hc.size(0)) == B
         return Hc
+
+    def potentials_all_adapter_grad(self, batch, stride: Optional[int] = None) -> Tensor:
+        """Returns adapter-differentiable potentials without trajectory gradients.
+
+        Reverse diffusion remains under ``no_grad`` so a post-readout adapter
+        cannot make the iterative trajectory part of an AMP backward graph.
+        Only the residual adapter receives gradients from the returned tensor.
+        """
+        with torch.no_grad():
+            base_potentials = self.infer_potentials_all(
+                batch,
+                stride=stride,
+                readout_source="observed_prefix",
+                apply_potential_adapter=False,
+            )
+        batch_size, num_classes, hidden = base_potentials.shape
+        if int(hidden) != self.hidden_channels:
+            raise ValueError(
+                f"Unexpected potential width {int(hidden)}; expected {self.hidden_channels}."
+            )
+        adapted = self._adapt_potential(base_potentials.reshape(batch_size * num_classes, hidden))
+        return adapted.reshape(batch_size, num_classes, hidden)
 
     @torch.no_grad()
     def sample_potentials_all(
@@ -1338,7 +1453,7 @@ class CTDMSyn(nn.Module):
             X_obs_last = self._last_xobs
             h = self._graph_readout(H, X_obs_last)
             h = self._fuse_text_embedding(h, batch)
-            outs.append(h)
+            outs.append(self._adapt_potential(h))
         Hc = torch.stack(outs, dim=1)  # [B, C, H]
         return Hc
 
@@ -1426,7 +1541,8 @@ class CTDMSyn(nn.Module):
 
     def validation_step(self, batch) -> Tensor:
         """Returns the stage-one validation objective without mutating prototypes."""
-        return self._objective_loss(batch, update_prototypes=False)
+        with self.objective_eval_target_access():
+            return self._objective_loss(batch, update_prototypes=False)
 
     def _posterior_mean_variance(self, Gt: Tensor, t: Tensor, eps_pred: Tensor) -> Tuple[Tensor, Tensor]:
         beta_t = self.betas[(t - 1).to(torch.long)].view(-1, 1)

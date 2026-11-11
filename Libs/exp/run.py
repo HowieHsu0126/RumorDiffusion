@@ -22,14 +22,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
+from torch import Tensor
 from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader
 
 from Libs.data.processor import (build_text_embedding_cache,
                                  build_text_embedding_cache_from_mapping,
-                                 collect_json_source_texts, parse_source_texts,
+                                 collect_json_source_texts,
                                  resolve_text_model_path)
 from Libs.data.dataset import GraphDataset
+from Libs.data.potential_cache import build_potential_cache_metadata, potential_cache_dir
+from Libs.exp.canonical_artifacts import canonical_run_id, prediction_rows_from_logits, write_canonical_run
 from Libs.exp.trainer import (CGVAEConfig, CGVAETrainer, LinkPredConfig,
                               LinkPredTrainer, Trainer, TrainerConfig,
                               build_checkpoint_payload,
@@ -56,6 +59,11 @@ from Libs.models.baselines.TGN import TGN
 from Libs.models.modules.rumor_diffusion import _extract_source_ids_from_batch, generate_potentials
 from Libs.utils.metrics import compute_accuracy, compute_ece, compute_macro_f1, metrics_from_logits
 from Libs.utils.seed import set_global_seed
+from Libs.utils.artifact_schema import (
+    canonical_json_hash as artifact_canonical_json_hash,
+    file_sha256,
+    omit_optional_none_fields,
+)
 
 # 屏蔽警告
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -64,8 +72,31 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
 def read_yaml_like(path: str) -> Dict[str, Any]:
+    def expand_env(value: Any) -> Any:
+        if isinstance(value, str):
+            expanded = os.path.expandvars(value)
+            if "${" in expanded:
+                raise ValueError(f"Unresolved environment variable in config {path}: {value}")
+            return expanded
+        if isinstance(value, list):
+            return [expand_env(item) for item in value]
+        if isinstance(value, dict):
+            return {key: expand_env(item) for key, item in value.items()}
+        return value
+
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        payload = expand_env(yaml.safe_load(f))
+    if not isinstance(payload, dict):
+        raise TypeError(f"YAML config must be a mapping: {path}")
+    base_config = payload.pop("base_config", None)
+    if base_config is None:
+        return payload
+    if not isinstance(base_config, str) or len(base_config.strip()) == 0:
+        raise TypeError(f"base_config must be a non-empty relative path in {path}")
+    base_path = os.path.normpath(os.path.join(os.path.dirname(path), base_config))
+    if not os.path.isfile(base_path):
+        raise FileNotFoundError(f"base_config does not exist: {base_path}")
+    return _deep_merge(read_yaml_like(base_path), payload)
 
 
 def sha256_text(text: str) -> str:
@@ -108,6 +139,7 @@ def build_checkpoint_metadata(
     config_payload: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Builds a strict metadata contract for serialized checkpoints."""
+    resolved_config_payload = omit_optional_none_fields(config_payload)
     return {
         "format_version": 1,
         "model_name": str(model_name),
@@ -116,8 +148,8 @@ def build_checkpoint_metadata(
         "seed": int(seed),
         "split_signature": compute_split_signature(dataset_root),
         "label_mapping": {str(key): int(value) for key, value in label_mapping.items()},
-        "config_hash": canonical_json_hash(config_payload),
-        "config_payload": copy.deepcopy(config_payload),
+        "config_hash": canonical_json_hash(resolved_config_payload),
+        "config_payload": copy.deepcopy(resolved_config_payload),
     }
 
 
@@ -485,6 +517,33 @@ def parse_transfer_pair_overrides(raw_pairs: str) -> Optional[List[Dict[str, str
     return parsed_pairs
 
 
+def _validate_checkpoint_variant_name(model_variant: str) -> str:
+    variant = str(model_variant).strip()
+    if (
+        not variant
+        or variant in {".", ".."}
+        or variant != str(model_variant)
+        or "/" in variant
+        or "\\" in variant
+    ):
+        raise ValueError(f"Invalid checkpoint variant name: {model_variant!r}")
+    return variant
+
+
+def resolve_model_checkpoint_subdir(model_name: str, model_variant: str) -> str:
+    """Keeps canonical paths stable while isolating RumorDiffusion variants."""
+    normalized_name = str(model_name).strip()
+    if not (
+        normalized_name == "rumordiffusion"
+        or normalized_name.startswith("rumordiffusion_")
+    ):
+        return normalized_name
+    variant = _validate_checkpoint_variant_name(model_variant)
+    if variant == "canonical":
+        return normalized_name
+    return os.path.join(normalized_name, variant)
+
+
 def sanitize_cache_token(text: str) -> str:
     """Returns a filesystem-safe token for derived cache names."""
     safe = "".join(ch if ch.isalnum() else "_" for ch in str(text).strip())
@@ -499,6 +558,17 @@ def resolve_dataset_text_runtime_cfg(exp_cfg: Dict[str, Any]) -> Dict[str, Any]:
     dataset_cfg = exp_cfg.get("dataset", {}) if isinstance(exp_cfg.get("dataset", {}), dict) else {}
     text_encoder_cfg = dataset_cfg.get("text_encoder", {}) if isinstance(dataset_cfg.get("text_encoder", {}), dict) else {}
     normalization_cfg = dataset_cfg.get("text_normalization", {}) if isinstance(dataset_cfg.get("text_normalization", {}), dict) else {}
+    raw_root = str(
+        text_encoder_cfg.get("raw_root")
+        or dataset_cfg.get("raw_root")
+        or ""
+    ).strip()
+    processed_root = str(
+        text_encoder_cfg.get("processed_root")
+        or dataset_cfg.get("root")
+        or dataset_cfg.get("processed_root")
+        or ""
+    ).strip()
     model_name_or_path = str(text_encoder_cfg.get("model_name_or_path", "")).strip()
     enabled = len(model_name_or_path) > 0
     cache_tag = str(text_encoder_cfg.get("cache_tag", "")).strip()
@@ -516,13 +586,15 @@ def resolve_dataset_text_runtime_cfg(exp_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "normalize_embeddings": bool(text_encoder_cfg.get("normalize_embeddings", False)),
         "rebuild_cache": bool(text_encoder_cfg.get("rebuild_cache", False)),
         "normalization": normalization_cfg,
+        "raw_root": raw_root,
+        "processed_root": processed_root,
     }
 
 
 def resolve_local_text_model_path(text_runtime_cfg: Dict[str, Any]) -> str:
     """Resolves a configured local text model path and rejects missing local models."""
     dataset_cfg = read_yaml_like(os.path.join("Libs", "configs", "dataset.yaml")).get("dataset", {})
-    raw_root = str(dataset_cfg.get("raw_root", os.path.join("Input", "raw")))
+    raw_root = str(text_runtime_cfg.get("raw_root") or dataset_cfg.get("raw_root", os.path.join("Input", "raw")))
     model_name_or_path = str(text_runtime_cfg.get("model_name_or_path", "")).strip()
     model_path = resolve_text_model_path(model_name_or_path, raw_root)
     if len(model_name_or_path) == 0:
@@ -541,8 +613,8 @@ def ensure_text_embedding_cache(dataset_name: str, text_runtime_cfg: Dict[str, A
     if not bool(text_runtime_cfg.get("enabled", False)):
         return
     dataset_cfg = read_yaml_like(os.path.join("Libs", "configs", "dataset.yaml")).get("dataset", {})
-    raw_root = str(dataset_cfg.get("raw_root", os.path.join("Input", "raw")))
-    processed_root = str(dataset_cfg.get("processed_root", os.path.join("Input", "processed")))
+    raw_root = str(text_runtime_cfg.get("raw_root") or dataset_cfg.get("raw_root", os.path.join("Input", "raw")))
+    processed_root = str(text_runtime_cfg.get("processed_root") or dataset_cfg.get("processed_root", os.path.join("Input", "processed")))
     cache_name = str(text_runtime_cfg.get("cache_name", "text_embs.pt"))
     cache_path = os.path.join(processed_root, dataset_name, cache_name)
     if os.path.isfile(cache_path) and not bool(text_runtime_cfg.get("rebuild_cache", False)):
@@ -582,8 +654,25 @@ def make_graph_dataset(
     use_potentials: bool = False,
     potentials_dir: Optional[str] = None,
     potentials_pair: Optional[List[int]] = None,
+    potential_cache_metadata: Optional[Dict[str, Any]] = None,
+    prefix_consistency_views: Optional[List[Dict[str, Any]]] = None,
+    prefix_consistency_potential_specs: Optional[List[Dict[str, Any]]] = None,
+    mode: str = "legacy",
+    require_lp_edges: bool = False,
+    label_schema: Optional[Dict[str, int]] = None,
 ) -> GraphDataset:
     """Builds a GraphDataset with consistent runtime text-cache overrides."""
+    # Canonical protocol settings are carried through the resolved prefix
+    # contract so every runner call site receives the same data mode and LP
+    # policy without silently changing historical legacy runs.
+    if mode == "legacy" and isinstance(prefix_cfg, dict) and prefix_cfg.get("_runtime_mode"):
+        requested_mode = str(prefix_cfg["_runtime_mode"])
+        split_modes = prefix_cfg.get("_runtime_modes", {}) if isinstance(prefix_cfg.get("_runtime_modes", {}), dict) else {}
+        mode = str(split_modes.get(split, requested_mode))
+        if requested_mode == "eval_prefix" and split == "train" and split not in split_modes:
+            mode = "train_arbiter"
+    if not require_lp_edges and isinstance(prefix_cfg, dict):
+        require_lp_edges = bool(prefix_cfg.get("_require_lp_edges", False))
     text_cfg = text_runtime_cfg if isinstance(text_runtime_cfg, dict) else {}
     return GraphDataset(
         root=root,
@@ -592,11 +681,17 @@ def make_graph_dataset(
         use_potentials=use_potentials,
         potentials_dir=potentials_dir,
         potentials_pair=potentials_pair,
+        potential_cache_metadata=potential_cache_metadata,
         prefix_cfg=prefix_cfg,
+        prefix_consistency_views=prefix_consistency_views,
+        prefix_consistency_potential_specs=prefix_consistency_potential_specs,
         observability_cfg=observability_cfg,
         text_cache_name=str(text_cfg.get("cache_name", "text_embs.pt")),
         force_text_cache=bool(text_cfg.get("force_text_cache", False)),
         text_normalize=bool(text_cfg.get("normalize_embeddings", False)),
+        mode=str(mode),
+        require_lp_edges=bool(require_lp_edges),
+        label_schema=label_schema,
     )
 
 
@@ -671,6 +766,71 @@ def build_observation_prefix_cfg(
     return resolved
 
 
+def resolve_prefix_consistency_views(
+    consistency_cfg: Dict[str, Any],
+    dataset_name: str,
+    base_prefix_cfg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Resolves auxiliary observed-prefix views for multi-view RD training."""
+    if not isinstance(consistency_cfg, dict) or not bool(consistency_cfg.get("enabled", False)):
+        return []
+    windows = consistency_cfg.get("windows", [])
+    unit = str(consistency_cfg.get("unit", base_prefix_cfg.get("strategy", "minutes"))).lower()
+    window_overrides = consistency_cfg.get("windows_overrides", {})
+    unit_overrides = consistency_cfg.get("unit_overrides", {})
+    if isinstance(window_overrides, dict) and dataset_name in window_overrides:
+        windows = window_overrides[dataset_name]
+    if isinstance(unit_overrides, dict) and dataset_name in unit_overrides:
+        unit = str(unit_overrides[dataset_name]).lower()
+    if not isinstance(windows, (list, tuple)) or len(windows) == 0:
+        raise ValueError("Enabled prefix consistency requires at least one configured observation window.")
+
+    main_unit = str(base_prefix_cfg.get("strategy", base_prefix_cfg.get("unit", "none"))).lower()
+    main_window = base_prefix_cfg.get("window", base_prefix_cfg.get("minutes", None))
+    views: List[Dict[str, Any]] = []
+    seen = set()
+    for window in windows:
+        resolved_window = int(window)
+        key = (unit, resolved_window)
+        if key in seen:
+            continue
+        seen.add(key)
+        # The main loader already supplies this supervised view.
+        if unit == main_unit and main_window not in (None, "") and resolved_window == int(main_window):
+            continue
+        views.append(build_observation_prefix_cfg(base_prefix_cfg, resolved_window, unit))
+    if len(views) == 0:
+        raise ValueError("Prefix consistency requires at least one auxiliary view distinct from the main prefix.")
+    return views
+
+
+def build_prefix_consistency_potential_specs(
+    views: Sequence[Dict[str, Any]],
+    potentials_root: str,
+    dataset_name: str,
+    seed: int,
+    ctdm_config_payload: Dict[str, Any],
+    potentials_pair: Sequence[int],
+) -> List[Dict[str, Any]]:
+    """Binds every auxiliary prefix view to its own validated cache namespace."""
+    specs: List[Dict[str, Any]] = []
+    for view_cfg in views:
+        resolved_view = dict(view_cfg)
+        specs.append(
+            {
+                "potentials_dir": potential_cache_dir(potentials_root, resolved_view),
+                "potentials_pair": [int(index) for index in potentials_pair],
+                "potential_cache_metadata": build_potential_cache_metadata(
+                    dataset_name=dataset_name,
+                    seed=int(seed),
+                    prefix_cfg=resolved_view,
+                    ctdm_config_payload=ctdm_config_payload,
+                ),
+            }
+        )
+    return specs
+
+
 def aggregate_numeric(values: List[float]) -> tuple[float, float]:
     """Returns (mean, std) for numeric list; std=0 if len<2."""
     if len(values) == 0:
@@ -741,17 +901,21 @@ def rewrite_csv_rows(csv_path: str, headers: List[str], rows: List[Dict[str, str
 
 
 def dedupe_csv_rows(rows: List[Dict[str, str]], key_fields: Sequence[str]) -> List[Dict[str, str]]:
-    """Keeps the latest row per composite key while preserving row order."""
+    """Validate legacy rows have unique composite keys.
+
+    Historical code selected the last timestamped row.  Legacy CSV remains
+    exploratory only, and a conflicting row must be repaired explicitly rather
+    than silently selected.
+    """
     seen = set()
-    deduped_reversed: List[Dict[str, str]] = []
-    for row in reversed(rows):
+    unique: List[Dict[str, str]] = []
+    for index, row in enumerate(rows):
         key = tuple(str(row.get(field, "")) for field in key_fields)
         if key in seen:
-            continue
+            raise ValueError(f"Duplicate legacy result key at row {index}: {key!r}; latest-row resolution is disabled")
         seen.add(key)
-        deduped_reversed.append(row)
-    deduped_reversed.reverse()
-    return deduped_reversed
+        unique.append(row)
+    return unique
 
 
 def refresh_result_aggregate_row(
@@ -1322,10 +1486,18 @@ def collect_eval_outputs(
             should_profile = bool(profile) and (
                 int(profile_max_batches) <= 0 or profiled_batches < int(profile_max_batches)
             )
-            if should_profile and batch_idx < int(profile_warmup_batches):
-                should_profile = False
             if should_profile:
                 repeat_count = max(1, int(profile_repeat))
+                if batch_idx < int(profile_warmup_batches):
+                    profile_cuda_boundary(device)
+                    if use_amp:
+                        with torch.cuda.amp.autocast():
+                            _ = model(batch)
+                    else:
+                        _ = model(batch)
+                    profile_cuda_boundary(device)
+                batch_size = max(1, int(batch.y.view(-1).size(0)))
+                repeated_latency_ms: List[float] = []
                 for _ in range(repeat_count):
                     profile_cuda_boundary(device)
                     start = time.perf_counter()
@@ -1336,9 +1508,10 @@ def collect_eval_outputs(
                         logits_profile = model(batch)
                     profile_cuda_boundary(device)
                     elapsed_ms = (time.perf_counter() - start) * 1000.0
-                    batch_size = max(1, int(batch.y.view(-1).size(0)))
-                    per_sample_latency_ms.append(elapsed_ms / float(batch_size))
+                    repeated_latency_ms.append(elapsed_ms / float(batch_size))
                     logits = logits_profile
+                batch_latency_ms = sum(repeated_latency_ms) / max(1, len(repeated_latency_ms))
+                per_sample_latency_ms.extend([batch_latency_ms] * batch_size)
                 profiled_batches += 1
             else:
                 if use_amp:
@@ -2236,9 +2409,13 @@ def setup_logging(log_dir: str, dataset: str, model_name: str, seed: int | None 
     os.makedirs(log_dir, exist_ok=True)
     job_name = os.environ.get("SLURM_JOB_NAME", "").strip()
     job_id = os.environ.get("SLURM_JOB_ID", "").strip()
-    log_path = ""
     if job_name and job_id:
-        log_path = os.path.join(log_dir, f"{job_name}_{job_id}.log")
+        log_filename = f"{job_name}_{job_id}.log"
+    else:
+        stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        seed_suffix = f"seed{int(seed)}" if seed is not None else "seedna"
+        log_filename = f"{dataset}_{model_name}_{seed_suffix}_{stamp}.log"
+    log_path = os.path.join(log_dir, log_filename)
     logger = logging.getLogger()
     for h in list(logger.handlers):
         if hasattr(h, "flush"):
@@ -2251,11 +2428,47 @@ def setup_logging(log_dir: str, dataset: str, model_name: str, seed: int | None 
     ch = logging.StreamHandler(stream=sys.stdout)
     ch.setFormatter(fmt)
     logger.addHandler(ch)
-    if log_path and not (job_name and job_id):
-        fh = logging.FileHandler(log_path, encoding="utf-8")
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
     return log_path
+
+
+def resolve_canonical_output_cfg(exp_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    outputs_cfg = exp_cfg.get("outputs", {}) if isinstance(exp_cfg, dict) else {}
+    canonical_cfg = outputs_cfg.get("canonical", {}) if isinstance(outputs_cfg, dict) else {}
+    if not isinstance(canonical_cfg, dict) or not bool(canonical_cfg.get("enabled", False)):
+        return {}
+    return canonical_cfg
+
+
+def resolve_canonical_stage_seeds(exp_cfg: Dict[str, Any], fallback_seed: int) -> Dict[str, int]:
+    experiment_cfg = exp_cfg.get("experiment", {}) if isinstance(exp_cfg, dict) else {}
+    seeds_cfg = experiment_cfg.get("seeds", []) if isinstance(experiment_cfg, dict) else []
+    split_seed = ctdm_seed = arbiter_seed = inference_seed = int(fallback_seed)
+    if isinstance(seeds_cfg, (list, tuple)) and len(seeds_cfg) >= 5:
+        bootstrap_seed = int(seeds_cfg[4])
+    else:
+        bootstrap_seed = int(fallback_seed)
+    missingness_seed = int(bootstrap_seed)
+    return {
+        "split": split_seed,
+        "ctdm": ctdm_seed,
+        "arbiter": arbiter_seed,
+        "inference": inference_seed,
+        "bootstrap": bootstrap_seed,
+        "missingness": missingness_seed,
+    }
+
+
+def resolve_canonical_horizon(prefix_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    unit = str(prefix_cfg.get("unit", prefix_cfg.get("strategy", "minutes"))).lower()
+    value = prefix_cfg.get("window", prefix_cfg.get("minutes", prefix_cfg.get("k", prefix_cfg.get("horizon_value", 0))))
+    if unit not in {"minutes", "hop", "count"}:
+        raise ValueError(f"Unsupported canonical horizon unit: {unit}")
+    if float(value) <= 0:
+        raise ValueError("Canonical horizon value must be positive")
+    return {"unit": unit, "value": float(value)}
 
 
 def main() -> None:
@@ -2324,10 +2537,17 @@ def main() -> None:
     use_lp_edges = bool(dataset_cfg.get("use_lp_edges", False))
     lp_edges_policy = str(args.lp_edges_policy)
     prefix_cfg = resolve_dataset_prefix_cfg(dataset_cfg.get("prefix", {}), dataset_name)
+    prefix_cfg["_runtime_mode"] = str(dataset_cfg.get("mode", "legacy"))
+    prefix_cfg["_runtime_modes"] = dict(dataset_cfg.get("modes", {})) if isinstance(dataset_cfg.get("modes", {}), dict) else {}
+    prefix_cfg["_require_lp_edges"] = bool(
+        dataset_cfg.get("require_lp_edges", False)
+        or (prefix_cfg["_runtime_mode"] != "legacy" and use_lp_edges)
+    )
     observability_cfg = dataset_cfg.get("observability", {})
     observability_sweep_cfg = dataset_cfg.get("observability_sweep", {})
     lp_cfg_dict = exp_cfg.get("link_prediction", {})
     outputs_cfg = exp_cfg.get("outputs", {})
+    canonical_outputs_cfg = resolve_canonical_output_cfg(exp_cfg)
     base_ckpt_dir = outputs_cfg.get(
         "ckpt_dir", os.path.join("Output", "ckpts"))
     base_log_dir = outputs_cfg.get("log_dir", os.path.join("Output", "logs"))
@@ -2469,6 +2689,7 @@ def main() -> None:
 
             log_path = setup_logging(
                 log_dir=base_log_dir, dataset=dataset_name, model_name=name, seed=int(seed))
+            run_started_at = datetime.now().astimezone().isoformat()
             logging.info(
                 f"Dataset: {dataset_name}; Source dataset: {source_dataset_name}; Model: {name}; LP: {use_lp}; Seed: {seed}")
 
@@ -2594,7 +2815,14 @@ def main() -> None:
             class_weights = None
             model_use_potentials = False
             model_potentials_dir: Optional[str] = None
+            model_potentials_root: Optional[str] = None
             model_potentials_pair: List[int] = []
+            model_potential_cache_metadata: Optional[Dict[str, Any]] = None
+            model_potential_cache_ctdm_payload: Optional[Dict[str, Any]] = None
+            rd_prefix_consistency_cfg: Dict[str, Any] = {}
+            rd_prefix_consistency_views: List[Dict[str, Any]] = []
+            rd_prefix_consistency_potential_specs: List[Dict[str, Any]] = []
+            rd_source_robustness_cfg: Dict[str, Any] = {}
             rd_ignored_metadata_keys: Optional[List[str]] = None
             if is_rumordiffusion:
                 # Stage 1: train CTDM if needed; then generate potentials
@@ -2627,18 +2855,43 @@ def main() -> None:
                     dataset_name=dataset_name,
                 )
                 potentials_dir_cfg = str(rd_cfg.get("potentials_dir", "rd_potentials"))
-                potentials_dir = potentials_dir_cfg if os.path.isabs(potentials_dir_cfg) else os.path.join(dataset_root, potentials_dir_cfg)
+                potentials_root = potentials_dir_cfg if os.path.isabs(potentials_dir_cfg) else os.path.join(dataset_root, potentials_dir_cfg)
                 if bool(rd_cfg.get("seed_scoped_potentials", False)):
-                    potentials_dir = os.path.join(potentials_dir, f"seed{int(seed)}")
+                    potentials_root = os.path.join(potentials_root, f"seed{int(seed)}")
                 cache_potentials_after_ctdm = bool(rd_cfg.get("cache_potentials_after_ctdm", False))
                 if cache_potentials_after_ctdm:
                     use_potentials = True
                 if args.sampling_budget_only:
                     use_potentials = False
-                model_use_potentials = use_potentials
-                model_potentials_dir = potentials_dir
                 model_potentials_pair = list(potentials_pair)
-                max_nodes_scan = scan_max_nodes_across_splits([ds_train, ds_val, ds_test])
+                rd_prefix_consistency_cfg = active_training_cfg.get("prefix_consistency", {})
+                rd_prefix_consistency_cfg = rd_prefix_consistency_cfg if isinstance(rd_prefix_consistency_cfg, dict) else {}
+                rd_source_robustness_cfg = active_training_cfg.get("source_robustness", {})
+                rd_source_robustness_cfg = rd_source_robustness_cfg if isinstance(rd_source_robustness_cfg, dict) else {}
+                rd_prefix_consistency_views = resolve_prefix_consistency_views(
+                    rd_prefix_consistency_cfg,
+                    dataset_name,
+                    prefix_cfg,
+                )
+                ctdm_scan_train_ds = make_graph_dataset(
+                    root=dataset_root,
+                    split="train",
+                    use_lp_edges=use_lp,
+                    prefix_cfg=prefix_cfg,
+                    observability_cfg=observability_cfg,
+                    text_runtime_cfg=text_runtime_cfg,
+                    mode="train_ctdm",
+                )
+                ctdm_scan_val_ds = make_graph_dataset(
+                    root=dataset_root,
+                    split="val",
+                    use_lp_edges=use_lp,
+                    prefix_cfg=prefix_cfg,
+                    observability_cfg=observability_cfg,
+                    text_runtime_cfg=text_runtime_cfg,
+                    mode="train_ctdm",
+                )
+                max_nodes_scan = scan_max_nodes_across_splits([ctdm_scan_train_ds, ctdm_scan_val_ds, ds_test])
                 max_nodes_config = int(ctdm_cfg.get("max_nodes", 0) or 0)
                 max_nodes_final = resolve_max_nodes_setting(
                     scanned_max_nodes=max_nodes_scan,
@@ -2648,6 +2901,30 @@ def main() -> None:
                 logging.info(
                     f"RumorDiffusion CTDM: scanned max_nodes={max_nodes_scan}, resolved to {max_nodes_final} "
                     f"(config value: {max_nodes_config})")
+                model_potential_cache_ctdm_payload = {
+                    "ctdm": _deep_merge(ctdm_cfg, {"max_nodes": int(max_nodes_final)}),
+                    "text": rd_cfg.get("text", {}),
+                    "prefix": prefix_cfg,
+                    "observability": observability_cfg,
+                }
+                model_potential_cache_metadata = build_potential_cache_metadata(
+                    dataset_name=dataset_name,
+                    seed=int(seed),
+                    prefix_cfg=prefix_cfg,
+                    ctdm_config_payload=model_potential_cache_ctdm_payload,
+                )
+                potentials_dir = potential_cache_dir(potentials_root, prefix_cfg)
+                rd_prefix_consistency_potential_specs = build_prefix_consistency_potential_specs(
+                    views=rd_prefix_consistency_views,
+                    potentials_root=potentials_root,
+                    dataset_name=dataset_name,
+                    seed=int(seed),
+                    ctdm_config_payload=model_potential_cache_ctdm_payload,
+                    potentials_pair=potentials_pair,
+                )
+                model_use_potentials = use_potentials
+                model_potentials_root = potentials_root
+                model_potentials_dir = potentials_dir
 
                 # 2) Build CTDM
                 bb_cfg = ctdm_cfg.get("backbone", {}) if isinstance(
@@ -2706,6 +2983,22 @@ def main() -> None:
                     text_dim=(text_dim if text_dim > 0 else None),
                     text_fuse=text_fuse,
                 )
+                potential_adapter_cfg = ctdm_cfg.get("potential_adapter", {})
+                if not isinstance(potential_adapter_cfg, dict):
+                    raise TypeError("rumordiffusion.ctdm.potential_adapter must be a mapping")
+                potential_adapter_enabled = bool(potential_adapter_cfg.get("enabled", False))
+                potential_adapter_bottleneck = int(
+                    potential_adapter_cfg.get("bottleneck_dim", max(1, ctdm.hidden_channels // 4))
+                )
+                ctdm.configure_potential_adapter(
+                    enabled=potential_adapter_enabled,
+                    bottleneck_dim=potential_adapter_bottleneck,
+                )
+                if potential_adapter_enabled:
+                    logging.info(
+                        "RD-CTDM post-readout potential adapter enabled: "
+                        f"bottleneck_dim={potential_adapter_bottleneck}"
+                    )
                 if isinstance(robust_text_cfg, dict):
                     noise_list = robust_text_cfg.get("noise_std", [])
                     drop_list = robust_text_cfg.get("dropout_p", [])
@@ -2818,6 +3111,7 @@ def main() -> None:
                     ),
                     selection_metric="objective_loss",
                     selection_mode="objective",
+                    fail_on_nonfinite=bool(active_training_cfg.get("fail_on_nonfinite", False)),
                 )
                 ctdm_eval_cfg = exp_cfg.get("evaluation", {})
                 ctdm_max_eval_samples = int(
@@ -2839,10 +3133,10 @@ def main() -> None:
                         persistent_workers=ctdm_train_cfg.num_workers > 0,
                     )
 
-                ctdm_train_ds = ds_train if train_max_samples <= 0 else Subset(
-                    ds_train, list(range(min(len(ds_train), train_max_samples)))
+                ctdm_train_ds = ctdm_scan_train_ds if train_max_samples <= 0 else Subset(
+                    ctdm_scan_train_ds, list(range(min(len(ctdm_scan_train_ds), train_max_samples)))
                 )
-                ctdm_val_ds = _maybe_subset_ctdm(ds_val)
+                ctdm_val_ds = _maybe_subset_ctdm(ctdm_scan_val_ds)
                 ctdm_metadata_model_name = "rumordiffusion"
                 ctdm_pretrain_dir = os.path.join(
                     ctdm_ckpt_root, source_dataset_name, ctdm_subdir, f"seed{seed}"
@@ -2933,7 +3227,45 @@ def main() -> None:
                                 device=device,
                                 stride=int(ctdm_cfg.get("t_stride", 20)),
                                 skip_existing=bool(active_training_cfg.get("reuse_cached_potentials", True)),
+                                cache_metadata=model_potential_cache_metadata,
                             )
+                        # Auxiliary consistency views must use independent
+                        # prefix-aware namespaces. A full-prefix cache is never
+                        # reused for an early window.
+                        for view_cfg, view_spec in zip(
+                            rd_prefix_consistency_views,
+                            rd_prefix_consistency_potential_specs,
+                        ):
+                            view_dir = str(view_spec["potentials_dir"])
+                            view_metadata = dict(view_spec["potential_cache_metadata"])
+                            logging.info(
+                                "Generating RumorDiffusion prefix-view cache "
+                                f"unit={view_metadata['prefix_unit']} window={view_metadata['prefix_window']} "
+                                f"in {view_dir}"
+                            )
+                            view_datasets = [
+                                make_graph_dataset(
+                                    root=dataset_root,
+                                    split=split_name,
+                                    use_lp_edges=use_lp,
+                                    prefix_cfg=view_cfg,
+                                    observability_cfg=observability_cfg,
+                                    text_runtime_cfg=text_runtime_cfg,
+                                )
+                                for split_name in ("train", "val", "test")
+                            ]
+                            for view_dataset in view_datasets:
+                                generate_potentials(
+                                    model=ctdm,
+                                    dataset=view_dataset,
+                                    out_dir=view_dir,
+                                    batch_size=int(active_training_cfg.get("potentials_batch_size", 1)),
+                                    num_workers=int(active_training_cfg.get("potentials_num_workers", 0)),
+                                    device=device,
+                                    stride=int(ctdm_cfg.get("t_stride", 20)),
+                                    skip_existing=bool(active_training_cfg.get("reuse_cached_potentials", True)),
+                                    cache_metadata=view_metadata,
+                                )
                     if not os.path.isdir(potentials_dir):
                         raise FileNotFoundError(f"Missing RumorDiffusion potentials directory: {potentials_dir}")
                     ds_train = make_graph_dataset(
@@ -2943,6 +3275,7 @@ def main() -> None:
                         use_potentials=True,
                         potentials_dir=potentials_dir,
                         potentials_pair=potentials_pair,
+                        potential_cache_metadata=model_potential_cache_metadata,
                         prefix_cfg=prefix_cfg,
                         observability_cfg=observability_cfg,
                         text_runtime_cfg=text_runtime_cfg,
@@ -2954,6 +3287,7 @@ def main() -> None:
                         use_potentials=True,
                         potentials_dir=potentials_dir,
                         potentials_pair=potentials_pair,
+                        potential_cache_metadata=model_potential_cache_metadata,
                         prefix_cfg=prefix_cfg,
                         observability_cfg=observability_cfg,
                         text_runtime_cfg=text_runtime_cfg,
@@ -2965,6 +3299,7 @@ def main() -> None:
                         use_potentials=True,
                         potentials_dir=potentials_dir,
                         potentials_pair=potentials_pair,
+                        potential_cache_metadata=model_potential_cache_metadata,
                         prefix_cfg=prefix_cfg,
                         observability_cfg=observability_cfg,
                         text_runtime_cfg=text_runtime_cfg,
@@ -3086,7 +3421,11 @@ def main() -> None:
                     supcon_temperature=float(rd_loss_cfg.get("supcon_temperature", 0.07)),
                     prototype_residual_cfg=arb_cfg.get("prototype_residual", {}),
                     semantic_residual_cfg=arb_cfg.get("semantic_residual", {}),
+                    prefix_graph_expert_cfg=arb_cfg.get("prefix_graph_expert", {}),
+                    gated_fusion_cfg=arb_cfg.get("gated_fusion", {}),
                     posterior_aggregation_cfg=arb_cfg.get("posterior_aggregation", {}),
+                    prefix_consistency_cfg=rd_prefix_consistency_cfg,
+                    source_robustness_cfg=rd_source_robustness_cfg,
                     root_feature_dim=int(num_features),
                     text_feature_dim=int(text_channels),
                 )
@@ -3276,6 +3615,22 @@ def main() -> None:
                 m = build_model(
                     model_cfg["name"], model_cfg["model"], num_features, num_classes, text_channels=text_channels)
 
+            if is_rumordiffusion and rd_prefix_consistency_views:
+                ds_train = make_graph_dataset(
+                    root=dataset_root,
+                    split="train",
+                    use_lp_edges=use_lp,
+                    use_potentials=model_use_potentials,
+                    potentials_dir=model_potentials_dir,
+                    potentials_pair=model_potentials_pair,
+                    potential_cache_metadata=model_potential_cache_metadata,
+                    prefix_cfg=prefix_cfg,
+                    prefix_consistency_views=rd_prefix_consistency_views,
+                    prefix_consistency_potential_specs=rd_prefix_consistency_potential_specs,
+                    observability_cfg=observability_cfg,
+                    text_runtime_cfg=text_runtime_cfg,
+                )
+
             trainer_cfg = TrainerConfig(
                 epochs=int(active_training_cfg["epochs"]),
                 learning_rate=float(active_training_cfg.get("lr", 3e-4)),
@@ -3292,6 +3647,7 @@ def main() -> None:
                 max_batches_per_epoch=active_training_cfg.get(
                     "max_batches_per_epoch"),
                 min_epochs=int(active_training_cfg.get("min_epochs", 30)),
+                fail_on_nonfinite=bool(active_training_cfg.get("fail_on_nonfinite", False)),
             )
 
             eval_cfg = exp_cfg.get("evaluation", {})
@@ -3337,13 +3693,26 @@ def main() -> None:
                     observation_window=int(observation_window),
                     observation_unit=str(observation_unit),
                 )
+                observation_potentials_dir = model_potentials_dir
+                observation_potential_metadata = model_potential_cache_metadata
+                if model_use_potentials:
+                    if model_potentials_root is None or model_potential_cache_ctdm_payload is None:
+                        raise RuntimeError("RumorDiffusion potential-cache context is missing for early evaluation.")
+                    observation_potentials_dir = potential_cache_dir(model_potentials_root, prefix_view_cfg)
+                    observation_potential_metadata = build_potential_cache_metadata(
+                        dataset_name=dataset_name,
+                        seed=int(seed),
+                        prefix_cfg=prefix_view_cfg,
+                        ctdm_config_payload=model_potential_cache_ctdm_payload,
+                    )
                 split_dataset = make_graph_dataset(
                     root=dataset_root,
                     split=str(split_name),
                     use_lp_edges=use_lp,
                     use_potentials=model_use_potentials,
-                    potentials_dir=model_potentials_dir,
+                    potentials_dir=observation_potentials_dir,
                     potentials_pair=model_potentials_pair,
+                    potential_cache_metadata=observation_potential_metadata,
                     prefix_cfg=prefix_view_cfg,
                     observability_cfg=observability_cfg,
                     text_runtime_cfg=text_runtime_cfg,
@@ -3369,7 +3738,7 @@ def main() -> None:
             if wb_enabled:
                 import wandb
 
-                run = wandb.init(
+                _wandb_run = wandb.init(
                     project=str(wb_cfg.get("project", "D2Plus")),
                     name=str(wb_cfg.get(
                         "run_name", f"{dataset_name}-{name}-seed{seed}")),
@@ -3429,7 +3798,27 @@ def main() -> None:
             adapt_ckpt_path = ""
             adapt_epochs = 0
             pseudo_label_coverage = 0.0
-            checkpoint_metadata: Optional[Dict[str, Any]] = None
+            checkpoint_metadata: Optional[Dict[str, Any]] = build_checkpoint_metadata(
+                model_name=name,
+                stage="classifier",
+                dataset_name=source_dataset_name,
+                dataset_root=source_dataset_root,
+                seed=int(seed),
+                label_mapping=dataset_label_mapping,
+                config_payload={
+                    "model": copy.deepcopy(model_cfg),
+                    "training": {
+                        "epochs": int(active_training_cfg["epochs"]),
+                        "lr": float(active_training_cfg.get("lr", active_training_cfg.get("learning_rate", 3e-4))),
+                        "weight_decay": float(active_training_cfg.get("weight_decay", 0.0)),
+                        "batch_size": int(active_training_cfg["batch_size"]),
+                        "early_stopping_patience": int(active_training_cfg.get("early_stopping_patience", 20)),
+                        "min_epochs": int(active_training_cfg.get("min_epochs", 30)),
+                    },
+                    "prefix": prefix_cfg,
+                    "observability": observability_cfg,
+                },
+            )
             if is_rumordiffusion:
                 checkpoint_metadata = build_checkpoint_metadata(
                     model_name=name,
@@ -3500,6 +3889,18 @@ def main() -> None:
                     raise ValueError(f"Unsupported target selection split: {selection_split}")
                 target_obs_cfg = adapt_cfg.get("target_observability", {}) if isinstance(adapt_cfg.get("target_observability", {}), dict) else {}
                 target_prefix_cfg = prefix_cfg if not isinstance(adapt_cfg.get("target_prefix", {}), dict) else {**prefix_cfg, **adapt_cfg.get("target_prefix", {})}
+                target_potentials_dir = model_potentials_dir
+                target_potential_metadata = model_potential_cache_metadata
+                if model_use_potentials:
+                    if model_potentials_root is None or model_potential_cache_ctdm_payload is None:
+                        raise RuntimeError("RumorDiffusion potential-cache context is missing for target adaptation.")
+                    target_potentials_dir = potential_cache_dir(model_potentials_root, target_prefix_cfg)
+                    target_potential_metadata = build_potential_cache_metadata(
+                        dataset_name=dataset_name,
+                        seed=int(seed),
+                        prefix_cfg=target_prefix_cfg,
+                        ctdm_config_payload=model_potential_cache_ctdm_payload,
+                    )
                 target_train_ds = make_graph_dataset(
                     root=dataset_root,
                     split=target_split,
@@ -3508,8 +3909,9 @@ def main() -> None:
                     observability_cfg={**observability_cfg, **target_obs_cfg},
                     text_runtime_cfg=text_runtime_cfg,
                     use_potentials=model_use_potentials,
-                    potentials_dir=model_potentials_dir,
+                    potentials_dir=target_potentials_dir,
                     potentials_pair=model_potentials_pair,
+                    potential_cache_metadata=target_potential_metadata,
                 )
                 target_val_ds = make_graph_dataset(
                     root=dataset_root,
@@ -3521,6 +3923,7 @@ def main() -> None:
                     use_potentials=model_use_potentials,
                     potentials_dir=model_potentials_dir,
                     potentials_pair=model_potentials_pair,
+                    potential_cache_metadata=model_potential_cache_metadata,
                 )
                 target_train_max_samples = int(adapt_cfg.get("target_max_samples", train_max_samples))
                 target_selection_max_samples = int(adapt_cfg.get("selection_max_samples", max_eval_samples))
@@ -3899,7 +4302,12 @@ def main() -> None:
             calibration_temp = None
             cal_cfg = rd_eval_cfg.get("calibration", {}) if isinstance(
                 rd_eval_cfg, dict) else {}
-            if is_rumordiffusion and isinstance(cal_cfg, dict) and cal_cfg.get("enabled", False):
+            if (
+                is_rumordiffusion
+                and isinstance(cal_cfg, dict)
+                and cal_cfg.get("enabled", False)
+                and not transfer_run
+            ):
                 calibration_fit_split = str(cal_cfg.get("fit_split", "val")).lower()
                 if calibration_fit_split != "val":
                     raise ValueError(
@@ -3945,6 +4353,158 @@ def main() -> None:
                 calibration_temp = float(temp_opt)
                 push_sweep("calibrated", test_metrics_cal, {
                            "calibration_temp": calibration_temp})
+            elif (
+                is_rumordiffusion
+                and isinstance(cal_cfg, dict)
+                and cal_cfg.get("enabled", False)
+                and transfer_run
+            ):
+                logging.info(
+                    "Source-only transfer disables temperature fitting because target validation labels "
+                    "must not influence reported target metrics."
+                )
+            if canonical_outputs_cfg:
+                if transfer_run:
+                    raise ValueError("canonical publishing is disabled for transfer runs; use the transfer runner")
+                canonical_output_root = str(canonical_outputs_cfg.get("root", "Output"))
+                canonical_protocol_id = str(canonical_outputs_cfg.get("protocol_id", "rumordiffusion_canonical_v1"))
+                canonical_horizon = resolve_canonical_horizon(prefix_cfg)
+                canonical_stage_seeds = resolve_canonical_stage_seeds(exp_cfg, int(seed))
+                resolved_canonical_checkpoint = actual_ckpt_path if len(actual_ckpt_path) > 0 else ckpt_path
+                if not os.path.isfile(resolved_canonical_checkpoint):
+                    raise FileNotFoundError(f"Canonical checkpoint missing: {resolved_canonical_checkpoint}")
+                raw_manifest_path = os.path.join(dataset_root, "raw_manifest.json")
+                processed_manifest_path = os.path.join(dataset_root, "processed_manifest.json")
+                split_manifest_path = os.path.join(dataset_root, "split_manifest.json")
+                canonical_temperature = float(calibration_temp if calibration_temp is not None else 1.0)
+                canonical_rows = prediction_rows_from_logits(
+                    run_id=canonical_run_id(
+                        run_inputs={
+                            "dataset": dataset_name,
+                            "split": "test",
+                            "horizon": canonical_horizon,
+                            "model": {"name": name, "variant": str(model_cfg.get("variant", name))},
+                            "seeds": canonical_stage_seeds,
+                            "calibration_tag": "val_temperature" if calibration_temp is not None else "identity",
+                            "sampling_S": 1,
+                        },
+                        exp_config=exp_cfg,
+                        model_config=model_cfg,
+                        raw_manifest_path=raw_manifest_path,
+                        processed_manifest_path=processed_manifest_path,
+                        split_manifest_path=split_manifest_path,
+                    ),
+                    dataset=dataset_name,
+                    split="test",
+                    source_ids=test_outputs_base["source_ids"],
+                    logits=test_outputs_base["logits"],
+                    targets=test_outputs_base["targets"],
+                    horizon_unit=str(canonical_horizon["unit"]),
+                    horizon_value=float(canonical_horizon["value"]),
+                    model=name,
+                    model_variant=str(model_cfg.get("variant", name)),
+                    seeds=canonical_stage_seeds,
+                    calibration_tag="val_temperature" if calibration_temp is not None else "identity",
+                    sampling_S=1,
+                    checkpoint_sha256=file_sha256(resolved_canonical_checkpoint),
+                    config_sha256=artifact_canonical_json_hash(
+                        omit_optional_none_fields({"experiment": exp_cfg, "model": model_cfg})
+                    ),
+                    split_sha256=file_sha256(split_manifest_path),
+                    temperature=canonical_temperature,
+                    compute_latency_ms=test_outputs_base["latency_ms"],
+                )
+                latency_values = [float(value) for value in test_outputs_base["latency_ms"]]
+                if latency_values:
+                    latency_summary = summarize_latency_ms(latency_values)
+                    latency_payload = {
+                        "schema_version": "1",
+                        "measured": True,
+                        "compute_latency_ms": {
+                            "n": len(latency_values),
+                            "mean_ms": float(latency_summary["mean_ms"]),
+                            "p50_ms": percentile(sorted(latency_values), 0.50),
+                            "p95_ms": float(latency_summary["p95_ms"]),
+                        },
+                        "detection_latency": {
+                            "measured": False,
+                            "unit": canonical_horizon["unit"],
+                            "value": float(canonical_horizon["value"]),
+                        },
+                    }
+                else:
+                    latency_payload = {
+                        "schema_version": "1",
+                        "measured": False,
+                        "status": "not_profiled",
+                        "compute_latency_ms": {"n": 0},
+                        "detection_latency": {
+                            "measured": False,
+                            "unit": canonical_horizon["unit"],
+                            "value": float(canonical_horizon["value"]),
+                        },
+                    }
+                canonical_probability = float(test_metrics.get("acc", 0.0))
+                selective_payload = {
+                    "schema_version": "1",
+                    "policy": "accept_all",
+                    "threshold_fit_split": "val",
+                    "coverage": 1.0,
+                    "selective_risk": float(1.0 - canonical_probability),
+                    "resolved_accuracy": canonical_probability,
+                    "resolved_macro_f1": float(test_metrics.get("macro_f1", 0.0)),
+                    "risk_coverage_curve": [{"coverage": 1.0, "risk": float(1.0 - canonical_probability)}],
+                }
+                calibration_payload = {
+                    "schema_version": "1",
+                    "method": "temperature" if calibration_temp is not None else "identity",
+                    "fit_split": "val",
+                    "threshold_fit_split": "val",
+                    "temperature": canonical_temperature,
+                    "status": "fitted" if calibration_temp is not None else "identity",
+                }
+                canonical_run_finished_at = datetime.now().astimezone().isoformat()
+                write_canonical_run(
+                    canonical_output_root,
+                    protocol_id=canonical_protocol_id,
+                    run_inputs={
+                        "dataset": dataset_name,
+                        "split": "test",
+                        "horizon": canonical_horizon,
+                        "model": {"name": name, "variant": str(model_cfg.get("variant", name))},
+                        "seeds": canonical_stage_seeds,
+                        "calibration_tag": "val_temperature" if calibration_temp is not None else "identity",
+                        "sampling_S": 1,
+                        "execution": {
+                            "start_time": run_started_at,
+                            "end_time": canonical_run_finished_at,
+                            "exit_code": 0,
+                            "command": " ".join(sys.argv),
+                            "log_path": log_path,
+                        },
+                        "environment": {
+                            "batch_size": int(eval_batch_size),
+                            "train_batch_size": int(trainer_cfg.batch_size),
+                            "amp": bool(trainer_cfg.amp),
+                            "device": device,
+                            "model_path": model_path,
+                            "checkpoint_path": resolved_canonical_checkpoint,
+                            "dataset_root": dataset_root,
+                        },
+                    },
+                    checkpoint_path=resolved_canonical_checkpoint,
+                    exp_config=exp_cfg,
+                    model_config=model_cfg,
+                    split_manifest_path=split_manifest_path,
+                    raw_manifest_path=raw_manifest_path,
+                    processed_manifest_path=processed_manifest_path,
+                    prediction_rows=canonical_rows,
+                    num_classes=num_classes,
+                    calibration=calibration_payload,
+                    selective_metrics=selective_payload,
+                    latency=latency_payload,
+                    repo_root=".",
+                )
             if bool(isinstance(export_pred_cfg, dict) and export_pred_cfg.get("enabled", False)):
                 export_prediction_rows(
                     csv_path=prediction_csv,
@@ -4420,9 +4980,7 @@ def main() -> None:
                             root=dataset_root,
                             split="test",
                             use_lp_edges=use_lp,
-                            use_potentials=model_use_potentials,
-                            potentials_dir=model_potentials_dir,
-                            potentials_pair=model_potentials_pair,
+                            use_potentials=False,
                             prefix_cfg=prefix_cfg,
                             observability_cfg={"drop_node": float(dn), "drop_edge": float(
                                 de), "seed": observability_cfg.get("seed", 0)},

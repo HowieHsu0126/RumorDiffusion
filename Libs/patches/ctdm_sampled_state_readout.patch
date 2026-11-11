@@ -1,0 +1,11 @@
+--- a/Libs/models/baselines/CTDM_syn.py
++++ b/Libs/models/baselines/CTDM_syn.py
+@@ -1319,7 +1319,7 @@
+         readout_source: str,
+     ) -> Tensor:
+         source = str(readout_source).lower()
+-        readout_mask = self._potential_readout_mask(G0, X_obs_last, source)
++        readout_mask = self._potential_readout_mask(G_state, X_obs_last, source)
+         if source in {"observed", "observed_prefix"}:
+             return self._graph_readout(H, readout_mask)
+         return self._graph_readout(H, readout_mask)

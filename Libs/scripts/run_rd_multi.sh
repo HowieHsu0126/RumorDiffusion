@@ -40,7 +40,15 @@ PY
 )
   SEEDS="${SEEDS_OVERRIDE:-${SEEDS_DEFAULT}}"
   DATASETS_VALUE="${DATASETS_OVERRIDE:-${DATASETS_DEFAULT}}"
-  MODEL_CFG_VALUE="${MODEL_CFG:-Libs/configs/baselines/rumordiffusion.yaml}"
+  MODEL_CFG_DEFAULT=$(python3 - "${EXP_CFG_DEFAULT}" <<'PY'
+import sys
+import yaml
+
+cfg = yaml.safe_load(open(sys.argv[1], "r", encoding="utf-8")) or {}
+print(str(cfg.get("model_cfg", "Libs/configs/baselines/rumordiffusion.yaml")))
+PY
+)
+  MODEL_CFG_VALUE="${MODEL_CFG:-${MODEL_CFG_DEFAULT}}"
   DEPENDENCY_VALUE="${SBATCH_DEPENDENCY:-}"
   DATASET_TAG=$(printf '%s' "${DATASETS_VALUE}" | tr ' ' '_' | tr ',' '_')
   if [ -z "${DATASET_TAG}" ]; then
@@ -102,7 +110,15 @@ PY
 )
 SEEDS="${SEEDS_OVERRIDE:-${SEEDS_DEFAULT}}"
 DATASETS=(${DATASETS_OVERRIDE:-${DATASETS_DEFAULT}})
-MODEL_CFG_VALUE="${MODEL_CFG:-Libs/configs/baselines/rumordiffusion.yaml}"
+MODEL_CFG_DEFAULT=$(python3 - "${EXP_CFG_DEFAULT}" <<'PY'
+import sys
+import yaml
+
+cfg = yaml.safe_load(open(sys.argv[1], "r", encoding="utf-8")) or {}
+print(str(cfg.get("model_cfg", "Libs/configs/baselines/rumordiffusion.yaml")))
+PY
+)
+MODEL_CFG_VALUE="${MODEL_CFG:-${MODEL_CFG_DEFAULT}}"
 
 for dataset_name in "${DATASETS[@]}"; do
   RUN_CMD=(

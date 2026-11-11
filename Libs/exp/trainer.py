@@ -68,6 +68,7 @@ class TrainerConfig:
     min_epochs: int = 30
     selection_metric: str = "macro_f1"
     selection_mode: str = "classification"
+    fail_on_nonfinite: bool = False
 
 
 class Trainer:
@@ -96,6 +97,19 @@ class Trainer:
         )
         self.scaler = GradScaler(enabled=cfg.amp) if cfg.device == 'cuda' else None
 
+    def _raise_if_nonfinite(self, tensors, stage: str) -> None:
+        """Fails closed before a non-finite training state reaches a checkpoint."""
+        if not bool(getattr(self.cfg, "fail_on_nonfinite", False)):
+            return
+        invalid = [
+            name for name, tensor in tensors
+            if tensor is not None and not bool(torch.isfinite(tensor).all().item())
+        ]
+        if invalid:
+            raise FloatingPointError(
+                f"Non-finite {stage} tensors: {', '.join(invalid[:8])}"
+            )
+
     def _step(self, batch: Batch, train: bool) -> Tuple[float, float]:
         batch = batch.to(self.device)
         if train:
@@ -118,19 +132,32 @@ class Trainer:
                 logits = self.model(batch)
                 loss = self.criterion(logits, batch.y.view(-1))
         if train:
+            self._raise_if_nonfinite([("loss", loss)], stage="loss")
             self.optimizer.zero_grad(set_to_none=True)
             if self.cfg.amp and self.scaler is not None:
                 self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                self._raise_if_nonfinite(
+                    ((name, param.grad) for name, param in self.model.named_parameters() if param.requires_grad),
+                    stage="gradient",
+                )
                 if self.cfg.grad_clip > 0:
-                    self.scaler.unscale_(self.optimizer)
                     clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
+                self._raise_if_nonfinite(
+                    ((name, param.grad) for name, param in self.model.named_parameters() if param.requires_grad),
+                    stage="gradient",
+                )
                 if self.cfg.grad_clip > 0:
                     clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
                 self.optimizer.step()
+            self._raise_if_nonfinite(
+                ((name, param) for name, param in self.model.named_parameters() if param.requires_grad),
+                stage="parameter",
+            )
 
         if logits is None:
             with torch.no_grad():
