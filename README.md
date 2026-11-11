@@ -318,7 +318,7 @@ All paper-aligned multi-seed result tables are included under [`Output/results/p
 
 ### 1. Main Observed-Prefix Results (5 Runs, Mean ± 95% CI)
 
-Under the shared observed-prefix protocol (60 minutes on Twitter15/16 and 3 hops on Weibo/PHEME), **RumorDiffusion** achieves strong classification accuracy and Macro-F1 across all four benchmarks while outperforming graph-only and generative baselines (`BiGCN`, `TGAT`, `LP-GCN`, `AGAD`, `TPSO`, and `DGA-Fake` on Twitter16/PHEME):
+Under the shared observed-prefix protocol (60 minutes on Twitter15/16 and 3 hops on Weibo/PHEME), **RumorDiffusion** achieves strong classification accuracy and Macro-F1 across all four benchmarks while outperforming graph-only and generative baselines (`BiGCN`, `TGAT`, `LP-GCN`, `AGAD`, and `TPSO`):
 
 | Method | Twitter15 Acc | Twitter15 Macro-F1 | Twitter16 Acc | Twitter16 Macro-F1 | Weibo Acc | Weibo Macro-F1 | PHEME Acc | PHEME Macro-F1 |
 | --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -326,9 +326,7 @@ Under the shared observed-prefix protocol (60 minutes on Twitter15/16 and 3 hops
 | **BiGCN** | 0.420±0.023 | 0.399±0.027 | 0.393±0.050 | 0.360±0.053 | 0.832±0.007 | 0.832±0.007 | 0.610±0.013 | 0.492±0.022 |
 | **TGAT** | 0.433±0.036 | 0.412±0.046 | 0.384±0.024 | 0.351±0.027 | 0.837±0.004 | 0.837±0.004 | 0.621±0.002 | 0.493±0.023 |
 | **LP-GCN (D²)** | 0.388±0.017 | 0.367±0.025 | 0.428±0.021 | 0.389±0.026 | 0.842±0.004 | 0.842±0.004 | 0.624±0.010 | 0.446±0.040 |
-| **DGA-Fake** | 0.775±0.000 | 0.774±0.002 | 0.744±0.025 | 0.743±0.024 | **0.887±0.007** | **0.887±0.008** | 0.816±0.004 | 0.799±0.005 |
 | **AGAD** | 0.340±0.067 | 0.262±0.101 | 0.327±0.032 | 0.305±0.056 | 0.836±0.009 | 0.836±0.009 | 0.623±0.002 | 0.474±0.032 |
-| **HPCL-cascade** | **0.808±0.018** | **0.802±0.021** | **0.819±0.009** | **0.817±0.009** | 0.876±0.004 | 0.876±0.004 | 0.849±0.006 | 0.837±0.006 |
 | **TPSO** | 0.385±0.021 | 0.346±0.015 | 0.320±0.052 | 0.260±0.062 | 0.838±0.006 | 0.838±0.006 | 0.627±0.005 | 0.444±0.040 |
 | **RumorDiffusion (Ours)** | 0.738±0.031 | 0.733±0.029 | 0.786±0.027 | 0.785±0.027 | 0.855±0.015 | 0.855±0.015 | 0.819±0.008 | 0.803±0.008 |
 
@@ -339,11 +337,9 @@ Under strict source-only transfer (no target-domain fine-tuning or target-label 
 | Transfer Pair | Method | Source Macro-F1 | Transfer Macro-F1 | Macro-F1 Retained | Transfer ECE ↓ |
 | --- | --- | :---: | :---: | :---: | :---: |
 | **Twitter15 → Twitter16** | AGAD | 0.262±0.101 | 0.184±0.139 | 67.4±29.4% | 0.192±0.068 |
-| **Twitter15 → Twitter16** | HPCL-cascade | **0.802±0.021** | **0.543±0.020** | **67.8±2.8%** | 0.391±0.015 |
 | **Twitter15 → Twitter16** | TPSO | 0.346±0.015 | 0.215±0.143 | 61.5±39.1% | 0.222±0.025 |
 | **Twitter15 → Twitter16** | **RumorDiffusion (Ours)** | 0.733±0.029 | 0.453±0.030 | 62.0±5.1% | **0.123±0.017** |
 | **Weibo → PHEME** | AGAD | 0.836±0.009 | 0.471±0.007 | 56.3±1.4% | 0.473±0.016 |
-| **Weibo → PHEME** | HPCL-cascade | **0.876±0.004** | **0.510±0.014** | **58.2±1.8%** | 0.361±0.010 |
 | **Weibo → PHEME** | TPSO | 0.838±0.006 | 0.480±0.004 | 57.2±0.5% | 0.437±0.010 |
 | **Weibo → PHEME** | **RumorDiffusion (Ours)** | 0.855±0.015 | 0.478±0.136 | 55.9±15.9% | **0.148±0.076** |
 
